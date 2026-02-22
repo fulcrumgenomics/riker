@@ -1,0 +1,7 @@
+reorder_imports = true
+use_small_heuristics = "Max"
+# These are currently unstable and should be enabled when stable:
+#group_imports = "One"
+#imports_granularity = "Crate"
+#merge_imports = true
+#format_strings = true

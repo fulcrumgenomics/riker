@@ -1,0 +1,57 @@
+[workspace]
+members = [".", "riker_derive"]
+
+[package]
+name = "riker-ngs"
+version = "0.1.0"
+authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
+description = "Fast Rust CLI toolkit for sequencing QC metrics"
+repository = "https://github.com/fulcrumgenomics/riker"
+homepage = "https://github.com/fulcrumgenomics/riker"
+license = "MIT"
+edition = "2024"
+rust-version = "1.94.0" # minimum supported; toolchain pinned to stable
+
+[lib]
+name = "riker_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "riker"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
+enum_dispatch = "0.3"
+noodles = { version = "0.107", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
+noodles-bgzf = { version = "0.46", features = ["libdeflate"] }
+serde = { version = "1", features = ["derive"] }
+csv = "1"
+anyhow = "1"
+bstr = "1"
+chrono = "0.4"
+bitvec = "1"
+flate2 = "1"
+rustc-hash = "2"
+log = "0"
+env_logger = "0.11"
+rpmalloc = "0.2"
+riker_derive = { path = "riker_derive" }
+num-traits = "0.2"
+rust-lapper = "1"
+smallvec = "1"
+strum = { version = "0.27", features = ["derive"] }
+kuva = { version = "0.1.6", features = ["pdf"] }
+
+[dev-dependencies]
+tempfile = "3"
+approx = "0.5"
+
+[build-dependencies]
+built = "0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+panic = "abort"

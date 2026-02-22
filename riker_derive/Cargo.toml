@@ -1,0 +1,13 @@
+[package]
+name = "riker_derive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
