@@ -1,6 +1,6 @@
 ![Build](https://github.com/fulcrumgenomics/riker/actions/workflows/check.yml/badge.svg)
-[![Version at crates.io](https://img.shields.io/crates/v/riker)](https://crates.io/crates/riker)
-[![Documentation at docs.rs](https://img.shields.io/docsrs/riker)](https://docs.rs/riker)
+[![Version at crates.io](https://img.shields.io/crates/v/riker-ngs)](https://crates.io/crates/riker-ngs)
+[![Documentation at docs.rs](https://img.shields.io/docsrs/riker-ngs)](https://docs.rs/riker-ngs)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/riker.svg?label=bioconda)](https://bioconda.github.io/recipes/riker/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/riker/blob/main/LICENSE)
 
