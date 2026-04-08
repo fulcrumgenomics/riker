@@ -36,7 +36,7 @@ rustc-hash = "2"
 log = "0"
 env_logger = "0.11"
 rpmalloc = "0.2"
-riker_derive = { path = "riker_derive" }
+riker_derive = { package = "riker-ngs-derive", version = "0.1.0", path = "riker_derive" }
 num-traits = "0.2"
 rust-lapper = "1"
 smallvec = "1"

@@ -1,6 +1,11 @@
 [package]
-name = "riker_derive"
+name = "riker-ngs-derive"
 version = "0.1.0"
+authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
+description = "Proc-macro support crate for riker-ngs"
+repository = "https://github.com/fulcrumgenomics/riker"
+homepage = "https://github.com/fulcrumgenomics/riker"
+license = "MIT"
 edition = "2024"
 rust-version = "1.85.0"
 

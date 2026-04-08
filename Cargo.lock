@@ -1261,7 +1261,7 @@ dependencies = [
  "noodles",
  "noodles-bgzf",
  "num-traits",
- "riker_derive",
+ "riker-ngs-derive",
  "rpmalloc",
  "rust-lapper",
  "rustc-hash",
@@ -1272,7 +1272,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "riker_derive"
+name = "riker-ngs-derive"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
