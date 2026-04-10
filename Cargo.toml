@@ -23,7 +23,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
 enum_dispatch = "0.3"
-noodles = { version = "0.107", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
+noodles = { version = "0.109", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
 noodles-bgzf = { version = "0.46", features = ["libdeflate"] }
 serde = { version = "1", features = ["derive"] }
 csv = "1"
@@ -40,7 +40,7 @@ riker_derive = { package = "riker-ngs-derive", version = "0.1.0", path = "riker_
 num-traits = "0.2"
 rust-lapper = "1"
 smallvec = "1"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 kuva = { version = "0.1.6", features = ["pdf"] }
 
 [dev-dependencies]
