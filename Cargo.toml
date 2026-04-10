@@ -31,7 +31,7 @@ anyhow = "1"
 bstr = "1"
 chrono = "0.4"
 bitvec = "1"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 rustc-hash = "2"
 log = "0"
 env_logger = "0.11"
