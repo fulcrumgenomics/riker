@@ -152,20 +152,20 @@ impl Collector for MyCollector {
 }
 ```
 
-**`Command` impl** — the standalone execution path:
+**`Command` impl** — the standalone execution path. Use `for_each_record` to
+iterate records with buffer reuse (avoids per-record allocation for BAM/SAM):
 
 ```rust
 impl Command for MyCommand {
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) = open_bam(&self.input.input)?;
+        let (mut reader, header) = AlignmentReader::new(&self.input.input, ...)?;
         let mut collector = MyCollector::new(&self.output, &self.options);
         collector.initialize(&header)?;
         let mut progress = ProgressLogger::new("<name>", "reads", 5_000_000);
-        for result in reader.record_bufs(&header) {
-            let record = result?;
-            progress.record_with(&record, &header);
-            collector.accept(&record, &header)?;
-        }
+        reader.for_each_record(&header, |record| {
+            progress.record_with(record, &header);
+            collector.accept(record, &header)
+        })?;
         progress.finish();
         collector.finish()
     }

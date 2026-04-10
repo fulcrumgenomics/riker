@@ -293,13 +293,13 @@ fn run_single_threaded(
     }
 
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
-    for result in reader.record_bufs(header) {
-        let record = result?;
-        progress.record_with(&record, header);
+    reader.for_each_record(header, |record| {
+        progress.record_with(record, header);
         for collector in &mut collectors {
-            collector.accept(&record, header)?;
+            collector.accept(record, header)?;
         }
-    }
+        Ok(())
+    })?;
     progress.finish();
 
     for collector in &mut collectors {

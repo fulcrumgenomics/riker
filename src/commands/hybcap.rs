@@ -168,11 +168,11 @@ impl Command for HybCap {
         collector.initialize(&header)?;
 
         let mut progress = ProgressLogger::new("hybcap", "reads", 5_000_000);
-        for result in reader.record_bufs(&header) {
-            let record = result?;
-            collector.accept(&record, &header)?;
-            progress.record_with(&record, &header);
-        }
+        reader.for_each_record(&header, |record| {
+            collector.accept(record, &header)?;
+            progress.record_with(record, &header);
+            Ok(())
+        })?;
         progress.finish();
 
         collector.finish()?;

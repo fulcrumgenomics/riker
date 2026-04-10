@@ -102,11 +102,10 @@ impl Command for InsertSize {
             InsertSizeCollector::new(&self.input.input, &self.output.output, &self.options);
         collector.initialize(&header)?;
         let mut progress = ProgressLogger::new("isize", "reads", 5_000_000);
-        for result in reader.record_bufs(&header) {
-            let record = result?;
-            progress.record_with(&record, &header);
-            collector.accept(&record, &header)?;
-        }
+        reader.for_each_record(&header, |record| {
+            progress.record_with(record, &header);
+            collector.accept(record, &header)
+        })?;
         progress.finish();
         collector.finish()
     }
