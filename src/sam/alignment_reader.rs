@@ -3,7 +3,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use noodles::sam::Header;
 use noodles::sam::alignment::RecordBuf;
 use noodles::{bam, cram, fasta, sam};
@@ -12,7 +12,7 @@ use noodles_bgzf::io::Reader as BgzfReader;
 /// A unified alignment reader that handles SAM, BAM, CRAM, and gzipped SAM files.
 pub enum AlignmentReader {
     Sam(sam::io::Reader<BufReader<File>>),
-    GzippedSam(Box<sam::io::Reader<BufReader<GzDecoder<File>>>>),
+    GzippedSam(Box<sam::io::Reader<BufReader<MultiGzDecoder<File>>>>),
     Bam(bam::io::Reader<BgzfReader<File>>),
     Cram(cram::io::Reader<File>),
 }
@@ -41,7 +41,7 @@ impl AlignmentReader {
             }
             (AlignmentFormat::GzippedSam, _) => {
                 let file = File::open(path).with_context(context)?;
-                let mut reader = sam::io::Reader::new(BufReader::new(GzDecoder::new(file)));
+                let mut reader = sam::io::Reader::new(BufReader::new(MultiGzDecoder::new(file)));
                 let header = reader.read_header().with_context(header_context)?;
                 Ok((Self::GzippedSam(Box::new(reader)), header))
             }
