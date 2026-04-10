@@ -106,7 +106,7 @@ Reusable `#[derive(clap::Args)]` structs in `src/commands/common.rs`:
 
 | Module | Purpose |
 |--------|---------|
-| `src/sam/alignment_reader.rs` | `open_alignment()` — opens SAM/BAM/CRAM via noodles |
+| `src/sam/alignment_reader.rs` | `AlignmentReader` — opens SAM/BAM/CRAM via noodles; `for_each_record()` iterates with buffer reuse for BAM/SAM |
 | `src/sam/indexed_reader.rs` | `IndexedAlignmentReader` — indexed BAM/CRAM with region queries |
 | `src/sam/record_filter.rs` | Filtering predicates (secondary, duplicate, PF, MAPQ) |
 | `src/sam/pair_orientation.rs` | `PairOrientation` enum (FR/RF/Tandem) |

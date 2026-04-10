@@ -79,11 +79,10 @@ impl Command for Basic {
         let mut collector = BasicCollector::new(&self.input.input, &self.output.output);
         collector.initialize(&header)?;
         let mut progress = ProgressLogger::new("basic", "reads", 5_000_000);
-        for result in reader.record_bufs(&header) {
-            let record = result?;
-            progress.record_with(&record, &header);
-            collector.accept(&record, &header)?;
-        }
+        reader.for_each_record(&header, |record| {
+            progress.record_with(record, &header);
+            collector.accept(record, &header)
+        })?;
         progress.finish();
         collector.finish()
     }

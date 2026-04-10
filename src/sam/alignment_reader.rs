@@ -66,6 +66,57 @@ impl AlignmentReader {
         }
     }
 
+    /// Reads the next alignment record into the provided `RecordBuf`, reusing its
+    /// allocations.  Returns the number of bytes read, or `0` at EOF.
+    ///
+    /// This avoids the per-record clone performed by the [`record_bufs`](Self::record_bufs)
+    /// iterator and can significantly reduce allocation pressure on large files.
+    ///
+    /// # Errors
+    /// Returns an error if reading fails or the file is CRAM (which does not
+    /// support this API in noodles).
+    pub fn read_record_buf(&mut self, header: &Header, record: &mut RecordBuf) -> Result<usize> {
+        match self {
+            Self::Bam(r) => r.read_record_buf(header, record).context("Failed to read BAM record"),
+            Self::Sam(r) => r.read_record_buf(header, record).context("Failed to read SAM record"),
+            Self::GzippedSam(r) => {
+                r.read_record_buf(header, record).context("Failed to read SAM record")
+            }
+            Self::Cram(_) => {
+                bail!("read_record_buf is not supported for CRAM files")
+            }
+        }
+    }
+
+    /// Process every record in the file, calling `f` for each one.
+    ///
+    /// For BAM and SAM files, a single `RecordBuf` is reused across all records,
+    /// avoiding per-record allocation.  For CRAM, records are decoded from
+    /// containers and passed individually (noodles does not support CRAM buffer
+    /// reuse).
+    ///
+    /// # Errors
+    /// Returns an error if reading fails or if the callback returns an error.
+    pub fn for_each_record<F>(&mut self, header: &Header, mut f: F) -> Result<()>
+    where
+        F: FnMut(&RecordBuf) -> Result<()>,
+    {
+        if let Self::Cram(r) = self {
+            for result in r.records(header) {
+                let cram_rec = result.context("Failed to read CRAM record")?;
+                let record = RecordBuf::try_from_alignment_record(header, &cram_rec)
+                    .context("Failed to convert CRAM record")?;
+                f(&record)?;
+            }
+        } else {
+            let mut record = RecordBuf::default();
+            while self.read_record_buf(header, &mut record)? != 0 {
+                f(&record)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns an iterator that reads alignment records as owned `RecordBuf`s.
     pub fn record_bufs<'a>(
         &'a mut self,
