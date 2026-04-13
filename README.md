@@ -47,8 +47,8 @@ The obvious question is: why not just fix up Picard?  Riker exists for a number 
 
 * **Speed**: Most tools in riker are 4-6x faster than their counterparts in Picard; some are _much_ faster. With a fresh start it was much easier to make _all_ tools runnable via a single `multi` command, reducing complexity and saving more compute time (e.g. in Picard the `wgs` `hybcap`, and `error` tools all require separate invocations).
 * **Cleaner Output**: Picard's tools output an inconvenient mostly-TSV format with a variable number of `#`-commented header lines and sometimes multiple independent tables in the same file, making them harder than they should be to parse programmatically _and_ annoying to review manually.  Riker's outputs are simple TSVs with one table per output file that can easily be routed into `cat file | column -t` or python's `csv.DictReader` with no fuss.  In addition Riker standardizes on having the `sample` be the first column in every file - so you can easily concatenate files for many samples.
-* **Lightweight Ditribution**: Picard carries a lot of baggage. It needs a JVM. It needs R and much of the tidyverse in order to produce plots.  The bioconda distribution requires a python interpreter to run it's wrapper script.  Running `pixi init && pixi add picard` results in a 1.2GB environment!  In contrast Riker is ditributed as a single executable of < 10MB with no external dependencies.
-* **Maintenance**: Maintenance of Picard has been [minimal for some time](https://github.com/broadinstitute/picard/commits/master/), with what little actiivty there is coming mostly from the community.  Picard is owned by, but no longer actively led by, the Broad Institute, making its path forward unclear.  Picard also suffers from some now-unnecessary complexity and years of less-than-necessary maintenance.  All of this makes a fresh start more appealing.
+* **Lightweight Distribution**: Picard carries a lot of baggage. It needs a JVM. It needs R and much of the tidyverse in order to produce plots.  The bioconda distribution requires a python interpreter to run it's wrapper script.  Running `pixi init && pixi add picard` results in a 1.2GB environment!  In contrast Riker is distributed as a single executable of < 10MB with no external dependencies.
+* **Maintenance**: Maintenance of Picard has been [minimal for some time](https://github.com/broadinstitute/picard/commits/master/), with what little activity there is coming mostly from the community.  Picard is owned by, but no longer actively led by, the Broad Institute, making its path forward unclear.  Picard also suffers from some now-unnecessary complexity and years of less-than-necessary maintenance.  All of this makes a fresh start more appealing.
 
 ## Installation
 
@@ -76,7 +76,7 @@ cargo install riker-ngs
 
 ### Building from source
 
-Similarly, tobuild from source you'll also need cargo.  Once installed you can:
+Similarly, to build from source you'll also need cargo.  Once installed you can:
 
 ```shell
 # clone the repo
