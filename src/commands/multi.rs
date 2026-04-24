@@ -419,8 +419,8 @@ fn run_single_threaded(
 /// Architecture:
 /// - One **reader thread** pulls empty [`RecyclableBatch`] slots from a pool,
 ///   fills them in place via `read_record_buf`, wraps each in an `Arc`, and
-///   fans the `Arc` out onto a shared `(collector_idx, Arc<Batch>)` work queue
-///   — one entry per collector.
+///   fans it out onto a shared `(collector_idx, Batch)` work queue — one entry
+///   per collector.
 /// - `threads` **pool threads** block on the shared work queue. On receipt of
 ///   a work item they lock that collector's mutex and call `accept_multiple`.
 ///   The mutex serializes per-collector accepts (required since `Collector`
@@ -565,53 +565,59 @@ fn reader_thread_loop(
 ) -> Result<()> {
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
 
-    loop {
-        if poison.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        // Blocks if every batch is currently in flight — acts as backpressure.
-        let Ok(mut records) = pool_rx.recv() else {
-            return Ok(());
-        };
-
-        // Read directly into the pre-allocated slots. Each RecordBuf's inner
-        // Vecs (name, cigar, sequence, quality, data) are reused.
-        let mut len = 0;
-        while len < records.len() {
-            let bytes = reader.read_record_buf(header, &mut records[len])?;
-            if bytes == 0 {
-                break;
-            }
-            progress.record_with(&records[len], header);
-            len += 1;
-        }
-
-        if len == 0 {
-            // EOF: recycle the unused batch and stop.
-            let _ = pool_tx.send(records);
-            break;
-        }
-
-        // Wrap once, fan out via Arc clones on the shared work queue. The
-        // last `Arc` drop (after the last pool worker processes it) triggers
-        // `RecyclableBatch::drop`, which recycles `records` to the pool.
-        let batch = Arc::new(RecyclableBatch { records, len, return_tx: pool_tx.clone() });
-        for idx in 0..n_collectors {
+    // Wrap the loop in an IIFE so `progress.finish()` runs on every exit —
+    // EOF, poison trip, pool-channel close, fan-out send failure, and the
+    // `?` on `read_record_buf`. Without this, the final-count log line
+    // silently disappears on any non-EOF shutdown.
+    let result = (|| -> Result<()> {
+        loop {
             if poison.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            if work_tx.send((idx, Arc::clone(&batch))).is_err() {
-                // All pool threads gone (they errored and dropped their
-                // receivers) — stop and let the parent surface the error.
+
+            // Blocks if every batch is currently in flight — acts as backpressure.
+            let Ok(mut records) = pool_rx.recv() else {
+                return Ok(());
+            };
+
+            // Read directly into the pre-allocated slots. Each RecordBuf's inner
+            // Vecs (name, cigar, sequence, quality, data) are reused.
+            let mut len = 0;
+            while len < records.len() {
+                let bytes = reader.read_record_buf(header, &mut records[len])?;
+                if bytes == 0 {
+                    break;
+                }
+                progress.record_with(&records[len], header);
+                len += 1;
+            }
+
+            if len == 0 {
+                // EOF: recycle the unused batch and stop.
+                let _ = pool_tx.send(records);
                 return Ok(());
             }
+
+            // Wrap once, fan out via Arc clones on the shared work queue. The
+            // last `Arc` drop (after the last pool worker processes it) triggers
+            // `RecyclableBatch::drop`, which recycles `records` to the pool.
+            let batch = Arc::new(RecyclableBatch { records, len, return_tx: pool_tx.clone() });
+            for idx in 0..n_collectors {
+                if poison.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if work_tx.send((idx, Arc::clone(&batch))).is_err() {
+                    // All pool threads gone (they errored and dropped their
+                    // receivers) — stop and let the parent surface the error.
+                    return Ok(());
+                }
+            }
+            drop(batch);
         }
-        drop(batch);
-    }
+    })();
 
     progress.finish();
-    Ok(())
+    result
 }
 
 /// Pool worker: blocks on the shared work queue and dispatches each
