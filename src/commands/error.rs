@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use bitvec::prelude::*;
-use bstr::{BStr, BString};
 use clap::Args;
 use noodles::core::Region;
 use noodles::sam::Header;
@@ -23,6 +22,7 @@ use crate::fasta::Fasta;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_6dp, write_tsv};
 use crate::progress::ProgressLogger;
 use crate::sam::indexed_reader::IndexedAlignmentReader;
+use crate::sam::mate_buffer::{MateAction, MateBuffer};
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sequence_dict::SequenceDictionary;
 use crate::vcf::IndexedVcf;
@@ -312,24 +312,30 @@ impl Command for Error {
                 total_records += 1;
                 progress.record_with(&record, &header);
 
-                match collector.mate_buffer.accept_read(record) {
-                    MateResult::Buffered => {}
-                    MateResult::Single(rec) => {
-                        collector.process_record(&rec, &region, None);
+                match collector.mate_buffer.accept(&record) {
+                    MateAction::Buffered => {}
+                    MateAction::Alone => {
+                        collector.process_record(&record, &region, None);
                     }
-                    MateResult::Pair(rec, mate) => {
+                    MateAction::PairWith(mate) => {
                         let mate_bases = build_aligned_bases(&mate, collector.min_bq);
-                        let record_bases = build_aligned_bases(&rec, collector.min_bq);
+                        let record_bases = build_aligned_bases(&record, collector.min_bq);
                         collector.process_record(&mate, &region, Some(&record_bases));
-                        collector.process_record(&rec, &region, Some(&mate_bases));
+                        collector.process_record(&record, &region, Some(&mate_bases));
                     }
                 }
             }
 
-            // Flush orphans — process for mismatch/indel only
+            // Flush orphans — process for mismatch/indel only. The interval
+            // was itself derived from the same sequence dictionary, so a
+            // lookup miss here is a logic error we want to surface loudly
+            // rather than silently flush against ref_id=0.
             let ref_id = dict
                 .get_by_name(contig_name)
-                .map_or(0, crate::sequence_dict::SequenceMetadata::index);
+                .map(crate::sequence_dict::SequenceMetadata::index)
+                .with_context(|| {
+                    format!("contig {contig_name} not found in sequence dictionary")
+                })?;
             for orphan in collector.mate_buffer.flush_behind(ref_id, *end) {
                 collector.process_record(&orphan, &region, None);
             }
@@ -338,7 +344,7 @@ impl Command for Error {
         // Discard remaining buffered mates whose mates never arrived.
         // In the standalone path these are from the last interval and have no
         // further region context to process against.
-        drop(collector.mate_buffer.drain_all());
+        collector.mate_buffer.clear();
 
         progress.finish();
         log::info!("Processed {total_records} records passing filters.");
@@ -377,7 +383,7 @@ pub struct ErrorCollector {
     base_level_stratifiers: Vec<Stratifier>,
 
     // Mate buffer for overlap detection
-    mate_buffer: MateBuffer,
+    mate_buffer: MateBuffer<RecordBuf>,
 
     // String interner for compact covariate keys
     interner: StringInterner,
@@ -959,12 +965,12 @@ impl Collector for ErrorCollector {
         if self.current_ref_id != Some(ref_id) {
             // Process orphaned buffered reads from previous contig without overlap data
             if let Some(region) = self.current_region.take() {
-                for orphan in self.mate_buffer.drain_all() {
+                for orphan in self.mate_buffer.flush() {
                     self.process_record(&orphan, &region, None);
                 }
                 self.current_region = Some(region);
             } else {
-                drop(self.mate_buffer.drain_all());
+                self.mate_buffer.clear();
             }
 
             let dict = self.dict.as_ref().unwrap();
@@ -1005,17 +1011,16 @@ impl Collector for ErrorCollector {
         // This is zero-cost (Option take/replace is just pointer swaps).
         let region = self.current_region.take().unwrap();
 
-        // Clone required since Collector trait gives us &RecordBuf
-        match self.mate_buffer.accept_read(record.clone()) {
-            MateResult::Buffered => {}
-            MateResult::Single(rec) => {
-                self.process_record(&rec, &region, None);
+        match self.mate_buffer.accept(record) {
+            MateAction::Buffered => {}
+            MateAction::Alone => {
+                self.process_record(record, &region, None);
             }
-            MateResult::Pair(rec, mate) => {
+            MateAction::PairWith(mate) => {
                 let mate_bases = build_aligned_bases(&mate, self.min_bq);
-                let record_bases = build_aligned_bases(&rec, self.min_bq);
+                let record_bases = build_aligned_bases(record, self.min_bq);
                 self.process_record(&mate, &region, Some(&record_bases));
-                self.process_record(&rec, &region, Some(&mate_bases));
+                self.process_record(record, &region, Some(&mate_bases));
             }
         }
 
@@ -1027,12 +1032,12 @@ impl Collector for ErrorCollector {
     fn finish(&mut self) -> Result<()> {
         // Process remaining buffered reads without overlap data
         if let Some(region) = self.current_region.take() {
-            for orphan in self.mate_buffer.drain_all() {
+            for orphan in self.mate_buffer.flush() {
                 self.process_record(&orphan, &region, None);
             }
             self.current_region = Some(region);
         } else {
-            drop(self.mate_buffer.drain_all());
+            self.mate_buffer.clear();
         }
         self.write_output()
     }
@@ -1845,96 +1850,6 @@ struct IndelAccum {
     num_inserted_bases: u64,
     num_deletions: u64,
     num_deleted_bases: u64,
-}
-
-/// Result of presenting a read to the mate buffer for overlap classification.
-enum MateResult {
-    /// The read was buffered — its mate may arrive later for overlap comparison.
-    /// No records need processing now.
-    Buffered,
-    /// The read should be processed alone (no overlap data).
-    Single(RecordBuf),
-    /// The read and its buffered mate should be processed together with overlap data.
-    Pair(RecordBuf, RecordBuf),
-}
-
-/// Buffer for storing reads that may overlap their mate pair.
-///
-/// Reads are keyed by read name. When a read arrives, `accept_read` determines
-/// whether to buffer it (mate expected later), return it alone (no overlap), or
-/// return it paired with a previously buffered mate.
-struct MateBuffer {
-    buffer: HashMap<BString, RecordBuf>,
-}
-
-impl MateBuffer {
-    fn new() -> Self {
-        Self { buffer: HashMap::with_capacity_and_hasher(4096, rustc_hash::FxBuildHasher) }
-    }
-
-    /// Accept a read and decide what to do with it:
-    /// 1. If the read can't overlap its mate (unpaired, unmapped mate, different
-    ///    contig) → return `Single` immediately without checking the buffer.
-    /// 2. If the mate is already buffered → remove it and return `Pair(read, mate)`.
-    /// 3. If the mate's start falls within this read's reference span (potential
-    ///    overlap) → buffer it, return `Buffered`.
-    /// 4. Otherwise → return `Single(read)` for processing without overlap.
-    fn accept_read(&mut self, record: RecordBuf) -> MateResult {
-        let flags = record.flags();
-
-        // Quick check: can this read possibly overlap its mate?
-        if !flags.is_segmented() || flags.is_unmapped() || flags.is_mate_unmapped() {
-            return MateResult::Single(record);
-        }
-        if record.reference_sequence_id() != record.mate_reference_sequence_id() {
-            return MateResult::Single(record);
-        }
-
-        // Check if the mate is already buffered (zero-allocation lookup via &BStr)
-        if let Some(name) = record.name() {
-            let name_ref: &BStr = BStr::new(name);
-            if self.buffer.contains_key(name_ref) {
-                let mate = self.buffer.remove(name_ref).unwrap();
-                return MateResult::Pair(record, mate);
-            }
-        }
-
-        // Buffer if mate's start falls within this read's reference span
-        let read_start = record.alignment_start().map_or(0, |p| p.get());
-        let read_end = record.alignment_end().map_or(0, |e| e.get());
-        let mate_start = record.mate_alignment_start().map_or(0, |p| p.get());
-
-        if mate_start >= read_start && mate_start <= read_end {
-            let name = BString::from(record.name().map_or_else(Vec::new, |n| <[u8]>::to_vec(n)));
-            self.buffer.insert(name, record);
-            return MateResult::Buffered;
-        }
-
-        MateResult::Single(record)
-    }
-
-    /// Remove and return buffered reads whose expected mate position is behind `current_pos`.
-    /// These reads' mates won't arrive, so they need to be processed without overlap data.
-    #[expect(clippy::cast_possible_truncation, reason = "1-based genomic positions fit in u32")]
-    fn flush_behind(&mut self, current_ref_id: usize, current_pos: u32) -> Vec<RecordBuf> {
-        let keys: Vec<BString> = self
-            .buffer
-            .iter()
-            .filter(|(_, record)| {
-                let mate_ref_id = record.mate_reference_sequence_id().unwrap_or(usize::MAX);
-                let mate_pos = record.mate_alignment_start().map_or(0, |p| (p.get() - 1) as u32);
-                mate_ref_id < current_ref_id
-                    || (mate_ref_id == current_ref_id && mate_pos < current_pos)
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        keys.into_iter().filter_map(|k| self.buffer.remove(&k)).collect()
-    }
-
-    /// Drain and return all remaining buffered reads.
-    fn drain_all(&mut self) -> Vec<RecordBuf> {
-        self.buffer.drain().map(|(_, v)| v).collect()
-    }
 }
 
 // ─── Module-level functions ─────────────────────────────────────────────────────

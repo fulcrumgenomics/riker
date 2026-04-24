@@ -33,7 +33,6 @@ fn make_cmd(
             min_mapq,
             min_bq,
             coverage_cap,
-            max_read_ref_span: 2000,
         },
     }
 }

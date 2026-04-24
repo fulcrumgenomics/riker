@@ -55,3 +55,10 @@ lto = "thin"
 codegen-units = 1
 overflow-checks = true
 panic = "abort"
+
+# Profile that matches release perf closely but keeps symbol + line info for
+# samply/perf. Use via `cargo build --profile bench-prof`.
+[profile.bench-prof]
+inherits = "release"
+debug = 1
+strip = false
