@@ -512,13 +512,14 @@ impl CategoryAccumulator {
                         self.hq_aligned_bases += len as u64;
                         if has_quals {
                             // Malformed BAMs can declare a CIGAR longer than the
-                            // quality array. Clamp the window to `qual_bytes.len()`
+                            // quality array. Clamp both bounds to `qual_bytes.len()`
                             // so out-of-range positions are silently omitted —
                             // identical count to the pre-SIMD scalar form, which
                             // used `.get().unwrap_or(0)` (Q=0 never passes a
                             // non-zero BQ threshold, so the two paths agree).
-                            let end = (read_pos + len).min(qual_bytes.len());
-                            let window = &qual_bytes[read_pos..end];
+                            let start = read_pos.min(qual_bytes.len());
+                            let end = read_pos.saturating_add(len).min(qual_bytes.len());
+                            let window = &qual_bytes[start..end];
                             self.hq_aligned_q20_bases +=
                                 simd::count_bases_ge_q(window, BASE_QUALITY_THRESHOLD);
                         }
@@ -1089,6 +1090,32 @@ mod tests {
         acc.process_cigar(&record, true, false); // is_hq = true
         assert_eq!(acc.hq_aligned_bases, 10);
         assert_eq!(acc.hq_aligned_q20_bases, 5);
+    }
+
+    #[test]
+    fn test_process_cigar_q20_bases_malformed_short_quals() {
+        // Malformed BAM: CIGAR declares 15 read bases but the quality array is
+        // only 3 bytes long. The first M block can still score 3 Q30 bytes;
+        // the second runs entirely past the end of the quality array and must
+        // contribute 0 (silently) rather than panicking.
+        let cigar: Cigar =
+            [Op::new(CigarKind::Match, 5), Op::new(CigarKind::Match, 10)].into_iter().collect();
+        let record = make_record(
+            Flags::empty(),
+            Some(1),
+            60,
+            cigar,
+            &[b'A'; 15],
+            &[30u8, 30, 30],
+            Some(0),
+            None,
+            0,
+            Data::default(),
+        );
+        let mut acc = CategoryAccumulator::new("TEST");
+        acc.process_cigar(&record, true, false);
+        assert_eq!(acc.hq_aligned_bases, 15);
+        assert_eq!(acc.hq_aligned_q20_bases, 3);
     }
 
     // ── process_cigar — additional edge cases ───────────────────────────────

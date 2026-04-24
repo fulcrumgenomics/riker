@@ -1596,6 +1596,32 @@ mod tests {
     }
 
     #[test]
+    fn test_gc_fraction_pure_acgt() {
+        // 4 G/C out of 8 → 0.5.
+        assert!((HybCapCollector::gc_fraction(b"ACGTACGT") - 0.5).abs() < f64::EPSILON);
+        // Lowercase is treated identically.
+        assert!((HybCapCollector::gc_fraction(b"acgtacgt") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_gc_fraction_iupac_contributes_half() {
+        // N and every other IUPAC ambiguity code are treated uniformly:
+        // each contributes 0.5 to the numerator and 1 to the denominator.
+        // 4 unambiguous ACGT (2 G/C) + 8 ambiguous → (2 + 8*0.5) / 12 = 0.5.
+        let bases = b"ACGTNSWRYKMB";
+        assert!((HybCapCollector::gc_fraction(bases) - 0.5).abs() < f64::EPSILON);
+
+        // All-N pulls GC toward 0.5 regardless of case.
+        assert!((HybCapCollector::gc_fraction(b"NNNNnnnn") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_gc_fraction_empty() {
+        // safe_div_f returns 0.0 for an empty slice.
+        assert!(HybCapCollector::gc_fraction(b"").abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_compute_bases_at_or_above() {
         let hist = vec![5, 10, 3, 2];
         let result = compute_bases_at_or_above(&hist);
