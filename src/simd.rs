@@ -297,7 +297,7 @@ mod tests {
         for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 64, 150, 300] {
             let mut seq = vec![0u8; len];
             rng.fill_byte(&mut seq, alphabet);
-            assert_eq!(count_gc_case_insensitive(&seq), scalar_count_gc(&seq), "len={len}",);
+            assert_eq!(count_gc_case_insensitive(&seq), scalar_count_gc(&seq), "len={len}");
         }
     }
 
@@ -325,7 +325,7 @@ mod tests {
         for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 64, 150] {
             let mut seq = vec![0u8; len];
             rng.fill_byte(&mut seq, alphabet);
-            assert_eq!(count_n_case_insensitive(&seq), scalar_count_n(&seq), "len={len}",);
+            assert_eq!(count_n_case_insensitive(&seq), scalar_count_n(&seq), "len={len}");
         }
     }
 }
