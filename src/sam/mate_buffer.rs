@@ -59,6 +59,7 @@ pub trait MateCache: Sized {
 }
 
 /// Outcome of presenting a record to the buffer via [`MateBuffer::accept`].
+#[derive(Debug)]
 pub enum MateAction<T> {
     /// No overlap possible (unpaired, unmapped mate, cross-contig, or mate
     /// falls outside this read's reference span). Caller should process the
@@ -78,6 +79,7 @@ pub enum MateAction<T> {
 /// committing to a cache projection. Callers that want to build `T` inline
 /// with their own per-base processing use `probe` + [`MateBuffer::insert`]
 /// instead of [`MateBuffer::accept`].
+#[derive(Debug)]
 pub enum Peek<T> {
     /// No overlap possible — process the record alone.
     Alone,
@@ -505,7 +507,7 @@ mod tests {
         let second = paired_record(b"qname", 0, 150, 100);
         match buf.accept(&second) {
             MateAction::PairWith(cache) => assert_eq!(cache.0, b"qname"),
-            other => panic!("expected PairWith, got {:?}", other_kind(&other)),
+            other => panic!("expected PairWith, got {other:?}"),
         }
         assert!(buf.is_empty());
     }
@@ -611,15 +613,6 @@ mod tests {
                 assert_eq!(cached.alignment_start().unwrap().get(), 100);
             }
             _ => panic!("expected PairWith"),
-        }
-    }
-
-    /// Debug-formatting helper since `MateAction<T>` doesn't require `Debug`.
-    fn other_kind<T>(action: &MateAction<T>) -> &'static str {
-        match action {
-            MateAction::Alone => "Alone",
-            MateAction::Buffered => "Buffered",
-            MateAction::PairWith(_) => "PairWith",
         }
     }
 

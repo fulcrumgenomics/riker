@@ -874,11 +874,10 @@ impl ContigDepth {
     }
 
     /// Resize for a new contig. `Vec::resize(n, 0)` reuses the existing backing
-    /// allocation up to current capacity and zero-initialises any newly-appended
-    /// slots; the caller is expected to have drained the previous contig via
-    /// `take(pos)` so the existing slots are already zero.
+    /// allocation up to current capacity, truncates down or zero-fills new
+    /// slots as needed; the caller is expected to have drained the previous
+    /// contig via `take(pos)` so the existing slots are already zero.
     fn reset_for_contig(&mut self, contig_len: usize) {
-        self.depth.clear();
         self.depth.resize(contig_len, 0);
     }
 
