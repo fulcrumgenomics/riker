@@ -43,6 +43,7 @@ smallvec = "1"
 strum = { version = "0.28", features = ["derive"] }
 kuva = { version = "0.1.6", features = ["pdf"] }
 wide = "1.3"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
@@ -59,7 +60,21 @@ panic = "abort"
 
 # Profile that matches release perf closely but keeps symbol + line info for
 # samply/perf. Use via `cargo build --profile bench-prof`.
+#
+# `lto = false` overrides the release default of `thin` LTO: thin LTO reorders
+# and merges function bodies across crates so aggressively that sampled PCs
+# land inside address ranges belonging to unrelated symbols (we observed e.g.
+# wgs/noodles hot loops showing up as `aho_corasick::...::build_from_noncontiguous`
+# when symbolicating with atos). Disabling LTO here keeps the symbol table
+# honest at a modest perf cost — a few percent in our measurements — which is
+# well worth it for readable flamegraphs.
+#
+# `debug = 2` gives full DWARF (files + line numbers + inline info) rather than
+# the minimal `debug = 1` symbol table, which makes atos / samply / Firefox
+# Profiler attribute samples to the right source line inside generic / inlined
+# functions.
 [profile.bench-prof]
 inherits = "release"
-debug = 1
+lto = false
+debug = 2
 strip = false
