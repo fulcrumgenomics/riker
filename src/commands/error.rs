@@ -519,9 +519,11 @@ impl ErrorCollector {
         for accum in &self.accumulators {
             let group_name = &accum.group.name;
 
-            // Sort entries by formatted key for deterministic output
+            // Sort entries by formatted key for deterministic output.
+            // `sort_by_cached_key` formats each key exactly once rather than
+            // allocating a String on every comparison.
             let mut entries: Vec<_> = accum.accums.iter().collect();
-            entries.sort_by(|a, b| a.0.format(&self.interner).cmp(&b.0.format(&self.interner)));
+            entries.sort_by_cached_key(|(key, _)| key.format(&self.interner));
 
             for (key, combined) in &entries {
                 let formatted_key = key.format(&self.interner);

@@ -196,6 +196,10 @@ impl<T> MateBuffer<T> {
     /// [`clear_behind`]: MateBuffer::clear_behind
     #[allow(clippy::cast_possible_truncation, reason = "1-based genomic positions fit in u32")]
     pub fn insert(&mut self, record: &RecordBuf, value: T) {
+        // `insert` is contracted as a follow-up to a `probe` that returned
+        // `WouldBuffer`, which guarantees both fields are present. A debug
+        // assertion catches callers that skip `probe` and insert cold.
+        debug_assert!(record.reference_sequence_id().is_some() && record.name().is_some());
         let Some(ref_id) = record.reference_sequence_id() else { return };
         let Some(name) = record.name() else { return };
         let mate_pos_1based = record.mate_alignment_start().map_or(0, |p| p.get());
@@ -210,19 +214,11 @@ impl<T> MateBuffer<T> {
     /// Drain and return entries whose expected mate position is strictly before
     /// `(ref_id, pos)`. Typical use: at an interval boundary, yield orphans
     /// whose mates won't appear within the remaining scan.
-    //
-    // Two-pass implementation (collect keys, then remove) because
-    // `HashMap::extract_if` is still unstable; once that lands a single-pass
-    // version would be cleaner. `retain` doesn't work here since we need to
-    // *return* the drained values, not just drop them.
     pub fn flush_behind(&mut self, ref_id: usize, pos: u32) -> Vec<T> {
-        let keys: Vec<Vec<u8>> = self
-            .buffer
-            .iter()
-            .filter(|(_, entry)| Self::is_behind(entry, ref_id, pos))
-            .map(|(k, _)| k.clone())
-            .collect();
-        keys.into_iter().filter_map(|k| self.buffer.remove(&k)).map(|e| e.value).collect()
+        self.buffer
+            .extract_if(|_, entry| Self::is_behind(entry, ref_id, pos))
+            .map(|(_, e)| e.value)
+            .collect()
     }
 
     /// Drain and return all remaining buffered entries.

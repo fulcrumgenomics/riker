@@ -621,7 +621,11 @@ impl WgsCollector {
             #[allow(clippy::cast_possible_truncation)]
             let usable = (block_ref_end - block_ref_start) as u32;
 
-            let read_start = read_off as usize;
+            // Clamp both bounds to quals.len(): on a malformed BAM where the
+            // CIGAR claims more read bases than the qual array provides,
+            // `read_off` itself can exceed `quals.len()`, which would make the
+            // naive slice panic.
+            let read_start = (read_off as usize).min(quals.len());
             let read_end = (read_start + usable as usize).min(quals.len());
             let available = &quals[read_start..read_end];
             #[allow(clippy::cast_possible_truncation)]
