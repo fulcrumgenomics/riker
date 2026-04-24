@@ -20,7 +20,7 @@ fn make_cmd(
     exclude_unpaired_reads: bool,
     min_mapq: u8,
     min_bq: u8,
-    coverage_cap: u32,
+    coverage_cap: u16,
 ) -> Wgs {
     Wgs {
         input: InputOptions { input: bam.to_path_buf() },

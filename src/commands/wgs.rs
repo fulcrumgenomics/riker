@@ -73,15 +73,17 @@ pub struct WgsOptions {
     ///
     /// Per-position depths saturate at this value; bases arriving at a
     /// position that has already hit the cap are counted as capped exclusions.
+    /// Bounded by u16 (max 65535) since the per-position depth array stores
+    /// each slot as a u16.
     #[arg(long, default_value_t = WgsOptions::DEFAULT_COVERAGE_CAP)]
-    pub coverage_cap: u32,
+    pub coverage_cap: u16,
 }
 
 impl WgsOptions {
     const DEFAULT_EXCLUDE_UNPAIRED: bool = true;
     const DEFAULT_MIN_MAPQ: u8 = 20;
     const DEFAULT_MIN_BQ: u8 = 20;
-    const DEFAULT_COVERAGE_CAP: u32 = 250;
+    const DEFAULT_COVERAGE_CAP: u16 = 250;
 }
 
 impl Default for WgsOptions {
@@ -179,7 +181,7 @@ pub struct WgsCollector {
     include_unpaired: bool,
     min_mapq: u8,
     min_bq: u8,
-    coverage_cap: u32,
+    coverage_cap: u16,
 
     // BAM contig metadata
     dict: Option<SequenceDictionary>,
@@ -460,10 +462,7 @@ impl WgsCollector {
         let intervals_bv = self.intervals.as_ref().map(|intervals| intervals.contig_bitvec(ref_id));
 
         let contig_len = self.depth.len();
-        // `coverage_cap` fits in u16 (clamped in `ContigDepth::new`); hoisted
-        // out of the per-position loop because it's a record-invariant constant.
-        let capped = u16::try_from(self.coverage_cap.min(u32::from(u16::MAX)))
-            .expect("coverage_cap clamped to u16::MAX in ContigDepth::new");
+        let capped = self.coverage_cap;
         let mut eligible: u64 = 0;
         for pos in 0..contig_len {
             let depth = self.depth.take(pos);
@@ -499,7 +498,7 @@ impl WgsCollector {
 
         let territory = self.genome_territory as f64;
 
-        let x_max_idx = usize::try_from(x_max).expect("x_max ≤ coverage_cap (u32)");
+        let x_max_idx = usize::try_from(x_max).expect("x_max ≤ coverage_cap (u16)");
         let xy: Vec<(f64, f64)> = self
             .depth_histogram
             .iter()
@@ -865,12 +864,7 @@ struct ContigDepth {
 }
 
 impl ContigDepth {
-    fn new(coverage_cap: u32) -> Self {
-        // Cap fits in u16 because coverage-cap histograms are bounded by
-        // `u32::MAX` but in practice we run with ≤ 250. Clamp defensively.
-        let cap = coverage_cap.min(u32::from(u16::MAX));
-        #[allow(clippy::cast_possible_truncation)]
-        let coverage_cap = cap as u16;
+    fn new(coverage_cap: u16) -> Self {
         Self { depth: Vec::new(), coverage_cap, excl_capped: 0 }
     }
 
