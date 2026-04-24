@@ -66,6 +66,17 @@ impl AlignmentReader {
         }
     }
 
+    /// True iff the reader supports in-place reads via [`read_record_buf`].
+    /// Returns `false` only for CRAM, which noodles does not let us read
+    /// into a caller-owned `RecordBuf`. Callers that build their own pooling
+    /// around `read_record_buf` should fall back to a cloning path
+    /// (e.g. [`record_bufs`](Self::record_bufs) or
+    /// [`for_each_record`](Self::for_each_record)) when this is `false`.
+    #[must_use]
+    pub fn supports_in_place_reads(&self) -> bool {
+        !matches!(self, Self::Cram(_))
+    }
+
     /// Reads the next alignment record into the provided `RecordBuf`, reusing its
     /// allocations.  Returns the number of bytes read, or `0` at EOF.
     ///
@@ -74,7 +85,9 @@ impl AlignmentReader {
     ///
     /// # Errors
     /// Returns an error if reading fails or the file is CRAM (which does not
-    /// support this API in noodles).
+    /// support this API in noodles). Check
+    /// [`supports_in_place_reads`](Self::supports_in_place_reads) first if
+    /// you need to fall back gracefully.
     pub fn read_record_buf(&mut self, header: &Header, record: &mut RecordBuf) -> Result<usize> {
         match self {
             Self::Bam(r) => r.read_record_buf(header, record).context("Failed to read BAM record"),

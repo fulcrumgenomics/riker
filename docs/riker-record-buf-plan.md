@@ -11,10 +11,15 @@ and the crossbeam MPMC work queue (same branch), `riker multi --tools wgs`
 on a 12× 1KG BAM (~313M reads, 18GB) runs in **~3:01 wall** with **225s user
 time**. Sampling profile (`samply`, `bench-prof` profile with LTO off):
 
-| Thread            | CPU     | Top cost                                                    |
-|-------------------|---------|-------------------------------------------------------------|
-| Reader            | 186.9s  | BGZF decompress 92s · BAM decode 76s · Data churn 18s       |
-| Pool workers (×2) | ~34s ea | `wait_timeout` gone after crossbeam; now ~10s real work each |
+| Thread            | CPU     | Top cost                                                   |
+|-------------------|---------|------------------------------------------------------------|
+| Reader            | 186.9s  | BGZF decompress 92s · BAM decode 76s · Data churn 18s      |
+| Pool workers (×2) | ~10s ea | Real collector work; idle-blocked on `recv()` the rest     |
+
+(Profile captured against the pre-crossbeam branch `1aacac6`; the pool
+workers at that point were burning ~25s each in `Condvar::wait_timeout`
+on top of their 10s of real work. After the crossbeam switch the
+wait-timeout cost is gone, so the ~10s figure is what remains.)
 
 The reader thread is fully pegged at 98% of wall. Of its 187s:
 
@@ -128,14 +133,14 @@ empty.**
 
 ## Where the wins come from
 
-| Current cost              | Fate under `RikerRecordBuf`                        |
-|---------------------------|----------------------------------------------------|
-| 53s aux-tag parse         | Deferred; zero if no collector calls `data()`       |
-| 18s `Data::clear`/`insert`| No HashMap in the hot path                          |
-| ~7s rpmalloc              | Mostly gone (Data churn was a big chunk)            |
-| 13s sequence unpack       | Still paid when wgs/error asks; same cost but once  |
-| 92s BGZF                  | Unchanged — fundamental                             |
-| 76s BAM decode overall    | Drops roughly to `92 + (per-field cache fills)`     |
+| Current cost              | Fate under `RikerRecordBuf`                              |
+|---------------------------|----------------------------------------------------------|
+| 53s aux-tag parse         | Deferred; zero if no collector calls `data()`             |
+| 18s `Data::clear`/`insert`| No HashMap in the hot path                                |
+| ~7s rpmalloc              | Mostly gone (Data churn was a big chunk)                  |
+| 13s sequence unpack       | Paid per record when wgs/error asks — **plus** a free/realloc of the cached `Vec<u8>` on every `read_into` reset (`OnceCell` doesn't let us reuse the allocation). A bespoke single-shot cell that retains its inner allocation across resets would kill that. Measure before optimising. |
+| 92s BGZF                  | Unchanged — fundamental                                   |
+| 76s BAM decode overall    | Drops roughly to `92 + (per-field cache fills)`           |
 
 Back-of-envelope: reader falls from 187s → ~110–120s CPU → wall ~2:00–2:15.
 
@@ -178,30 +183,53 @@ Back-of-envelope: reader falls from 187s → ~110–120s CPU → wall ~2:00–2:
   build a `RikerRecordBuf` from a `RecordBuf` for CRAM inputs. That's a
   performance regression for CRAM vs. current behaviour (we'd decode aux
   tags eagerly then discard them unless needed). Acceptable: CRAM is the
-  minority case and the eager path is what we have today.
+  minority case and the eager path is what we have today. (Aside: CRAM is
+  already routed to the single-threaded multi path because
+  `AlignmentReader::read_record_buf` doesn't support in-place reads for
+  CRAM — see `AlignmentReader::supports_in_place_reads`. The `RikerRecordBuf`
+  story will ride on top of that same split.)
 - **Where does `data()` caching live when a collector *does* want it?** For
   `error`'s NM-tag lookup, a `HashMap<Tag, Value>` is overkill — we parse
   the whole aux block to read one tag. A narrower helper like
   `find_aux_tag(record, Tag::NM) -> Option<Value>` that scans the raw aux
   bytes without building a HashMap might be even faster for single-tag
   lookups. Worth measuring once the basic path works.
-- **Mate-buffer storage.** The error collector's `MateBuffer<RecordBuf>`
-  clones the record into the cache. Under `RikerRecordBuf` the `buf: Vec<u8>`
-  means the clone still allocates for the byte buffer itself. We could
-  either accept this (paid only for buffered reads, not all reads) or
-  extend the buffer pool story to reuse those buffers too — but that adds
-  complexity. Start with the simple clone.
+- **Mate-buffer storage lifetime.** The `error` collector's
+  `MateBuffer<RecordBuf>` clones the record into the cache at the time of
+  `probe`, and the cached entry lives until the mate arrives later in the
+  same contig — possibly many thousands of records later. Under
+  `RikerRecordBuf` the cache would hold the byte buffer, which:
+  1. keeps the multi pool from reusing that slot (fine — the clone is
+     independent of the pool), and
+  2. defers aux-tag decode to the point where the *mate* arrives and
+     `error` actually compares base-level data, which matches what the
+     mate cache is supposed to do anyway.
+  Simple clone at `probe` time is the right first cut. Measure memory
+  usage on a deep-coverage input before adding any second-tier buffer
+  pool for the mate cache.
 - **Handling of `l_read_name`, `l_seq`, `n_cigar_op`.** These are fixed
   offsets in the BAM record header; straightforward to pull out during
   `read_into` and cache in `FieldOffsets`.
+- **Migrating call sites that take `impl sam::alignment::Record`.** Most
+  riker code today calls methods directly on `&RecordBuf`. A handful of
+  helpers (e.g. in `src/sam/record_utils.rs`, the `MateCache` trait) are
+  generic over something. If any of those are bounded by
+  `sam::alignment::Record` we'll either need to (a) implement that trait
+  for `RikerRecordBuf`, or (b) drop the bound and take `&RikerRecordBuf`
+  directly. (a) is more invasive — `sam::alignment::Record`'s associated
+  types (name, cigar, sequence, ...) return trait objects or specific
+  view types that would force us to mirror noodles' API precisely; (b)
+  is mechanical and keeps our own shape. Plan to do (b).
 
 ## Risks
 
 - **Invariant fragility** — the `OnceCell` reset on buffer reuse is a
   correctness land-mine. A forgotten reset means a cached field returned
-  from a previous record would be served for the next. Build a debug-build
-  invariant check (e.g. a generation counter on the buffer that the caches
-  compare against, panicking if they see a stale generation).
+  from a previous record would be served for the next. Guard it with a
+  generation counter on the buffer that the caches compare against on
+  every access, panicking on a stale generation. Gate the check with
+  `#[cfg(debug_assertions)]` so the release-build cache accessors stay
+  branchless.
 - **Maintenance overhead** — custom record type is another thing to
   understand when contributing. We should document the BAM field layout
   and the reset semantics thoroughly in the module docs.
