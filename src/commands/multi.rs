@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+use std::sync::mpsc::{self, Receiver, TryRecvError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -31,8 +31,43 @@ const BATCH_SIZE: usize = 256;
 /// Number of batches buffered per collector channel.
 const CHANNEL_DEPTH: usize = 128;
 
+/// Extra pool slots beyond `CHANNEL_DEPTH` to absorb the in-flight batch and
+/// any transient ordering between dispatch and per-collector drain.
+const POOL_EXTRA: usize = 2;
+
 /// A batch of records shared across collector channels.
-type Batch = Arc<Vec<RecordBuf>>;
+///
+/// Wrapping the records in `RecyclableBatch` lets us send the inner
+/// `Vec<RecordBuf>` back to the reader's pool when the last `Arc` reference
+/// drops (i.e. the last collector has finished with it), so the reader can
+/// reuse the pre-allocated `RecordBuf` slots on the next read and avoid the
+/// per-record clone that `Reader::record_bufs` would do.
+type Batch = Arc<RecyclableBatch>;
+
+/// Owns a pre-allocated `Vec<RecordBuf>` of capacity `BATCH_SIZE` plus a count
+/// of valid records. On drop, the inner `Vec` is returned to the reader's
+/// pool via `return_tx` so its allocations can be reused.
+struct RecyclableBatch {
+    records: Vec<RecordBuf>,
+    len: usize,
+    return_tx: mpsc::Sender<Vec<RecordBuf>>,
+}
+
+impl RecyclableBatch {
+    /// Valid records in the batch, as a slice.
+    fn records(&self) -> &[RecordBuf] {
+        &self.records[..self.len]
+    }
+}
+
+impl Drop for RecyclableBatch {
+    fn drop(&mut self) {
+        // Hand the inner Vec back to the reader's pool for reuse. The receiver
+        // is dropped during shutdown; ignore send errors in that case.
+        let records = std::mem::take(&mut self.records);
+        let _ = self.return_tx.send(records);
+    }
+}
 
 // ─── Multi command struct ────────────────────────────────────────────────────
 
@@ -336,6 +371,20 @@ fn run_parallel(
         }));
     }
 
+    // Pool of reusable record-batch allocations. When a `RecyclableBatch`
+    // drops (last collector done), its inner `Vec<RecordBuf>` is sent back
+    // here so the reader can reuse those pre-allocated slots.
+    //
+    // Unbounded channel: receivers may arrive at arbitrary times during
+    // shutdown and we must never block in `RecyclableBatch::drop`.
+    let (pool_tx, pool_rx) = mpsc::channel::<Vec<RecordBuf>>();
+    let pool_size = CHANNEL_DEPTH + POOL_EXTRA;
+    for _ in 0..pool_size {
+        let mut vec: Vec<RecordBuf> = Vec::with_capacity(BATCH_SIZE);
+        vec.resize_with(BATCH_SIZE, RecordBuf::default);
+        pool_tx.send(vec).expect("pool receiver exists on startup, send cannot fail");
+    }
+
     let poison = AtomicBool::new(false);
     let notify = (Mutex::new(()), Condvar::new());
 
@@ -347,15 +396,28 @@ fn run_parallel(
             pool_handles.push(scope.spawn(|| pool_thread_loop(&slots, &poison, &notify)));
         }
 
-        // Reader thread runs on the current scope too.
-        let reader_handle = scope.spawn(|| {
-            let reader_result = reader_thread_loop(&mut reader, header, &senders, &poison, &notify);
+        // Reader thread runs on the current scope too. The pool ends, the
+        // senders, and the reader all move into it; `poison`/`notify` are
+        // shared with the pool threads so we pass references (which the
+        // `move` closure captures by copy).
+        let poison_ref: &AtomicBool = &poison;
+        let notify_ref: &(Mutex<()>, Condvar) = &notify;
+        let reader_handle = scope.spawn(move || {
+            let reader_result = reader_thread_loop(
+                &mut reader,
+                header,
+                &senders,
+                pool_tx,
+                pool_rx,
+                poison_ref,
+                notify_ref,
+            );
 
             // Drop all senders so pool threads see channel disconnection.
             drop(senders);
 
             // Wake pool threads so they notice the disconnection.
-            notify.1.notify_all();
+            notify_ref.1.notify_all();
 
             reader_result
         });
@@ -400,64 +462,78 @@ fn run_parallel(
 }
 
 /// Reader thread: reads BAM records in batches and dispatches to all collector channels.
+///
+/// Records are read directly into pre-allocated `RecordBuf`s pulled from
+/// `pool_rx`; when the last collector has processed the resulting
+/// [`RecyclableBatch`], the inner `Vec` flows back to `pool_tx` via the
+/// batch's `Drop`, so we never pay per-record allocation costs after startup.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "pool_tx and pool_rx are moved into the reader thread's scope so \
+              that in-flight RecyclableBatch Drops can clone pool_tx and pool_rx \
+              is !Sync"
+)]
 fn reader_thread_loop(
     reader: &mut AlignmentReader,
     header: &Header,
     senders: &[std::sync::mpsc::SyncSender<Batch>],
+    pool_tx: mpsc::Sender<Vec<RecordBuf>>,
+    pool_rx: mpsc::Receiver<Vec<RecordBuf>>,
     poison: &AtomicBool,
     notify: &(Mutex<()>, Condvar),
 ) -> Result<()> {
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
-    let mut batch = Vec::with_capacity(BATCH_SIZE);
 
-    for result in reader.record_bufs(header) {
+    loop {
         if poison.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        let record = result?;
-        progress.record_with(&record, header);
-        batch.push(record);
-
-        if batch.len() >= BATCH_SIZE && !dispatch_batch(&mut batch, senders, poison, notify) {
+        // Pull an empty batch from the pool. Blocks if every batch is currently
+        // in flight, which is the backpressure mechanism.
+        let Ok(mut records) = pool_rx.recv() else {
+            // Reader's pool was closed — shouldn't happen during normal run
+            // since we hold pool_tx ourselves.
             return Ok(());
-        }
-    }
+        };
 
-    // Send any remaining partial batch.
-    if !batch.is_empty() {
-        dispatch_batch(&mut batch, senders, poison, notify);
+        // Read up to BATCH_SIZE records directly into the pre-allocated slots.
+        // Each RecordBuf's inner Vecs (name, cigar, sequence, quality, data)
+        // are reused across records.
+        let mut len = 0;
+        while len < records.len() {
+            let bytes = reader.read_record_buf(header, &mut records[len])?;
+            if bytes == 0 {
+                break;
+            }
+            progress.record_with(&records[len], header);
+            len += 1;
+        }
+
+        if len == 0 {
+            // EOF: return the unused batch to the pool and exit.
+            let _ = pool_tx.send(records);
+            break;
+        }
+
+        // Wrap and dispatch. When the last collector drops its Arc, the
+        // batch's Drop sends `records` back to `pool_tx` for reuse.
+        let batch = Arc::new(RecyclableBatch { records, len, return_tx: pool_tx.clone() });
+        for tx in senders {
+            if poison.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if tx.send(Arc::clone(&batch)).is_err() {
+                // Receiver dropped — a pool thread errored.
+                return Ok(());
+            }
+        }
+        drop(batch);
+        notify.1.notify_all();
     }
 
     progress.finish();
     Ok(())
-}
-
-/// Wrap the current batch in an Arc and send it to all collector channels.
-/// Returns `true` if dispatch succeeded, `false` if sending should stop
-/// (poison flag set or a receiver was dropped).
-fn dispatch_batch(
-    batch: &mut Vec<RecordBuf>,
-    senders: &[std::sync::mpsc::SyncSender<Batch>],
-    poison: &AtomicBool,
-    notify: &(Mutex<()>, Condvar),
-) -> bool {
-    let arc_batch = Arc::new(std::mem::replace(batch, Vec::with_capacity(BATCH_SIZE)));
-
-    for tx in senders {
-        if poison.load(Ordering::Relaxed) {
-            return false;
-        }
-        // send() blocks if the channel is full — this is the backpressure mechanism.
-        if tx.send(Arc::clone(&arc_batch)).is_err() {
-            // Receiver dropped — collector thread errored.
-            return false;
-        }
-    }
-
-    // Notify pool threads that new work is available.
-    notify.1.notify_all();
-    true
 }
 
 /// Pool thread work loop: services any collector that has pending batches.
@@ -484,7 +560,7 @@ fn pool_thread_loop(
                 match slot.rx.try_recv() {
                     Ok(batch) => {
                         let CollectorSlot { collector, header, .. } = &mut *slot;
-                        collector.accept_multiple(&batch, header)?;
+                        collector.accept_multiple(batch.records(), header)?;
                         did_work = true;
                     }
                     Err(TryRecvError::Empty) => {}
@@ -493,7 +569,7 @@ fn pool_thread_loop(
                         {
                             let CollectorSlot { collector, rx, header, .. } = &mut *slot;
                             while let Ok(batch) = rx.try_recv() {
-                                collector.accept_multiple(&batch, header)?;
+                                collector.accept_multiple(batch.records(), header)?;
                             }
                         }
                         if !poison.load(Ordering::Relaxed) {
