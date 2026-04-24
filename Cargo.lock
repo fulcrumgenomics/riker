@@ -1329,6 +1329,7 @@ dependencies = [
  "built",
  "chrono",
  "clap",
+ "crossbeam-channel",
  "csv",
  "enum_dispatch",
  "env_logger",
