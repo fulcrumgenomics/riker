@@ -20,6 +20,7 @@ use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::record_utils::{derive_sample, get_integer_tag};
+use crate::simd;
 
 /// File suffix appended to the output prefix for alignment summary metrics.
 pub const METRICS_SUFFIX: &str = ".alignment-metrics.txt";
@@ -510,13 +511,16 @@ impl CategoryAccumulator {
                     if is_hq {
                         self.hq_aligned_bases += len as u64;
                         if has_quals {
-                            for i in 0..len {
-                                if qual_bytes.get(read_pos + i).copied().unwrap_or(0)
-                                    >= BASE_QUALITY_THRESHOLD
-                                {
-                                    self.hq_aligned_q20_bases += 1;
-                                }
-                            }
+                            // Malformed BAMs can declare a CIGAR longer than the
+                            // quality array. Clamp the window to `qual_bytes.len()`
+                            // so out-of-range positions are silently omitted —
+                            // identical count to the pre-SIMD scalar form, which
+                            // used `.get().unwrap_or(0)` (Q=0 never passes a
+                            // non-zero BQ threshold, so the two paths agree).
+                            let end = (read_pos + len).min(qual_bytes.len());
+                            let window = &qual_bytes[read_pos..end];
+                            self.hq_aligned_q20_bases +=
+                                simd::count_bases_ge_q(window, BASE_QUALITY_THRESHOLD);
                         }
                     }
                     read_pos += len;

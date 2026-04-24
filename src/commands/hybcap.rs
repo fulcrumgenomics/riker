@@ -23,6 +23,7 @@ use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::derive_sample;
 use crate::sequence_dict::SequenceDictionary;
+use crate::simd;
 
 /// `(ref_start_0based, ref_end_exclusive, aligned_bases, alignment_blocks)`.
 type AlignmentInfo = (u32, u32, u64, SmallVec<[(u32, u32); 8]>);
@@ -501,8 +502,7 @@ impl HybCapCollector {
                         // instead of per-base branching.
                         if effective_len == op.len() && effective_len > 0 {
                             let quals = &qual_bytes[read_offset..read_offset + effective_len];
-                            let low_qual =
-                                quals.iter().filter(|&&q| q < self.min_bq).count() as u64;
+                            let low_qual = simd::count_bases_lt_q(quals, self.min_bq);
                             self.exc_baseq_bases += low_qual;
                             self.exc_off_target_bases += effective_len as u64 - low_qual;
                         } else {
@@ -631,29 +631,21 @@ impl HybCapCollector {
 
     /// Compute GC fraction from a sequence of bases.
     ///
-    /// N (ambiguous) bases are counted in the denominator and contribute 0.5 to the
-    /// GC numerator, treating them as maximally uncertain rather than ignoring them
-    /// (which inflates GC in N-rich regions) or treating them as non-GC (which dilutes it).
+    /// Non-ACGT bases (N and any IUPAC ambiguity codes) are counted in the
+    /// denominator and contribute 0.5 to the GC numerator, treating them as
+    /// maximally uncertain rather than ignoring them (which would inflate GC
+    /// in N-rich regions) or treating them as non-GC (which would dilute it).
     fn gc_fraction(bases: &[u8]) -> f64 {
         let mut gc = 0u64;
-        let mut total = 0u64;
-        let mut n_count = 0u64;
+        let mut ambiguous = 0u64;
         for &b in bases {
             match b {
-                b'G' | b'C' | b'g' | b'c' => {
-                    gc += 1;
-                    total += 1;
-                }
-                b'A' | b'T' | b'a' | b't' => {
-                    total += 1;
-                }
-                _ => {
-                    n_count += 1;
-                    total += 1;
-                }
+                b'G' | b'C' | b'g' | b'c' => gc += 1,
+                b'A' | b'T' | b'a' | b't' => {}
+                _ => ambiguous += 1,
             }
         }
-        safe_div_f(gc as f64 + n_count as f64 * 0.5, total as f64)
+        safe_div_f(gc as f64 + ambiguous as f64 * 0.5, bases.len() as f64)
     }
 
     /// Estimate library size using the Lander-Waterman model (bisection method).

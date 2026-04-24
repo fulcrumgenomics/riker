@@ -25,6 +25,7 @@ use crate::progress::ProgressLogger;
 use crate::sam::indexed_reader::IndexedAlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sequence_dict::SequenceDictionary;
+use crate::simd;
 use crate::vcf::IndexedVcf;
 
 // ─── Constants & type aliases ────────────────────────────────────────────────────
@@ -1716,10 +1717,7 @@ impl ReadLevelCache {
             if seq.is_empty() {
                 None
             } else {
-                let gc_count = seq
-                    .iter()
-                    .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
-                    .count();
+                let gc_count = simd::count_gc_case_insensitive(seq) as usize;
                 let pct = (gc_count * 100 + seq.len() / 2) / seq.len();
                 Some(CovariateValue::Int(pct as u32))
             }

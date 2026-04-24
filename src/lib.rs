@@ -16,5 +16,6 @@ pub mod plotting;
 pub mod progress;
 pub mod sam;
 pub mod sequence_dict;
+pub mod simd;
 pub mod vcf;
 pub mod version;
