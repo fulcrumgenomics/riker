@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -11,7 +10,6 @@ use kuva::render::layout::Layout;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
 use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::Cigar as CigarTrait;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
@@ -26,6 +24,7 @@ use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{FG_BLUE, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::mate_buffer::{MateBuffer, Peek};
 use crate::sam::record_utils::derive_sample;
 use crate::sequence_dict::SequenceDictionary;
 
@@ -72,29 +71,19 @@ pub struct WgsOptions {
 
     /// Maximum depth reported in the metrics and histogram.
     ///
-    /// At each position, the internal buffer stores up to 2x coverage-cap
-    /// read-name hashes for read-pair overlap detection before dedup. Bases
-    /// exceeding the cap are counted as capped exclusions. Memory usage is
-    /// approximately max-read-ref-span x 2 x coverage-cap x 8 bytes.
+    /// Per-position depths saturate at this value; bases arriving at a
+    /// position that has already hit the cap are counted as capped exclusions.
+    /// Bounded by u16 (max 65535) since the per-position depth array stores
+    /// each slot as a u16.
     #[arg(long, default_value_t = WgsOptions::DEFAULT_COVERAGE_CAP)]
-    pub coverage_cap: u32,
-
-    /// Maximum reference span (in bases) of a single read alignment.
-    ///
-    /// The internal circular buffer holds this many genomic positions. It must
-    /// be at least as large as the longest CIGAR reference span. The default
-    /// of 1000 suits short-read Illumina data; increase for long-read
-    /// technologies. Memory scales linearly with this value.
-    #[arg(long, default_value_t = WgsOptions::DEFAULT_MAX_READ_REF_SPAN)]
-    pub max_read_ref_span: usize,
+    pub coverage_cap: u16,
 }
 
 impl WgsOptions {
     const DEFAULT_EXCLUDE_UNPAIRED: bool = true;
     const DEFAULT_MIN_MAPQ: u8 = 20;
     const DEFAULT_MIN_BQ: u8 = 20;
-    const DEFAULT_COVERAGE_CAP: u32 = 250;
-    const DEFAULT_MAX_READ_REF_SPAN: usize = 1000;
+    const DEFAULT_COVERAGE_CAP: u16 = 250;
 }
 
 impl Default for WgsOptions {
@@ -106,7 +95,6 @@ impl Default for WgsOptions {
             min_mapq: Self::DEFAULT_MIN_MAPQ,
             min_bq: Self::DEFAULT_MIN_BQ,
             coverage_cap: Self::DEFAULT_COVERAGE_CAP,
-            max_read_ref_span: Self::DEFAULT_MAX_READ_REF_SPAN,
         }
     }
 }
@@ -168,7 +156,8 @@ impl Command for Wgs {
 
 // ─── Collector ────────────────────────────────────────────────────────────────
 
-/// Accumulates per-position coverage statistics using a circular depth buffer.
+/// Accumulates per-position coverage statistics using a contig-sized depth
+/// array and a per-pair mate buffer for overlap detection.
 pub struct WgsCollector {
     // Output paths
     metrics_path: PathBuf,
@@ -179,8 +168,11 @@ pub struct WgsCollector {
     // Input path (needed for sample name derivation in initialize)
     input_path: PathBuf,
 
-    // Circular depth buffer (replaces PileupEngine)
-    buffer: DepthBuffer,
+    // Per-contig depth array (one u16 per genomic position, reused across contigs).
+    depth: ContigDepth,
+
+    // Buffer of already-seen mate records whose overlapping mate hasn't arrived yet.
+    mate_buffer: MateBuffer<CachedMate>,
 
     // Config
     reference: Fasta,
@@ -189,18 +181,14 @@ pub struct WgsCollector {
     include_unpaired: bool,
     min_mapq: u8,
     min_bq: u8,
-    coverage_cap: u32,
+    coverage_cap: u16,
 
     // BAM contig metadata
     dict: Option<SequenceDictionary>,
 
-    // The ref_id of the reads currently being added to the buffer.
-    buffer_ref_id: Option<usize>,
-
     // Per-contig working state
     current_ref_id: Option<usize>,
     current_non_n: BitVec,
-    current_covered: u64,
     processed_contigs: HashSet<usize>,
 
     // Global accumulators
@@ -212,7 +200,6 @@ pub struct WgsCollector {
     bases_excl_baseq: u64,
     bases_excl_overlap: u64,
     bases_excl_capped: u64,
-    bases_excl_truncated: u64,
 
     sample: String,
 }
@@ -247,7 +234,8 @@ impl WgsCollector {
             plot_path,
             plot_title: String::new(),
             input_path: input.to_path_buf(),
-            buffer: DepthBuffer::new(options.max_read_ref_span, options.coverage_cap),
+            depth: ContigDepth::new(options.coverage_cap),
+            mate_buffer: MateBuffer::new(),
             reference,
             intervals,
             include_duplicates: options.include_duplicates,
@@ -256,10 +244,8 @@ impl WgsCollector {
             min_bq: options.min_bq,
             coverage_cap: options.coverage_cap,
             dict: None,
-            buffer_ref_id: None,
             current_ref_id: None,
             current_non_n: BitVec::EMPTY,
-            current_covered: 0,
             processed_contigs: HashSet::new(),
             genome_territory: 0,
             depth_histogram: vec![0u64; hist_len],
@@ -269,174 +255,8 @@ impl WgsCollector {
             bases_excl_baseq: 0,
             bases_excl_overlap: 0,
             bases_excl_capped: 0,
-            bases_excl_truncated: 0,
             sample: String::new(),
         })
-    }
-
-    /// Flush all positions in the buffer before `genome_pos`, recording
-    /// coverage statistics for each.
-    fn flush_before(&mut self, genome_pos: u64) -> Result<()> {
-        while self.buffer.len > 0 && self.buffer.genome_pos < genome_pos {
-            self.flush_one()?;
-        }
-        Ok(())
-    }
-
-    /// Flush all remaining positions in the buffer.
-    fn flush_all(&mut self) -> Result<()> {
-        while self.buffer.len > 0 {
-            self.flush_one()?;
-        }
-        Ok(())
-    }
-
-    /// Flush the head position of the buffer and record its coverage.
-    fn flush_one(&mut self) -> Result<()> {
-        let genome_pos = self.buffer.genome_pos;
-        let ref_id = self.buffer_ref_id.expect("buffer_ref_id set when buffer is non-empty");
-        let result = self.buffer.flush_position(self.coverage_cap);
-        self.record_position(ref_id, genome_pos, &result)
-    }
-
-    /// Process a flushed position: handle contig transitions, N-base checks,
-    /// interval checks, and update the histogram and accumulators.
-    #[allow(clippy::cast_possible_truncation)] // compile_error! in lib.rs guarantees 64-bit platform
-    fn record_position(&mut self, ref_id: usize, pos: u64, result: &FlushResult) -> Result<()> {
-        // ── Contig transition ────────────────────────────────────────────────
-        if Some(ref_id) != self.current_ref_id {
-            self.finalize_contig();
-            let name = self.dict.as_ref().unwrap().get_by_index(ref_id).map_or("", |m| m.name());
-            self.current_non_n = build_non_n_bitvec(&self.reference.load_contig(name, false)?);
-            self.current_ref_id = Some(ref_id);
-            self.current_covered = 0;
-            self.processed_contigs.insert(ref_id);
-        }
-
-        // ── Skip N bases ─────────────────────────────────────────────────────
-        let pos_idx = pos as usize;
-        if pos_idx >= self.current_non_n.len() || !self.current_non_n[pos_idx] {
-            return Ok(());
-        }
-
-        // ── Skip positions outside intervals ─────────────────────────────────
-        if !self.pos_in_intervals(ref_id, pos) {
-            return Ok(());
-        }
-
-        self.current_covered += 1;
-
-        // ── Update histogram and accumulators ────────────────────────────────
-        let capped = result.depth.min(u64::from(self.coverage_cap));
-        let capped_idx = capped as usize;
-        self.depth_histogram[capped_idx] += 1;
-        self.bases_excl_capped += result.excl_capped;
-        self.bases_excl_overlap += result.excl_overlap;
-
-        Ok(())
-    }
-
-    /// Finalize the current contig: count all eligible (non-N, in-interval) positions
-    /// and add uncovered positions to `depth_histogram[0]`.
-    fn finalize_contig(&mut self) {
-        let Some(ref_id) = self.current_ref_id else {
-            return;
-        };
-
-        let non_n_bv = std::mem::take(&mut self.current_non_n);
-        let non_n = self.count_eligible_positions(ref_id, &non_n_bv);
-        self.genome_territory += non_n;
-
-        // Positions with depth=0 are the eligible positions not covered by the pileup.
-        let uncovered = non_n.saturating_sub(self.current_covered);
-        self.depth_histogram[0] += uncovered;
-
-        self.current_covered = 0;
-    }
-
-    /// Count non-N positions in `non_n` that fall within the configured intervals
-    /// for `ref_id` (or all positions if no intervals are configured).
-    fn count_eligible_positions(&self, ref_id: usize, non_n: &BitVec) -> u64 {
-        match &self.intervals {
-            None => non_n.count_ones() as u64,
-            Some(intervals) => {
-                let ivl = intervals.contig_bitvec(ref_id);
-                if ivl.is_empty() {
-                    return 0;
-                }
-                // AND the two bitvecs over their shared length, then count ones.
-                let len = non_n.len().min(ivl.len());
-                (non_n[..len].to_bitvec() & &ivl[..len]).count_ones() as u64
-            }
-        }
-    }
-
-    /// Return true if `pos` is within the configured intervals for `ref_id`,
-    /// or if no intervals are configured (all positions pass).
-    #[expect(clippy::cast_possible_truncation, reason = "genomic coordinates fit in u32")]
-    fn pos_in_intervals(&self, ref_id: usize, pos: u64) -> bool {
-        match &self.intervals {
-            None => true,
-            Some(intervals) => intervals.contains_pos(ref_id, pos as u32),
-        }
-    }
-
-    /// Write a PDF area-chart of the coverage depth distribution to [`Self::plot_path`].
-    ///
-    /// The X axis runs from 0 to `x_max` (the 99.9th-percentile depth), so the long
-    /// high-depth tail is trimmed.  The Y axis is the fraction of genome positions at
-    /// each depth.  A theoretical Poisson distribution is overlaid as a dashed line
-    /// using the observed `mean_coverage` as lambda.  Returns immediately when `x_max`
-    /// is 0 or no territory exists.
-    fn plot_histogram(&self, x_max: u64, mean_coverage: f64) -> Result<()> {
-        if self.genome_territory == 0 || x_max == 0 {
-            return Ok(());
-        }
-
-        let territory = self.genome_territory as f64;
-
-        let x_max_idx = usize::try_from(x_max).expect("x_max ≤ coverage_cap (u32)");
-        let xy: Vec<(f64, f64)> = self
-            .depth_histogram
-            .iter()
-            .enumerate()
-            .take(x_max_idx + 1)
-            .map(|(d, &c)| (d as f64, c as f64 / territory))
-            .collect();
-
-        // Theoretical Poisson distribution scaled by the fraction of covered bases.
-        let covered_bases = territory - self.depth_histogram[0] as f64;
-        let covered_frac = covered_bases / territory;
-        let poisson_xy: Vec<(f64, f64)> =
-            (0..=x_max).map(|k| (k as f64, poisson_pmf(k, mean_coverage) * covered_frac)).collect();
-
-        let observed = LinePlot::new()
-            .with_data(xy)
-            .with_color(FG_BLUE)
-            .with_fill()
-            .with_fill_opacity(0.3)
-            .with_legend("Empirical");
-
-        let theoretical = LinePlot::new()
-            .with_data(poisson_xy)
-            .with_color(FG_TEAL)
-            .with_dashed()
-            .with_stroke_width(1.5)
-            .with_legend("Theoretical");
-
-        let plots: Vec<Plot> = vec![observed.into(), theoretical.into()];
-
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
-            .with_title(&self.plot_title)
-            .with_x_label("Coverage Depth (X)")
-            .with_y_label("Fraction of Genome")
-            .with_minor_ticks(5)
-            .with_show_minor_grid(true)
-            .with_legend_position(LegendPosition::InsideTopRight);
-
-        write_plot_pdf(plots, layout, &self.plot_path)
     }
 
     /// Finalize the last contig, process any un-pileup'd contigs, and write output.
@@ -450,6 +270,7 @@ impl WgsCollector {
         self.current_ref_id = None;
 
         // Process contigs that had zero reads (never appeared in pileup).
+        // `dict` is set in `initialize`, which always runs before `finish`.
         let dict = self.dict.as_ref().unwrap();
         let n_contigs = dict.len();
         for ref_id in 0..n_contigs {
@@ -541,8 +362,7 @@ impl WgsCollector {
                 + self.bases_excl_unpaired
                 + self.bases_excl_baseq
                 + self.bases_excl_overlap
-                + self.bases_excl_capped
-                + self.bases_excl_truncated,
+                + self.bases_excl_capped,
         );
 
         let total_raw = total_excl as f64 + sum_depth;
@@ -565,7 +385,6 @@ impl WgsCollector {
             frac_excluded_baseq: frac_excl(self.bases_excl_baseq),
             frac_excluded_overlap: frac_excl(self.bases_excl_overlap),
             frac_excluded_capped: frac_excl(self.bases_excl_capped),
-            frac_excluded_truncated: frac_excl(self.bases_excl_truncated),
             frac_excluded_total: frac_excl_total,
             frac_bases_at_1x: frac_at(1),
             frac_bases_at_5x: frac_at(5),
@@ -625,6 +444,212 @@ impl WgsCollector {
 
         Ok(())
     }
+
+    /// Walk the per-position depth array for the current contig and accumulate
+    /// per-position statistics into the global histograms. As it goes, it
+    /// zeroes each slot in the depth array (so the next contig starts clean
+    /// without a separate memset) and accumulates the `bases_excl_capped`
+    /// overflow counter from the per-contig buffer.
+    fn finalize_contig(&mut self) {
+        let Some(ref_id) = self.current_ref_id else {
+            return;
+        };
+
+        // Global capped-exclusion counter absorbs the per-contig cap overflow.
+        self.bases_excl_capped += self.depth.take_excl_capped();
+
+        let non_n_bv = std::mem::take(&mut self.current_non_n);
+        let intervals_bv = self.intervals.as_ref().map(|intervals| intervals.contig_bitvec(ref_id));
+
+        let contig_len = self.depth.len();
+        let capped = self.coverage_cap;
+        let mut eligible: u64 = 0;
+        for pos in 0..contig_len {
+            let depth = self.depth.take(pos);
+            // Skip positions that are N in the reference, or outside the
+            // optional intervals mask.
+            let non_n_ok = pos < non_n_bv.len() && non_n_bv[pos];
+            let interval_ok = intervals_bv.as_ref().is_none_or(|bv| pos < bv.len() && bv[pos]);
+            if !non_n_ok || !interval_ok {
+                continue;
+            }
+            eligible += 1;
+            let idx = depth.min(capped) as usize;
+            self.depth_histogram[idx] += 1;
+        }
+        self.genome_territory += eligible;
+
+        // All positions in the active contig have been read-and-zeroed above,
+        // so the depth array is ready for the next contig without an explicit
+        // memset.
+    }
+
+    /// Write a PDF area-chart of the coverage depth distribution to [`Self::plot_path`].
+    ///
+    /// The X axis runs from 0 to `x_max` (the 99.9th-percentile depth), so the long
+    /// high-depth tail is trimmed.  The Y axis is the fraction of genome positions at
+    /// each depth.  A theoretical Poisson distribution is overlaid as a dashed line
+    /// using the observed `mean_coverage` as lambda.  Returns immediately when `x_max`
+    /// is 0 or no territory exists.
+    fn plot_histogram(&self, x_max: u64, mean_coverage: f64) -> Result<()> {
+        if self.genome_territory == 0 || x_max == 0 {
+            return Ok(());
+        }
+
+        let territory = self.genome_territory as f64;
+
+        let x_max_idx = usize::try_from(x_max).expect("x_max ≤ coverage_cap (u16)");
+        let xy: Vec<(f64, f64)> = self
+            .depth_histogram
+            .iter()
+            .enumerate()
+            .take(x_max_idx + 1)
+            .map(|(d, &c)| (d as f64, c as f64 / territory))
+            .collect();
+
+        // Theoretical Poisson distribution scaled by the fraction of covered bases.
+        let covered_bases = territory - self.depth_histogram[0] as f64;
+        let covered_frac = covered_bases / territory;
+        let poisson_xy: Vec<(f64, f64)> =
+            (0..=x_max).map(|k| (k as f64, poisson_pmf(k, mean_coverage) * covered_frac)).collect();
+
+        let observed = LinePlot::new()
+            .with_data(xy)
+            .with_color(FG_BLUE)
+            .with_fill()
+            .with_fill_opacity(0.3)
+            .with_legend("Empirical");
+
+        let theoretical = LinePlot::new()
+            .with_data(poisson_xy)
+            .with_color(FG_TEAL)
+            .with_dashed()
+            .with_stroke_width(1.5)
+            .with_legend("Theoretical");
+
+        let plots: Vec<Plot> = vec![observed.into(), theoretical.into()];
+
+        let layout = Layout::auto_from_plots(&plots)
+            .with_width(PLOT_WIDTH)
+            .with_height(PLOT_HEIGHT)
+            .with_title(&self.plot_title)
+            .with_x_label("Coverage Depth (X)")
+            .with_y_label("Fraction of Genome")
+            .with_minor_ticks(5)
+            .with_show_minor_grid(true)
+            .with_legend_position(LegendPosition::InsideTopRight);
+
+        write_plot_pdf(plots, layout, &self.plot_path)
+    }
+
+    /// Count non-N positions in `non_n` that fall within the configured intervals
+    /// for `ref_id` (or all positions if no intervals are configured). Used
+    /// only by `finish_metrics` for contigs that had zero eligible reads and
+    /// therefore never triggered `finalize_contig`.
+    fn count_eligible_positions(&self, ref_id: usize, non_n: &BitVec) -> u64 {
+        match &self.intervals {
+            None => non_n.count_ones() as u64,
+            Some(intervals) => {
+                let ivl = intervals.contig_bitvec(ref_id);
+                if ivl.is_empty() {
+                    return 0;
+                }
+                // AND the two bitvecs over their shared length, then count ones.
+                let len = non_n.len().min(ivl.len());
+                (non_n[..len].to_bitvec() & &ivl[..len]).count_ones() as u64
+            }
+        }
+    }
+
+    /// Begin processing a new contig: load the reference sequence to build the
+    /// non-N bitvec, resize the per-position depth array, and reset the mate
+    /// buffer (mates cannot straddle contigs).
+    fn begin_contig(&mut self, ref_id: usize) -> Result<()> {
+        // `dict` is set in `initialize` before any record arrives; `accept`
+        // is the only caller that drives contig transitions.
+        let name = self.dict.as_ref().unwrap().get_by_index(ref_id).map_or("", |m| m.name());
+        // `contig_length` returns a u64 of genomic coordinates; platforms with
+        // < 64-bit pointers are rejected by the compile_error! in `lib.rs`, so
+        // the cast is lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        let contig_len = self.reference.contig_length(name).map_or(0, |n| n as usize);
+        let seq = self.reference.load_contig(name, false)?;
+        self.current_non_n = build_non_n_bitvec(&seq);
+        self.depth.reset_for_contig(contig_len);
+        self.mate_buffer.clear();
+        self.current_ref_id = Some(ref_id);
+        self.processed_contigs.insert(ref_id);
+        Ok(())
+    }
+
+    /// Walk the CIGAR of `record` and apply its per-base depth contribution,
+    /// parameterised on a [`DepthAction`] that encodes the mate-routing case:
+    ///
+    /// - [`AloneAction`] — no mate overlap; always push depth.
+    /// - [`BufferAction`] — buffer for a later mate; push depth and record
+    ///   each position in the overlap bitmap.
+    /// - [`PairAction`] — second read of a pair; skip positions the cached
+    ///   mate already counted (`excl_overlap`), push depth elsewhere.
+    ///
+    /// The `DepthAction` methods for unused hooks are zero-cost default
+    /// implementations; monomorphisation compiles each call site into the
+    /// same code the three former `process_single` / `process_single_with_bitmap`
+    /// / `process_pair` functions emitted.
+    #[inline]
+    fn walk_depth<A: DepthAction>(&mut self, record: &RecordBuf, mut action: A) {
+        let Some(pos_1based) = record.alignment_start() else {
+            return;
+        };
+        let ref_start_u64 = pos_1based.get() as u64 - 1;
+        let quals: &[u8] = record.quality_scores().as_ref();
+        let contig_len_u64 = self.depth.len() as u64;
+        let min_bq = self.min_bq;
+
+        for (ref_off, read_off, len) in iter_aligned_blocks(record) {
+            let block_ref_start = ref_start_u64 + u64::from(ref_off);
+            // CIGAR blocks that fall entirely past the contig end — a
+            // malformed-BAM case the spec disallows — are silently dropped.
+            if block_ref_start >= contig_len_u64 {
+                continue;
+            }
+            // Clamp the block's effective length to the remaining contig
+            // territory. Any tail past the contig end is silently dropped.
+            let block_ref_end = (block_ref_start + u64::from(len)).min(contig_len_u64);
+            // `usable` ≤ `len` ≤ `u32::MAX` by construction (CIGAR op length
+            // is u32 in noodles), so the cast is lossless.
+            #[allow(clippy::cast_possible_truncation)]
+            let usable = (block_ref_end - block_ref_start) as u32;
+
+            // Clamp both bounds to quals.len(): on a malformed BAM where the
+            // CIGAR claims more read bases than the qual array provides,
+            // `read_off` itself can exceed `quals.len()`, which would make the
+            // naive slice panic.
+            let read_start = (read_off as usize).min(quals.len());
+            let read_end = (read_start + usable as usize).min(quals.len());
+            let available = &quals[read_start..read_end];
+            #[allow(clippy::cast_possible_truncation)]
+            let base_pos = block_ref_start as u32;
+            for (i, &q) in available.iter().enumerate() {
+                if q < min_bq {
+                    self.bases_excl_baseq += 1;
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ref_pos = base_pos + i as u32;
+                    if action.is_mate_covered(ref_pos) {
+                        self.bases_excl_overlap += 1;
+                    } else {
+                        self.depth.push(ref_pos);
+                        action.on_depth_counted(ref_pos);
+                    }
+                }
+            }
+            // If the qual array is shorter than the CIGAR claims the block
+            // spans (malformed BAM — the spec says they match), the missing
+            // quals can't have passed BQ, so we fold them into the BQ-fail
+            // counter to keep the exclusion totals accurate.
+            self.bases_excl_baseq += (usable as usize - available.len()) as u64;
+        }
+    }
 }
 
 // ─── Collector trait impl ─────────────────────────────────────────────────────
@@ -640,10 +665,6 @@ impl Collector for WgsCollector {
         Ok(())
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "offset is bounded by num_positions (usize) before use"
-    )]
     fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
         let flags = record.flags();
 
@@ -684,91 +705,37 @@ impl Collector for WgsCollector {
         let Some(ref_id) = record.reference_sequence_id() else {
             return Ok(());
         };
-        let Some(pos_1based) = record.alignment_start() else {
-            return Ok(());
-        };
-        let start_pos = pos_1based.get() as u64 - 1;
 
-        // Compute name hash.
-        let name_hash = hash_name(record.name().map_or(&[] as &[u8], |n| {
-            let s: &[u8] = n;
-            s
-        }));
-
-        // ── Contig transition: flush all buffered positions ──────────────────
-        if self.buffer_ref_id.is_some() && self.buffer_ref_id != Some(ref_id) {
-            self.flush_all()?;
-        }
-        self.buffer_ref_id = Some(ref_id);
-
-        // ── Flush positions before this read's start (they're complete) ──────
-        if self.buffer.len > 0 {
-            self.flush_before(start_pos)?;
-        }
-
-        // ── Initialize buffer range if empty ─────────────────────────────────
-        self.buffer.ensure_range(start_pos);
-
-        // ── Walk CIGAR and insert name hashes for aligned bases ──────────────
-        let qual: &[u8] = record.quality_scores().as_ref();
-        let num_positions = self.buffer.num_positions;
-        let min_bq = self.min_bq;
-
-        let mut ref_pos = start_pos;
-        let mut read_cursor: usize = 0;
-
-        for op in CigarTrait::iter(record.cigar()).filter_map(Result::ok) {
-            let len = op.len();
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    let first_offset = (ref_pos - self.buffer.genome_pos) as usize;
-
-                    // Determine how many bases fit within the buffer; the rest are truncated.
-                    let usable = if first_offset >= num_positions {
-                        self.bases_excl_truncated += len as u64;
-                        ref_pos += len as u64;
-                        read_cursor += len;
-                        continue;
-                    } else {
-                        len.min(num_positions - first_offset)
-                    };
-                    let truncated = len - usable;
-                    self.bases_excl_truncated += truncated as u64;
-
-                    // Extend buffer len once for the whole block.
-                    let last_offset = first_offset + usable - 1;
-                    if last_offset >= self.buffer.len {
-                        self.buffer.len = last_offset + 1;
-                    }
-
-                    // Inner loop: only BQ check + push.
-                    for i in 0..usable {
-                        let q = qual.get(read_cursor + i).copied().unwrap_or(0);
-                        if q < min_bq {
-                            self.bases_excl_baseq += 1;
-                        } else {
-                            self.buffer.push(first_offset + i, name_hash);
-                        }
-                    }
-                    ref_pos += len as u64;
-                    read_cursor += len;
-                }
-                Kind::Insertion | Kind::SoftClip => {
-                    read_cursor += len;
-                }
-                Kind::Deletion | Kind::Skip => {
-                    ref_pos += len as u64;
-                }
-                Kind::HardClip | Kind::Pad => {}
+        // Contig transition: finalize the previous contig and start a fresh
+        // depth array sized to the new contig. Any buffered mates belonged to
+        // the old contig (mates can never straddle contigs) and were already
+        // pushed when they arrived, so we just drop the buffer.
+        if Some(ref_id) != self.current_ref_id {
+            if self.current_ref_id.is_some() {
+                self.finalize_contig();
             }
+            self.begin_contig(ref_id)?;
+        }
+
+        // Route the record through the mate buffer. Probe first so the
+        // Buffered branch can build the overlap bitmap inline with the depth
+        // walk — one CIGAR iteration, not two.
+        match self.mate_buffer.probe(record) {
+            Peek::Alone => self.walk_depth(record, AloneAction),
+            Peek::WouldBuffer { overlap_start, overlap_len } => {
+                let mut bitmap = bitvec![u64, Lsb0; 0; overlap_len as usize];
+                self.walk_depth(record, BufferAction { overlap_start, bitmap: &mut bitmap });
+                self.mate_buffer.insert(record, CachedMate { overlap_start, bitmap });
+            }
+            Peek::PairWith(cached) => self.walk_depth(record, PairAction { cached: &cached }),
         }
 
         Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
-        // Flush all remaining buffer positions.
-        self.flush_all()?;
+        // All buffered mates have already pushed their depth contributions, so
+        // finalization just needs to close out the last contig and write out.
         self.finish_metrics()
     }
 
@@ -816,9 +783,6 @@ pub struct WgsMetrics {
     /// Fraction of bases excluded because the coverage cap was exceeded.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_excluded_capped: f64,
-    /// Fraction of bases excluded because the read's reference span exceeded --max-read-ref-len.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_excluded_truncated: f64,
     /// Total fraction of bases excluded for any reason.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_excluded_total: f64,
@@ -883,170 +847,202 @@ pub struct WgsCoverageEntry {
     pub frac_bases_at_or_above: f64,
 }
 
-// ─── DepthBuffer ──────────────────────────────────────────────────────────────
+// ─── ContigDepth ─────────────────────────────────────────────────────────────
 
-/// Circular buffer that accumulates name hashes per genomic position for
-/// coverage depth computation.  Replaces the general-purpose `PileupEngine`
-/// with a structure that stores only the data WGS needs (name hashes) and
-/// performs base-quality filtering at insertion time.
-///
-/// Both `num_positions` and `max_depth_per_pos` are rounded up to the next
-/// power of two so that the hot-path modulo and multiply can be replaced with
-/// bitmask and shift operations.
-struct DepthBuffer {
-    /// Flat storage: position `p` uses slots `[p << depth_shift .. (p << depth_shift) + counts[p])`.
-    hashes: Vec<u64>,
-    /// Number of name hashes stored at each buffer position.
-    counts: Vec<u32>,
-    /// Number of bases that arrived at a position after it was full (>= `max_depth_per_pos`).
-    excess: Vec<u64>,
-    /// Number of genomic positions the buffer can hold (power-of-two, rounded up from CLI value).
-    num_positions: usize,
-    /// Bitmask for ring index: `num_positions - 1`.
-    pos_mask: usize,
-    /// Maximum name hash entries per position (power-of-two, rounded up from 2 × `coverage_cap`).
-    max_depth_per_pos: usize,
-    /// Shift amount equivalent to `× max_depth_per_pos`: `max_depth_per_pos.trailing_zeros()`.
-    depth_shift: u32,
-    /// Index of the leftmost active position in the circular buffer.
-    head: usize,
-    /// Genomic position corresponding to `head`.
-    genome_pos: u64,
-    /// Number of active positions currently in use (`head..head+len`).
-    len: usize,
-}
-
-impl DepthBuffer {
-    /// Create a new depth buffer.
-    ///
-    /// `num_positions` is the maximum reference span of a single read alignment.
-    /// `coverage_cap` is the maximum reported depth; `max_depth_per_pos` is set to
-    /// `2 × coverage_cap` to accommodate read-pair overlap before deduplication.
-    ///
-    /// Both values are rounded up to the next power of two internally so that
-    /// ring-index and offset computations use bitmask/shift instead of modulo/multiply.
-    fn new(num_positions: usize, coverage_cap: u32) -> Self {
-        let num_positions = num_positions.next_power_of_two();
-        let pos_mask = num_positions - 1;
-        let max_depth_per_pos = (2 * coverage_cap as usize).next_power_of_two();
-        let depth_shift = max_depth_per_pos.trailing_zeros();
-        Self {
-            hashes: vec![0u64; num_positions * max_depth_per_pos],
-            counts: vec![0u32; num_positions],
-            excess: vec![0u64; num_positions],
-            num_positions,
-            pos_mask,
-            max_depth_per_pos,
-            depth_shift,
-            head: 0,
-            genome_pos: 0,
-            len: 0,
-        }
-    }
-
-    /// Return the slice of stored hashes at buffer position `buf_pos`.
-    #[cfg(test)]
-    fn hashes_at(&self, buf_pos: usize) -> &[u64] {
-        let ring = (self.head + buf_pos) & self.pos_mask;
-        let start = ring << self.depth_shift;
-        let count = self.counts[ring] as usize;
-        &self.hashes[start..start + count]
-    }
-
-    /// Add a name hash at `buf_pos`. If the position is full, increments excess.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "count ≤ max_depth_per_pos = 2 × coverage_cap (u32), fits in u32"
-    )]
-    fn push(&mut self, buf_pos: usize, name_hash: u64) {
-        let ring = (self.head + buf_pos) & self.pos_mask;
-        let count = self.counts[ring] as usize;
-        if count < self.max_depth_per_pos {
-            let idx = (ring << self.depth_shift) + count;
-            self.hashes[idx] = name_hash;
-            self.counts[ring] = (count + 1) as u32;
-        } else {
-            self.excess[ring] += 1;
-        }
-    }
-
-    /// Clear all data at `buf_pos` (count and excess).
-    #[cfg(test)]
-    fn clear_position(&mut self, buf_pos: usize) {
-        let ring = (self.head + buf_pos) & self.pos_mask;
-        self.counts[ring] = 0;
-        self.excess[ring] = 0;
-    }
-
-    /// Ensure the buffer covers positions up to `genome_pos + span - 1`.
-    /// If the buffer is empty, initializes `self.genome_pos`.
-    fn ensure_range(&mut self, start_pos: u64) {
-        if self.len == 0 {
-            self.genome_pos = start_pos;
-        }
-    }
-
-    /// Flush a single position at `buf_pos`, returning depth statistics.
-    /// After flushing, the position is cleared, `head` advances, and `len` shrinks.
-    fn flush_position(&mut self, coverage_cap: u32) -> FlushResult {
-        let ring = self.head & self.pos_mask;
-        let count = self.counts[ring] as usize;
-        let excess = self.excess[ring];
-
-        // Fast paths for low-count positions (common at low-to-moderate coverage).
-        let (depth, excl_overlap) = match count {
-            0 => (0u64, 0u64),
-            1 => (1, 0),
-            2 => {
-                let base = ring << self.depth_shift;
-                if self.hashes[base] == self.hashes[base + 1] { (1, 1) } else { (2, 0) }
-            }
-            _ => {
-                // Sort hashes in-place for overlap detection (the slot is about to be cleared).
-                let start = ring << self.depth_shift;
-                self.hashes[start..start + count].sort_unstable();
-
-                // Linear scan: count unique hashes as depth, duplicates as overlap.
-                let mut d: u64 = 0;
-                let mut ov: u64 = 0;
-                let mut prev_hash: u64 = u64::MAX;
-                for &hash in &self.hashes[start..start + count] {
-                    if hash == prev_hash {
-                        ov += 1;
-                    } else {
-                        d += 1;
-                        prev_hash = hash;
-                    }
-                }
-                (d, ov)
-            }
-        };
-
-        // Apply coverage cap.
-        let cap = u64::from(coverage_cap);
-        let capped = depth.min(cap);
-        let excl_capped = depth - capped + excess;
-
-        // Clear and advance.
-        self.counts[ring] = 0;
-        self.excess[ring] = 0;
-        self.head = (self.head + 1) & self.pos_mask;
-        self.genome_pos += 1;
-        self.len -= 1;
-
-        FlushResult { depth, excl_overlap, excl_capped }
-    }
-}
-
-/// Result of flushing a single position from the depth buffer.
-struct FlushResult {
-    /// Number of unique name hashes (depth after overlap removal).
-    depth: u64,
-    /// Number of duplicate name hashes (overlap exclusions).
-    excl_overlap: u64,
-    /// Bases excluded because position was at or above the coverage cap, plus
-    /// excess bases that arrived after the position's hash storage was full.
+/// Per-position depth array for a single contig. Allocated once and reused
+/// across contigs: `reset_for_contig(n)` clears and resizes to `n` u16 slots,
+/// zeroing all entries. The caller drains the array by `take(pos)` on each
+/// position during `finalize_contig`, which returns the current depth and
+/// zeros the slot — after the finalize pass the array is already in the
+/// "fresh" state for the next contig (no separate memset needed).
+struct ContigDepth {
+    depth: Vec<u16>,
+    coverage_cap: u16,
+    /// Running count of bases that arrived at a position already at the cap.
+    /// Finalize drains this into the collector-level accumulator.
     excl_capped: u64,
+}
+
+impl ContigDepth {
+    fn new(coverage_cap: u16) -> Self {
+        Self { depth: Vec::new(), coverage_cap, excl_capped: 0 }
+    }
+
+    /// Length of the currently-active contig's depth array.
+    fn len(&self) -> usize {
+        self.depth.len()
+    }
+
+    /// Resize for a new contig. `Vec::resize(n, 0)` reuses the existing backing
+    /// allocation up to current capacity, truncates down or zero-fills new
+    /// slots as needed; the caller is expected to have drained the previous
+    /// contig via `take(pos)` so the existing slots are already zero.
+    fn reset_for_contig(&mut self, contig_len: usize) {
+        self.depth.resize(contig_len, 0);
+    }
+
+    /// Increment the depth at `ref_pos`, saturating at `coverage_cap`. Attempts
+    /// to push past the cap bump the capped-exclusion counter instead.
+    fn push(&mut self, ref_pos: u32) {
+        let pos = ref_pos as usize;
+        // Defensive: callers already bound `ref_pos` by `contig_len` via the
+        // truncation check in process_single/pair, so this should never hit.
+        if pos >= self.depth.len() {
+            return;
+        }
+        let d = &mut self.depth[pos];
+        if *d < self.coverage_cap {
+            *d += 1;
+        } else {
+            self.excl_capped += 1;
+        }
+    }
+
+    /// Read the depth at `pos` and zero the slot in one step (used by
+    /// `finalize_contig` as it walks the array).
+    fn take(&mut self, pos: usize) -> u16 {
+        std::mem::take(&mut self.depth[pos])
+    }
+
+    /// Drain and return the running capped-exclusion counter.
+    fn take_excl_capped(&mut self) -> u64 {
+        std::mem::take(&mut self.excl_capped)
+    }
+}
+
+// ─── Mate buffering for read-pair overlap detection ──────────────────────────
+
+/// Per-mate state retained while the overlapping mate of a buffered read has
+/// not yet arrived. The only question we need to answer at pair time is:
+/// "did the first read contribute BQ-passing depth at this reference
+/// position?" — a single bit per position in the overlap region. We record
+/// exactly that bitmap, sized to the overlap span between the two mates'
+/// alignments, rather than keeping quals + CIGAR blocks to reconstruct the
+/// answer at query time.
+struct CachedMate {
+    /// 0-based reference position of the first bit; equals the mate's
+    /// expected `alignment_start`.
+    overlap_start: u32,
+    /// Bit `i` (LSB-first) is set when the first read contributed
+    /// BQ-passing depth at reference position `overlap_start + i`. The
+    /// length of the bitmap (in bits) is the overlap region's span.
+    bitmap: BitVec<u64, Lsb0>,
+}
+
+impl CachedMate {
+    /// Returns `true` if the cached read contributed BQ-passing depth at
+    /// `ref_pos`. Positions outside the overlap region return `false`.
+    fn covered_at(&self, ref_pos: u32) -> bool {
+        if ref_pos < self.overlap_start {
+            return false;
+        }
+        let idx = (ref_pos - self.overlap_start) as usize;
+        if idx >= self.bitmap.len() {
+            return false;
+        }
+        self.bitmap[idx]
+    }
+}
+
+/// Per-record strategy for the inner depth-push loop, capturing the two
+/// orthogonal decisions the three mate-routing cases disagree on:
+///
+/// 1. [`is_mate_covered`] — whether the paired-mate already contributed
+///    depth at this reference position; if so, the current record counts
+///    the base as an `excl_overlap` exclusion instead of pushing depth.
+/// 2. [`on_depth_counted`] — whether to record the position so that a
+///    later-arriving mate can dedupe against it (populates the bitmap in
+///    [`CachedMate`]).
+///
+/// [`AloneAction`] uses the defaults (never-covered, never-record).
+/// [`BufferAction`] overrides `on_depth_counted` to populate the overlap
+/// bitmap. [`PairAction`] overrides `is_mate_covered` to consult the
+/// cached mate. Monomorphization keeps the unused hook in each case at
+/// zero cost (a `false` return or empty body).
+///
+/// [`is_mate_covered`]: DepthAction::is_mate_covered
+/// [`on_depth_counted`]: DepthAction::on_depth_counted
+trait DepthAction {
+    /// Return `true` if the other read of this pair already counted
+    /// `ref_pos`. The caller should not push depth again.
+    #[inline]
+    fn is_mate_covered(&self, _ref_pos: u32) -> bool {
+        false
+    }
+
+    /// Record that depth was pushed at `ref_pos`, so a later-arriving mate
+    /// can dedupe against the current record's contribution.
+    #[inline]
+    fn on_depth_counted(&mut self, _ref_pos: u32) {}
+}
+
+/// No-overlap-awareness action for reads with no overlapping mate.
+struct AloneAction;
+impl DepthAction for AloneAction {}
+
+/// Action for reads that will be buffered: records each depth-push
+/// position into `bitmap` so the arriving mate can skip the double-count.
+struct BufferAction<'a> {
+    overlap_start: u32,
+    bitmap: &'a mut BitVec<u64, Lsb0>,
+}
+
+impl DepthAction for BufferAction<'_> {
+    #[inline]
+    fn on_depth_counted(&mut self, ref_pos: u32) {
+        if ref_pos >= self.overlap_start {
+            let idx = (ref_pos - self.overlap_start) as usize;
+            if idx < self.bitmap.len() {
+                self.bitmap.set(idx, true);
+            }
+        }
+    }
+}
+
+/// Action for the second read of a pair: consults the cached mate's
+/// bitmap so overlap positions tally as `excl_overlap` instead of
+/// double-pushing depth.
+struct PairAction<'a> {
+    cached: &'a CachedMate,
+}
+
+impl DepthAction for PairAction<'_> {
+    #[inline]
+    fn is_mate_covered(&self, ref_pos: u32) -> bool {
+        self.cached.covered_at(ref_pos)
+    }
+}
+
+/// Iterate `(ref_offset, read_offset, len)` tuples for each M/=/X CIGAR
+/// operation in `record`. `ref_offset` is relative to the record's
+/// `alignment_start` and `read_offset` indexes into the record's quality /
+/// sequence arrays. Non-M CIGAR ops advance the ref/read cursors but do not
+/// yield.
+fn iter_aligned_blocks(record: &RecordBuf) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+    let mut ref_off: u32 = 0;
+    let mut read_off: u32 = 0;
+    record.cigar().as_ref().iter().filter_map(move |&op| {
+        // CIGAR op lengths are stored as u32 in BAM/SAM, so the cast is lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = op.len() as u32;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let out = (ref_off, read_off, len);
+                ref_off += len;
+                read_off += len;
+                Some(out)
+            }
+            Kind::Insertion | Kind::SoftClip => {
+                read_off += len;
+                None
+            }
+            Kind::Deletion | Kind::Skip => {
+                ref_off += len;
+                None
+            }
+            Kind::HardClip | Kind::Pad => None,
+        }
+    })
 }
 
 // ─── Poisson helpers ─────────────────────────────────────────────────────────
@@ -1066,23 +1062,14 @@ fn ln_factorial(k: u64) -> f64 {
     (2..=k).map(|i| (i as f64).ln()).sum()
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Compute a 64-bit hash of the given byte slice using `DefaultHasher`.
-fn hash_name(name: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    hasher.finish()
-}
-
 // ─── CIGAR helper ─────────────────────────────────────────────────────────────
 
 /// Count the number of reference-aligned bases (M/=/X) in a record's CIGAR.
 fn count_aligned_bases(record: &RecordBuf) -> u64 {
-    use noodles::sam::alignment::record::Cigar;
-    use noodles::sam::alignment::record::cigar::op::Kind;
     let mut count: u64 = 0;
-    for op in Cigar::iter(record.cigar()).filter_map(Result::ok) {
+    // Concrete slice iteration — avoids the boxed dyn iterator that
+    // `Cigar::iter()` would return.
+    for &op in record.cigar().as_ref() {
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 count += op.len() as u64;
@@ -1215,124 +1202,117 @@ mod tests {
         assert!((percentile_from_hist(&hist, 0.5, 10) - 5.0).abs() < f64::EPSILON);
     }
 
-    // ── DepthBuffer tests ────────────────────────────────────────────────────
+    // ── ContigDepth tests ────────────────────────────────────────────────────
 
     #[test]
-    fn test_depth_buffer_basic_push_and_flush() {
-        let mut buf = DepthBuffer::new(100, 250);
-        buf.ensure_range(10);
-        buf.len = 1;
-        buf.push(0, 42);
-        buf.push(0, 99);
+    fn test_contig_depth_basic_push_and_take() {
+        let mut d = ContigDepth::new(250);
+        d.reset_for_contig(10);
+        d.push(3);
+        d.push(3);
+        d.push(7);
 
-        let result = buf.flush_position(250);
-        assert_eq!(result.depth, 2);
-        assert_eq!(result.excl_overlap, 0);
-        assert_eq!(result.excl_capped, 0);
+        assert_eq!(d.take(0), 0);
+        assert_eq!(d.take(3), 2);
+        assert_eq!(d.take(7), 1);
+        // `take` zeroes the slot:
+        assert_eq!(d.take(3), 0);
     }
 
     #[test]
-    fn test_depth_buffer_overlap_detection() {
-        let mut buf = DepthBuffer::new(100, 250);
-        buf.ensure_range(0);
-        buf.len = 1;
-        // Same hash twice = overlap
-        buf.push(0, 42);
-        buf.push(0, 42);
-
-        let result = buf.flush_position(250);
-        assert_eq!(result.depth, 1);
-        assert_eq!(result.excl_overlap, 1);
-        assert_eq!(result.excl_capped, 0);
-    }
-
-    #[test]
-    fn test_depth_buffer_coverage_cap() {
-        let mut buf = DepthBuffer::new(100, 3);
-        buf.ensure_range(0);
-        buf.len = 1;
-        for i in 0..5u64 {
-            buf.push(0, i);
+    fn test_contig_depth_saturates_at_cap() {
+        let mut d = ContigDepth::new(3);
+        d.reset_for_contig(5);
+        for _ in 0..10 {
+            d.push(2);
         }
-
-        let result = buf.flush_position(3);
-        assert_eq!(result.depth, 5);
-        assert_eq!(result.excl_overlap, 0);
-        assert_eq!(result.excl_capped, 2); // 5 - 3 = 2
+        assert_eq!(d.take(2), 3);
+        // 10 pushes, cap=3 → 7 counted as capped.
+        assert_eq!(d.take_excl_capped(), 7);
     }
 
     #[test]
-    fn test_depth_buffer_excess_counting() {
-        // max_depth_per_pos = (2 * 3).next_power_of_two() = 8, so after 8 entries excess kicks in.
-        let mut buf = DepthBuffer::new(100, 3);
-        buf.ensure_range(0);
-        buf.len = 1;
-        // Push 10 entries: 8 stored, 2 excess
-        for i in 0..10u64 {
-            buf.push(0, i);
+    fn test_contig_depth_resize_between_contigs() {
+        let mut d = ContigDepth::new(250);
+        d.reset_for_contig(10);
+        d.push(5);
+        d.take(5);
+        // Switch to a larger contig; existing backing store grows via resize.
+        d.reset_for_contig(100);
+        assert_eq!(d.len(), 100);
+        d.push(99);
+        assert_eq!(d.take(99), 1);
+    }
+
+    #[test]
+    fn test_contig_depth_ignores_out_of_range() {
+        let mut d = ContigDepth::new(250);
+        d.reset_for_contig(10);
+        d.push(42); // out of range — silently ignored
+        assert_eq!(d.take_excl_capped(), 0);
+        assert_eq!(d.take(0), 0);
+    }
+
+    // ── CachedMate tests ─────────────────────────────────────────────────────
+
+    /// Build a CachedMate by explicitly naming the ref positions where the
+    /// first read contributed BQ-passing depth.
+    fn cached_mate(overlap_start: u32, overlap_len: u32, covered: &[u32]) -> CachedMate {
+        let mut bitmap = bitvec![u64, Lsb0; 0; overlap_len as usize];
+        for &ref_pos in covered {
+            assert!(ref_pos >= overlap_start);
+            let idx = (ref_pos - overlap_start) as usize;
+            assert!(idx < overlap_len as usize);
+            bitmap.set(idx, true);
         }
-
-        let result = buf.flush_position(3);
-        // Only 8 stored hashes, all unique → depth = 8
-        assert_eq!(result.depth, 8);
-        assert_eq!(result.excl_overlap, 0);
-        // excl_capped = (8 - 3) + 2 excess = 7
-        assert_eq!(result.excl_capped, 7);
+        CachedMate { overlap_start, bitmap }
     }
 
     #[test]
-    fn test_depth_buffer_circular_wrap() {
-        // Small num_positions to test circularity.
-        let mut buf = DepthBuffer::new(4, 250);
-        buf.ensure_range(100);
-
-        // Fill 4 positions, flush them all, then add more.
-        for i in 0..4usize {
-            if i >= buf.len {
-                buf.len = i + 1;
-            }
-            buf.push(i, (i + 1) as u64);
-        }
-
-        // Flush all 4 positions.
-        for expected_depth in 1..=4u64 {
-            let result = buf.flush_position(250);
-            assert_eq!(result.depth, 1, "expected depth 1 at flush {expected_depth}");
-        }
-
-        // Now head has wrapped. Add more positions.
-        buf.ensure_range(104);
-        buf.len = 2;
-        buf.push(0, 10);
-        buf.push(1, 20);
-        buf.push(1, 30);
-
-        let r1 = buf.flush_position(250);
-        assert_eq!(r1.depth, 1);
-        let r2 = buf.flush_position(250);
-        assert_eq!(r2.depth, 2);
+    fn test_cached_mate_covered_at_contiguous_region() {
+        // First read contributed depth at every position in [100, 109].
+        let cached = cached_mate(100, 10, &[100, 101, 102, 103, 104, 105, 106, 107, 108, 109]);
+        assert!(cached.covered_at(100));
+        assert!(cached.covered_at(105));
+        assert!(cached.covered_at(109));
+        // Outside overlap region:
+        assert!(!cached.covered_at(99));
+        assert!(!cached.covered_at(110));
     }
 
     #[test]
-    fn test_depth_buffer_hashes_at() {
-        let mut buf = DepthBuffer::new(10, 250);
-        buf.ensure_range(0);
-        buf.len = 2;
-        buf.push(0, 100);
-        buf.push(0, 200);
-        buf.push(1, 300);
-
-        assert_eq!(buf.hashes_at(0), &[100, 200]);
-        assert_eq!(buf.hashes_at(1), &[300]);
+    fn test_cached_mate_covered_at_with_gap() {
+        // Simulates CIGAR "5M2D5M" — BQ-passing depth at [100,104] and
+        // [107,111] (a 2bp gap in between from the deletion). The bitmap
+        // spans [100, 111] so gap positions are represented as 0 bits.
+        let cached = cached_mate(100, 12, &[100, 101, 102, 103, 104, 107, 108, 109, 110, 111]);
+        assert!(cached.covered_at(100));
+        assert!(cached.covered_at(104));
+        // Inside the 2bp deletion — not covered:
+        assert!(!cached.covered_at(105));
+        assert!(!cached.covered_at(106));
+        // After the deletion:
+        assert!(cached.covered_at(107));
+        assert!(cached.covered_at(111));
     }
 
     #[test]
-    fn test_depth_buffer_clear_position() {
-        let mut buf = DepthBuffer::new(10, 250);
-        buf.ensure_range(0);
-        buf.len = 1;
-        buf.push(0, 42);
-        buf.clear_position(0);
-        assert_eq!(buf.hashes_at(0).len(), 0);
+    fn test_cached_mate_covered_at_with_bq_fail_gaps() {
+        // First read aligned across [100, 109] but had a BQ-failing base at
+        // 103, so the bitmap has a 0 bit there even though the position is
+        // within the overlap region.
+        let cached = cached_mate(100, 10, &[100, 101, 102, 104, 105, 106, 107, 108, 109]);
+        assert!(cached.covered_at(102));
+        assert!(!cached.covered_at(103)); // BQ-fail gap
+        assert!(cached.covered_at(104));
+    }
+
+    #[test]
+    fn test_cached_mate_covered_at_out_of_range() {
+        let cached = cached_mate(100, 10, &[100, 109]);
+        assert!(!cached.covered_at(50));
+        assert!(!cached.covered_at(99));
+        assert!(!cached.covered_at(110));
+        assert!(!cached.covered_at(u32::MAX));
     }
 }
