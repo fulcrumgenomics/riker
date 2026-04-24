@@ -1779,3 +1779,70 @@ fn test_insertion_at_read_start_no_anchor() {
     let mm_all = mm.iter().find(|r| r.stratifier == "all").unwrap();
     assert_eq!(mm_all.total_bases, 50, "Aligned M bases should still be counted for mismatches");
 }
+
+/// Regression: an orphan buffered mid-read on contig A must not be processed against
+/// contig B's region when the next interval crosses contigs.
+///
+/// Setup: chr1 is all A, chr2 is all G. A coordinate-sorted pair lives on chr1, with
+/// read1 at pos 1 (1-based) and read2 at pos 30, each 50M. The intervals file covers
+/// `chr1:0-15` and all of `chr2`. Read1 is returned by the chr1 query and buffered
+/// (mate's expected start at pos 30 falls inside read1's [1, 50] span). Read2 lives
+/// outside the chr1 interval, so it never appears in the query and the buffered
+/// mate stays orphaned across the contig boundary.
+///
+/// Under the bug, the end-of-chr2 `flush_behind(chr2, 200)` drains read1 (its
+/// `mate_ref_id=chr1 < chr2`) and runs it through the chr2 region. All 50 A-bases
+/// then get compared against chr2's G reference, inflating `error_bases` to 50.
+///
+/// Correctly handled, the orphan is flushed against chr1's *last* region before
+/// swapping to chr2; the 15 positions inside `[0, 15)` match A-vs-A and the remaining
+/// 35 positions are skipped by `RegionContext::contains`, so `error_bases` is 0.
+#[test]
+fn test_cross_contig_orphan_not_processed_against_wrong_contig() {
+    let chr1 = vec![b'A'; 200];
+    let chr2 = vec![b'G'; 200];
+    let fasta = FastaBuilder::new()
+        .add_contig("chr1", &chr1)
+        .add_contig("chr2", &chr2)
+        .to_temp_fasta()
+        .unwrap();
+
+    let quals = vec![30u8; 50];
+    let seq_all_a = vec![b'A'; 50];
+    let mut builder = coord_builder(&[("chr1", 200), ("chr2", 200)]);
+    // read1 at 1-based pos 1, mate at pos 30 (0-based 29) — mate_pos falls inside
+    // read1's [1, 50] span so the buffer keeps it pending.
+    make_pair(&mut builder, "read", 0, 1, 30, 79, &seq_all_a, &seq_all_a, &quals);
+    let bam = builder.to_temp_indexed_bam().unwrap();
+
+    // BED: chr1 partial interval ending *before* read1's mate_pos (29); chr2 full.
+    let dir = tempfile::tempdir().unwrap();
+    let bed_path = dir.path().join("regions.bed");
+    std::fs::write(&bed_path, "chr1\t0\t15\nchr2\t0\t200\n").unwrap();
+
+    let prefix = dir.path().join("out");
+    let cmd = Error {
+        input: InputOptions { input: bam.path().to_path_buf() },
+        output: OutputOptions { output: prefix.clone() },
+        options: ErrorOptions {
+            reference: fasta.path().to_path_buf(),
+            vcf: None,
+            intervals: Some(bed_path),
+            min_mapq: 20,
+            min_bq: 0,
+            include_duplicates: false,
+            max_isize: 1000,
+            picard_compat: false,
+            stratify_by: vec![],
+        },
+    };
+    cmd.execute().expect("error command should succeed");
+
+    let mm: Vec<MismatchMetric> =
+        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    assert_eq!(
+        all_row.error_bases, 0,
+        "orphan on chr1 must not be compared against chr2's reference bases"
+    );
+}

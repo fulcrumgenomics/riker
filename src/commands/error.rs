@@ -278,8 +278,25 @@ impl Command for Error {
         let mut progress = ProgressLogger::new("error", "reads", 1_000_000);
         let mut total_records = 0u64;
         let mut contig_cache = ContigCache { name: String::new(), bases: Vec::new() };
+        // Tracks the most recently built region so trailing orphans on the
+        // previous contig can be flushed against the correct reference.
+        let mut prev_region: Option<(String, RegionContext)> = None;
 
         for (contig_name, start, end) in &intervals {
+            // Contig transition: drain leftover orphans against the previous
+            // contig's last region before swapping in one for the new contig.
+            // Without this, `flush_behind` at the end of the new interval
+            // would drain those orphans (their `mate_ref_id` is strictly less
+            // than the new `ref_id`) and compare their bases against the
+            // wrong reference.
+            if let Some((prev_contig, region)) = prev_region.as_ref()
+                && prev_contig != contig_name
+            {
+                for orphan in collector.mate_buffer.flush() {
+                    collector.process_record(&orphan, region, None);
+                }
+            }
+
             // Load region context (reference bases + pre-loaded variant masks)
             let region = RegionContext::new(
                 contig_name,
@@ -326,9 +343,10 @@ impl Command for Error {
                 }
             }
 
-            // Flush orphans — process for mismatch/indel only. The interval
-            // was itself derived from the same sequence dictionary, so a
-            // lookup miss here is a logic error we want to surface loudly
+            // Flush orphans whose mate is behind the interval end — their
+            // mates won't arrive in subsequent same-contig intervals either.
+            // The interval was derived from the same sequence dictionary, so
+            // a lookup miss here is a logic error we want to surface loudly
             // rather than silently flush against ref_id=0.
             let ref_id = dict
                 .get_by_name(contig_name)
@@ -339,12 +357,18 @@ impl Command for Error {
             for orphan in collector.mate_buffer.flush_behind(ref_id, *end) {
                 collector.process_record(&orphan, &region, None);
             }
+
+            prev_region = Some((contig_name.clone(), region));
         }
 
-        // Discard remaining buffered mates whose mates never arrived.
-        // In the standalone path these are from the last interval and have no
-        // further region context to process against.
-        collector.mate_buffer.clear();
+        // Flush any trailing orphans against the last region, mirroring the
+        // Collector path's `finish()` — they live on the final contig and
+        // should still contribute to its mismatch/indel counts.
+        if let Some((_, region)) = prev_region.as_ref() {
+            for orphan in collector.mate_buffer.flush() {
+                collector.process_record(&orphan, region, None);
+            }
+        }
 
         progress.finish();
         log::info!("Processed {total_records} records passing filters.");
