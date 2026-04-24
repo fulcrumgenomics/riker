@@ -1,3 +1,40 @@
+//! The `multi` command: one BAM pass, many collectors, run in parallel.
+//!
+//! ## Threading model
+//!
+//! There is a single **reader thread** and `--threads` **pool workers**,
+//! connected through three channels:
+//!
+//! - `batch_pool` — an unbounded mpsc channel of empty `Vec<RecordBuf>`
+//!   slots the reader pulls from (and which [`RecyclableBatch::drop`]
+//!   returns to). This recycles pre-allocated [`RecordBuf`]s across the
+//!   whole run so the reader does not allocate per-record.
+//! - `work_queue` — a bounded crossbeam MPMC queue of
+//!   `(collector_idx, Arc<RecyclableBatch>)`. The reader fans each batch
+//!   onto it once per collector; pool workers block on it.
+//! - `return` — the mpsc `return_tx`/`return_rx` captured inside each
+//!   `RecyclableBatch`. When the last `Arc` reference drops,
+//!   [`RecyclableBatch::drop`] sends the inner `Vec` back to the pool.
+//!
+//! The reader reads records in place into a batch (`read_record_buf`
+//! overwrites each slot), wraps the full batch in an `Arc`, and clones
+//! it once per collector onto the work queue. Workers block on
+//! `work_rx.recv()` — no polling, no condvar. On receipt they lock the
+//! per-collector mutex and call `accept_multiple`, which serialises
+//! accesses to any single collector while still letting different
+//! collectors process in parallel across workers.
+//!
+//! When the reader hits EOF it drops `work_tx`, the queue closes, and
+//! workers exit once they have drained. `Collector::finish` is called
+//! on the main thread after the scope joins — no cross-thread
+//! finalisation race.
+//!
+//! ## Single-threaded path
+//!
+//! For `--threads 1` the whole thing collapses to [`run_single_threaded`]:
+//! no channels, no extra threads, just a serial loop. Useful for testing
+//! and small runs where threading overhead isn't worth it.
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;

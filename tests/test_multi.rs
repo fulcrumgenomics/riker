@@ -558,6 +558,35 @@ fn test_parallel_all_collectors() -> Result<()> {
     Ok(())
 }
 
+/// Run with more pool threads than collectors. The MPMC work queue should
+/// still produce correct output; the extra workers simply block on `recv()`.
+#[test]
+fn test_parallel_more_threads_than_collectors() -> Result<()> {
+    let bam = build_test_bam()?;
+
+    // Single-threaded baseline.
+    let single_dir = TempDir::new()?;
+    let single_prefix = single_dir.path().join("out");
+    make_multi(bam.path(), &single_prefix, vec![CollectorKind::Isize]).execute()?;
+
+    // Parallel with 4 threads but only 1 collector — three workers are idle
+    // the whole run. Output must still match the serial path.
+    let parallel_dir = TempDir::new()?;
+    let parallel_prefix = parallel_dir.path().join("out");
+    make_multi_threaded(bam.path(), &parallel_prefix, vec![CollectorKind::Isize], 4).execute()?;
+
+    let single: Vec<InsertSizeMetric> =
+        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", single_prefix.display())))?;
+    let parallel: Vec<InsertSizeMetric> =
+        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", parallel_prefix.display())))?;
+    assert_eq!(single.len(), parallel.len());
+    for (s, p) in single.iter().zip(parallel.iter()) {
+        assert_eq!(s.pair_orientation, p.pair_orientation);
+        assert_eq!(s.read_pairs, p.read_pairs);
+    }
+    Ok(())
+}
+
 #[test]
 fn test_parallel_empty_bam() -> Result<()> {
     let builder = SamBuilder::new();
