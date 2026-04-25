@@ -456,20 +456,18 @@ impl Collector for BasicCollector {
 
         Self::ensure_capacity(base_counts, cycle_totals, qual_sums, qual_counts, len);
 
-        let has_quals = !quals.is_empty();
-
-        for i in 0..len {
+        // Quality scores can be shorter than the sequence on malformed
+        // input — guard with `quals.get(i)` rather than indexing directly,
+        // so a single bad record doesn't abort the whole run.
+        for (i, &base) in seq.iter().enumerate() {
             // Cycle: forward reads go 0..len, reverse reads go len-1..0
             let cycle_idx = if is_reverse { len - 1 - i } else { i };
-
-            let base = seq[i];
             let bi = Self::base_index(base);
 
             base_counts[bi][cycle_idx] += 1;
             cycle_totals[cycle_idx] += 1;
 
-            if has_quals {
-                let q = quals[i];
+            if let Some(&q) = quals.get(i) {
                 qual_sums[cycle_idx] += f64::from(q);
                 qual_counts[cycle_idx] += 1;
 

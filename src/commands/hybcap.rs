@@ -480,18 +480,31 @@ impl HybCapCollector {
                         clipping_active = true;
                     }
 
+                    // Clamp effective_len to the quality buffer; on a
+                    // malformed record the CIGAR can claim more bases
+                    // than there are quality bytes for, and the slices
+                    // below would panic. Truncated bases are charged to
+                    // the low-quality bucket (no quality info = treat as
+                    // failing the threshold).
+                    let avail = qual_bytes.len().saturating_sub(read_offset);
+                    let scan_len = effective_len.min(avail);
+                    let truncated = (effective_len - scan_len) as u64;
+                    if truncated > 0 {
+                        self.exc_baseq_bases += truncated;
+                    }
+
                     if cached_targets.is_empty() {
                         // Change 3: Off-target fast path — when the block is fully
                         // unclipped, scan a contiguous quality slice (auto-vectorizable)
                         // instead of per-base branching.
-                        if effective_len == op.len() && effective_len > 0 {
-                            let quals = &qual_bytes[read_offset..read_offset + effective_len];
+                        if effective_len == op.len() && scan_len > 0 {
+                            let quals = &qual_bytes[read_offset..read_offset + scan_len];
                             let low_qual = simd::count_bases_lt_q(quals, self.min_bq);
                             self.exc_baseq_bases += low_qual;
-                            self.exc_off_target_bases += effective_len as u64 - low_qual;
+                            self.exc_off_target_bases += scan_len as u64 - low_qual;
                         } else {
                             // Partially clipped block — per-base fallback (rare)
-                            for i in 0..effective_len {
+                            for i in 0..scan_len {
                                 let qual = qual_bytes.get(read_offset + i).copied().unwrap_or(0);
                                 if qual < self.min_bq {
                                     self.exc_baseq_bases += 1;
@@ -503,7 +516,7 @@ impl HybCapCollector {
                     } else {
                         // Change 4: Slice quality array once per M-block for bounds-check-
                         // free access in the inner loop.
-                        let quals = &qual_bytes[read_offset..read_offset + effective_len];
+                        let quals = &qual_bytes[read_offset..read_offset + scan_len];
                         for (i, &qual) in quals.iter().enumerate() {
                             if qual < self.min_bq {
                                 self.exc_baseq_bases += 1;
