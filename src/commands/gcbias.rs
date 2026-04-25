@@ -165,10 +165,8 @@ impl Command for GcBias {
         let mut collector =
             GcBiasCollector::new(&self.input.input, &self.output.output, reference, &self.options);
 
-        collector.initialize(reader.header())?;
         let mut progress = ProgressLogger::new("gcbias", "reads", 5_000_000);
-        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 

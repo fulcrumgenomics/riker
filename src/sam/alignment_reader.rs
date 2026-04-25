@@ -588,21 +588,30 @@ fn append_extension(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Confirm that one of `path`.bam.bai / `path`.bai / `path`.csi exists.
+/// Confirm that an index for `path` exists in one of the three layouts
+/// `samtools` writes:
+///
+/// - `<file>.bam.bai` (suffix appended) — `samtools index`'s default
+/// - `<file>.bai` (extension replaced — sibling) — Picard's default
+/// - `<file>.csi` (suffix appended) — large-contig index
+///
+/// `path.with_extension("bai")` gives the sibling form (replaces the
+/// existing `.bam` extension); `append_extension(_, ".bai")` gives the
+/// suffix form.
 fn validate_bam_index_exists(path: &Path) -> Result<()> {
-    let bai_alt = path.with_extension("bam.bai");
-    let bai = append_extension(path, ".bai");
+    let bai_sibling = path.with_extension("bai");
+    let bai_suffix = append_extension(path, ".bai");
     let csi = append_extension(path, ".csi");
 
-    if bai.exists() || bai_alt.exists() || csi.exists() {
+    if bai_sibling.exists() || bai_suffix.exists() || csi.exists() {
         return Ok(());
     }
 
     bail!(
         "BAM index not found. Expected one of:\n  {}\n  {}\n  {}\n\
          Run `samtools index {}` to create one.",
-        bai.display(),
-        bai_alt.display(),
+        bai_suffix.display(),
+        bai_sibling.display(),
         csi.display(),
         path.display(),
     );
@@ -630,4 +639,75 @@ fn open_context(path: &Path) -> String {
 /// Context message for "failed to read header" errors.
 fn header_context(path: &Path) -> String {
     format!("Failed to read header from: {}", path.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Helper: create an empty file at `path`.
+    fn touch(path: &Path) {
+        fs::write(path, b"").expect("create empty file");
+    }
+
+    #[test]
+    fn validate_bam_index_finds_suffix_form() {
+        // `samtools index` default: foo.bam → foo.bam.bai
+        let dir = TempDir::new().unwrap();
+        let bam = dir.path().join("sample.bam");
+        touch(&bam);
+        touch(&dir.path().join("sample.bam.bai"));
+        validate_bam_index_exists(&bam).expect("should accept suffix-form .bam.bai");
+    }
+
+    #[test]
+    fn validate_bam_index_finds_sibling_form() {
+        // Picard default: foo.bam → foo.bai
+        let dir = TempDir::new().unwrap();
+        let bam = dir.path().join("sample.bam");
+        touch(&bam);
+        touch(&dir.path().join("sample.bai"));
+        validate_bam_index_exists(&bam).expect("should accept sibling-form .bai");
+    }
+
+    #[test]
+    fn validate_bam_index_finds_csi() {
+        let dir = TempDir::new().unwrap();
+        let bam = dir.path().join("sample.bam");
+        touch(&bam);
+        touch(&dir.path().join("sample.bam.csi"));
+        validate_bam_index_exists(&bam).expect("should accept .csi");
+    }
+
+    #[test]
+    fn validate_bam_index_missing_errors() {
+        let dir = TempDir::new().unwrap();
+        let bam = dir.path().join("sample.bam");
+        touch(&bam);
+        let err = validate_bam_index_exists(&bam).expect_err("missing index should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("BAM index not found"), "unexpected error: {msg}");
+        assert!(msg.contains("sample.bam.bai"), "should mention suffix form: {msg}");
+        assert!(msg.contains("sample.bai"), "should mention sibling form: {msg}");
+    }
+
+    #[test]
+    fn validate_cram_index_finds_crai() {
+        let dir = TempDir::new().unwrap();
+        let cram = dir.path().join("sample.cram");
+        touch(&cram);
+        touch(&dir.path().join("sample.cram.crai"));
+        validate_cram_index_exists(&cram).expect("should accept .cram.crai");
+    }
+
+    #[test]
+    fn validate_cram_index_missing_errors() {
+        let dir = TempDir::new().unwrap();
+        let cram = dir.path().join("sample.cram");
+        touch(&cram);
+        let err = validate_cram_index_exists(&cram).expect_err("missing .crai should fail");
+        assert!(err.to_string().contains("CRAM index not found"));
+    }
 }

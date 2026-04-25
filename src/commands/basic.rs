@@ -77,10 +77,8 @@ impl Command for Basic {
         let mut reader =
             AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
         let mut collector = BasicCollector::new(&self.input.input, &self.output.output);
-        collector.initialize(reader.header())?;
         let mut progress = ProgressLogger::new("basic", "reads", 5_000_000);
-        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 

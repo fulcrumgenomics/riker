@@ -271,11 +271,13 @@ impl RikerRecord {
     pub fn sequence(&self) -> &[u8] {
         match self {
             Self::Bam(r) => {
-                debug_assert!(
-                    r.sequence_populated,
-                    "RikerRecord::sequence() called on a BAM record without `with_sequence()` \
-                     in the collector's field_needs(); update field_needs to declare it"
-                );
+                // Empty slice covers two cases per the doc comment above:
+                // (1) the consumer didn't declare `with_sequence()` and
+                // (2) the file genuinely had no bases (`l_seq == 0`).
+                // The `if` is also load-bearing because `sequence_buf` is
+                // a reused allocation: without it, a record where the
+                // decode didn't run would expose the *previous* record's
+                // bases.
                 if r.sequence_populated { r.sequence_buf.as_slice() } else { &[] }
             }
             Self::Fallback(r) => r.inner.sequence().as_ref(),
@@ -594,11 +596,8 @@ impl BamRec {
     }
 }
 
-impl Default for BamRec {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No public `Default` for `BamRec`: the constructors are pub(crate) and
+// an externally-defaulted record can never be filled or refreshed.
 
 // ─── FallbackRec ────────────────────────────────────────────────────────────
 
@@ -658,11 +657,8 @@ impl FallbackRec {
     }
 }
 
-impl Default for FallbackRec {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
+// No public `Default` for `FallbackRec`: same reasoning as `BamRec`
+// above — `empty()` is `pub(crate)` so external callers can't fill it.
 
 // ─── CigarOps iterator ──────────────────────────────────────────────────────
 
@@ -1262,13 +1258,19 @@ fn aux_value_len(aux_bytes: &[u8], pos: usize, type_byte: u8) -> Result<usize> {
             }
             let elem_ty = aux_bytes[pos];
             let count = u32::from_le_bytes(aux_bytes[pos + 1..pos + 5].try_into().unwrap());
-            let elem_size = match elem_ty {
+            let elem_size: usize = match elem_ty {
                 b'c' | b'C' => 1,
                 b's' | b'S' => 2,
                 b'i' | b'I' | b'f' => 4,
                 _ => anyhow::bail!("unsupported aux B-array element type '{}'", elem_ty as char),
             };
-            5 + (count as usize) * elem_size
+            // Hostile inputs can claim count = u32::MAX; checked_mul keeps
+            // us from triggering a multi-GB allocation downstream when the
+            // value-bytes window is materialised.
+            let payload_len = (count as usize).checked_mul(elem_size).ok_or_else(|| {
+                anyhow!("aux B-array size overflow: count={count}, elem_size={elem_size}")
+            })?;
+            payload_len.checked_add(5).ok_or_else(|| anyhow!("aux B-array length overflow"))?
         }
         _ => anyhow::bail!("unknown aux type byte '{}' ({:#x})", type_byte as char, type_byte),
     })
@@ -1658,6 +1660,28 @@ mod tests {
         assert!(dst.get(*b"BA").is_none());
         // `NM` stored fine despite the scanner walking past `BA`.
         assert_eq!(dst.get(*b"NM").unwrap().as_int(), Some(5));
+    }
+
+    #[test]
+    fn aux_b_array_oversized_payload_rejected_by_scan_bounds() {
+        // Hostile input: claim a B:i array with count = u32::MAX. The
+        // payload length aux_value_len returns is ~16 GB on 64-bit (well
+        // within usize) — what catches it is the scan_specific bounds
+        // check that the value extends past the end of the buffer. The
+        // critical thing is no panic, no oversize allocation, just a
+        // structured error.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"BAB"); // tag + B-array type byte
+        aux.push(b'i'); // element type i32 (4 bytes each)
+        aux.extend_from_slice(&u32::MAX.to_le_bytes());
+        // No payload. The buffer is 8 bytes total; claimed length is huge.
+        let wanted: BTreeSet<TagKey> = [*b"BA"].into_iter().collect();
+        let mut dst = AuxTagStore::new();
+        let err = scan_values(&aux, &wanted, &mut dst).unwrap_err();
+        assert!(
+            err.to_string().contains("extends past end of buffer"),
+            "expected past-end error, got: {err}"
+        );
     }
 
     #[test]

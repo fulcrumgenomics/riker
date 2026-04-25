@@ -100,10 +100,8 @@ impl Command for InsertSize {
             AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
         let mut collector =
             InsertSizeCollector::new(&self.input.input, &self.output.output, &self.options);
-        collector.initialize(reader.header())?;
         let mut progress = ProgressLogger::new("isize", "reads", 5_000_000);
-        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 

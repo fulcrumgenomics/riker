@@ -164,14 +164,8 @@ impl Command for HybCap {
         };
 
         let mut collector = HybCapCollector::new(&self.output.output, fasta, sample, &self.options);
-
-        collector.initialize(reader.header())?;
-
         let mut progress = ProgressLogger::new("hybcap", "reads", 5_000_000);
-        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
-
-        collector.finish()?;
-        Ok(())
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 

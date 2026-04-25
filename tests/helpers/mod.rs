@@ -302,11 +302,9 @@ impl SamBuilder {
         self
     }
 
-    /// Write all records to a BAM file at `path`, respecting the configured sort order.
-    ///
-    /// # Errors
-    /// Returns an error if the BAM file cannot be created or a record cannot be written.
-    pub fn write_to_file(&self, path: &Path) -> Result<()> {
+    /// Collect record references, sorted per the configured `sort_order`.
+    /// Used by every writer to apply the same ordering policy.
+    fn sorted_records(&self) -> Vec<&RecordBuf> {
         let mut records: Vec<&RecordBuf> = self.records.iter().collect();
         match self.sort_order {
             SortOrder::Unsorted => {}
@@ -326,11 +324,18 @@ impl SamBuilder {
                 });
             }
         }
+        records
+    }
 
+    /// Write all records to a BAM file at `path`, respecting the configured sort order.
+    ///
+    /// # Errors
+    /// Returns an error if the BAM file cannot be created or a record cannot be written.
+    pub fn write_to_file(&self, path: &Path) -> Result<()> {
         let file = std::fs::File::create(path)?;
         let mut writer = bam::io::Writer::new(BufWriter::new(file));
         writer.write_header(&self.header)?;
-        for record in records {
+        for record in self.sorted_records() {
             AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
         }
         Ok(())
@@ -348,26 +353,6 @@ impl SamBuilder {
         use noodles::cram;
         use noodles::fasta;
 
-        let mut records: Vec<&RecordBuf> = self.records.iter().collect();
-        match self.sort_order {
-            SortOrder::Unsorted => {}
-            SortOrder::Coordinate => {
-                records.sort_by_key(|r| {
-                    let rid = r.reference_sequence_id().unwrap_or(usize::MAX);
-                    let pos = r.alignment_start().map_or(u64::MAX, |p| p.get() as u64);
-                    (rid, pos)
-                });
-            }
-            SortOrder::QueryName => {
-                records.sort_by_key(|r| {
-                    r.name().map(|n| -> Vec<u8> {
-                        let bytes: &[u8] = n;
-                        bytes.to_vec()
-                    })
-                });
-            }
-        }
-
         let fasta_reader =
             fasta::io::indexed_reader::Builder::default().build_from_path(fasta_path)?;
         let repo =
@@ -378,7 +363,7 @@ impl SamBuilder {
             .set_reference_sequence_repository(repo)
             .build_from_writer(file);
         writer.write_header(&self.header)?;
-        for record in records {
+        for record in self.sorted_records() {
             AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
         }
         writer.try_finish(&self.header)?;
@@ -419,30 +404,10 @@ impl SamBuilder {
     pub fn write_sam_to_file(&self, path: &Path) -> Result<()> {
         use noodles::sam;
 
-        let mut records: Vec<&RecordBuf> = self.records.iter().collect();
-        match self.sort_order {
-            SortOrder::Unsorted => {}
-            SortOrder::Coordinate => {
-                records.sort_by_key(|r| {
-                    let rid = r.reference_sequence_id().unwrap_or(usize::MAX);
-                    let pos = r.alignment_start().map_or(u64::MAX, |p| p.get() as u64);
-                    (rid, pos)
-                });
-            }
-            SortOrder::QueryName => {
-                records.sort_by_key(|r| {
-                    r.name().map(|n| -> Vec<u8> {
-                        let bytes: &[u8] = n;
-                        bytes.to_vec()
-                    })
-                });
-            }
-        }
-
         let file = std::fs::File::create(path)?;
         let mut writer = sam::io::Writer::new(BufWriter::new(file));
         writer.write_header(&self.header)?;
-        for record in records {
+        for record in self.sorted_records() {
             AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
         }
         Ok(())
