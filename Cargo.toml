@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
 enum_dispatch = "0.3"
 noodles = { version = "0.109", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
 noodles-bgzf = { version = "0.46", features = ["libdeflate"] }
+bgzf = "0.3"
 serde = { version = "1", features = ["derive"] }
 csv = "1"
 anyhow = "1"
