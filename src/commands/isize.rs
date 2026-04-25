@@ -6,11 +6,10 @@ use kuva::plot::LinePlot;
 use kuva::render::layout::Layout;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::Collector;
+use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::counter::Counter;
@@ -20,6 +19,7 @@ use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::record_utils::derive_sample;
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
 /// File suffix appended to the output prefix for the metrics file.
 pub const METRICS_SUFFIX: &str = ".isize-metrics.txt";
@@ -96,17 +96,13 @@ impl Command for InsertSize {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output file cannot be written.
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) =
-            AlignmentReader::new(&self.input.input, self.reference.reference.as_deref())?;
+        let mut reader =
+            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
         let mut collector =
             InsertSizeCollector::new(&self.input.input, &self.output.output, &self.options);
-        collector.initialize(&header)?;
+        collector.initialize(reader.header())?;
         let mut progress = ProgressLogger::new("isize", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
         collector.finish()
     }
 }
@@ -215,7 +211,7 @@ impl Collector for InsertSizeCollector {
         Ok(())
     }
 
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         let flags = record.flags();
 
         // Filtering logic mirrors Picard's InsertSizeMetricsCollector.acceptRecord:
@@ -312,6 +308,10 @@ impl Collector for InsertSizeCollector {
 
     fn name(&self) -> &'static str {
         "isize"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        RikerRecordRequirements::NONE
     }
 }
 

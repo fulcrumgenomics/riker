@@ -7,8 +7,6 @@ use bitvec::prelude::*;
 use clap::Args;
 use noodles::core::Region;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::Cigar as _;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
@@ -21,9 +19,10 @@ use crate::commands::common::{InputOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_6dp, write_tsv};
 use crate::progress::ProgressLogger;
-use crate::sam::indexed_reader::IndexedAlignmentReader;
+use crate::sam::alignment_reader::IndexedAlignmentReader;
 use crate::sam::mate_buffer::{MateAction, MateBuffer};
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 use crate::simd;
 use crate::vcf::IndexedVcf;
@@ -255,7 +254,7 @@ impl Command for Error {
         let fasta = Fasta::from_path(ref_path)?;
 
         // Open indexed alignment file
-        let mut alignment_reader = IndexedAlignmentReader::new(&self.input.input, Some(ref_path))?;
+        let mut alignment_reader = IndexedAlignmentReader::open(&self.input.input, Some(ref_path))?;
         let header = alignment_reader.header().clone();
 
         // Build sequence dictionary
@@ -320,29 +319,29 @@ impl Command for Error {
                 .parse()
                 .with_context(|| format!("Failed to parse region: {region_str}"))?;
 
-            let records = alignment_reader.query(&query_region)?;
-
-            for record in records {
-                if !collector.passes_filters(&record) {
-                    continue;
+            let requirements = collector.field_needs();
+            alignment_reader.query_for_each(&query_region, &requirements, |record| {
+                if !collector.passes_filters(record) {
+                    return Ok(());
                 }
 
                 total_records += 1;
-                progress.record_with(&record, &header);
+                progress.record_with(record, &header);
 
-                match collector.mate_buffer.accept(&record) {
+                match collector.mate_buffer.accept(record) {
                     MateAction::Buffered => {}
                     MateAction::Alone => {
-                        collector.process_record(&record, &region, None);
+                        collector.process_record(record, &region, None);
                     }
                     MateAction::PairWith(mate) => {
                         let mate_bases = build_aligned_bases(&mate, collector.min_bq);
-                        let record_bases = build_aligned_bases(&record, collector.min_bq);
+                        let record_bases = build_aligned_bases(record, collector.min_bq);
                         collector.process_record(&mate, &region, Some(&record_bases));
-                        collector.process_record(&record, &region, Some(&mate_bases));
+                        collector.process_record(record, &region, Some(&mate_bases));
                     }
                 }
-            }
+                Ok(())
+            })?;
 
             // Flush orphans whose mate is behind the interval end — their
             // mates won't arrive in subsequent same-contig intervals either.
@@ -408,7 +407,7 @@ pub struct ErrorCollector {
     base_level_stratifiers: Vec<Stratifier>,
 
     // Mate buffer for overlap detection
-    mate_buffer: MateBuffer<RecordBuf>,
+    mate_buffer: MateBuffer<RikerRecord>,
 
     // String interner for compact covariate keys
     interner: StringInterner,
@@ -505,7 +504,7 @@ impl ErrorCollector {
     }
 
     /// Check if a record passes the basic filters.
-    fn passes_filters(&self, record: &RecordBuf) -> bool {
+    fn passes_filters(&self, record: &RikerRecord) -> bool {
         let flags = record.flags();
 
         // Skip unmapped, secondary, supplementary, QC-fail
@@ -644,7 +643,7 @@ impl ErrorCollector {
     )]
     fn process_record(
         &mut self,
-        record: &RecordBuf,
+        record: &RikerRecord,
         region: &RegionContext,
         mate_bases: Option<&[(u32, u8)]>,
     ) {
@@ -673,9 +672,7 @@ impl ErrorCollector {
         let mut last_anchor_ref_pos: Option<u32> = None;
         let mut last_anchor_cycle: Option<u32> = None;
 
-        for op_result in record.cigar().iter() {
-            let Ok(op) = op_result else { return };
-
+        for op in record.cigar_ops() {
             let kind = op.kind();
             let len = op.len();
 
@@ -704,7 +701,7 @@ impl ErrorCollector {
                 Kind::Insertion => {
                     // Skip the entire insertion if the first inserted base
                     // fails the base quality threshold.
-                    let quals = record.quality_scores().as_ref();
+                    let quals = record.quality_scores();
                     let first_bq = quals.get(read_pos).copied().unwrap_or(0);
 
                     if first_bq >= self.min_bq {
@@ -787,7 +784,7 @@ impl ErrorCollector {
     #[expect(clippy::too_many_arguments)]
     fn process_aligned_base(
         &mut self,
-        record: &RecordBuf,
+        record: &RikerRecord,
         read_offset: usize,
         ref_pos: u32,
         region: &RegionContext,
@@ -803,12 +800,12 @@ impl ErrorCollector {
         }
 
         // Skip if base quality too low
-        let quals = record.quality_scores().as_ref();
+        let quals = record.quality_scores();
         if read_offset < quals.len() && quals[read_offset] < self.min_bq {
             return;
         }
 
-        let seq = record.sequence().as_ref();
+        let seq = record.sequence();
         let read_base = match seq.get(read_offset) {
             Some(&b) => b.to_ascii_uppercase(),
             None => return,
@@ -893,7 +890,7 @@ impl ErrorCollector {
     #[expect(clippy::too_many_arguments)]
     fn process_indel(
         &mut self,
-        record: &RecordBuf,
+        record: &RikerRecord,
         anchor_read_offset: usize,
         anchor_ref_pos: u32,
         region: &RegionContext,
@@ -979,7 +976,7 @@ impl Collector for ErrorCollector {
     }
 
     #[expect(clippy::cast_possible_truncation, reason = "contig lengths fit in u32")]
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         if !self.passes_filters(record) {
             return Ok(());
         }
@@ -1071,6 +1068,11 @@ impl Collector for ErrorCollector {
 
     fn name(&self) -> &'static str {
         "error"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        // Reads sequence bases + quality scores + the NM aux tag.
+        RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM")
     }
 }
 
@@ -1244,7 +1246,7 @@ impl Stratifier {
     #[expect(clippy::too_many_arguments)]
     fn covariate(
         self,
-        record: &RecordBuf,
+        record: &RikerRecord,
         read_offset: usize,
         ref_pos: u32,
         region: &RegionContext,
@@ -1257,7 +1259,7 @@ impl Stratifier {
         match self {
             Self::All => Some(CovariateValue::InternedStr(interner.get("all"))),
             Self::Bq => {
-                let quals = record.quality_scores().as_ref();
+                let quals = record.quality_scores();
                 if read_offset < quals.len() {
                     Some(CovariateValue::Int(u32::from(quals[read_offset])))
                 } else {
@@ -1317,7 +1319,7 @@ impl Stratifier {
             Self::Nm => {
                 let nm = cache.nm_raw?;
                 let ref_b = region.ref_base(ref_pos);
-                let read_b = record.sequence().as_ref().get(read_offset).copied()?;
+                let read_b = record.sequence().get(read_offset).copied()?;
                 // Subtract 1 if this base is itself a mismatch (so we get "other mismatches")
                 let adjusted =
                     if read_b.to_ascii_uppercase() == ref_b { nm } else { nm.saturating_sub(1) };
@@ -1691,7 +1693,7 @@ impl ReadLevelCache {
         reason = "GC percentage is always 0-100, fits in u32"
     )]
     fn new(
-        record: &RecordBuf,
+        record: &RikerRecord,
         interner: &StringInterner,
         max_isize: u32,
         picard_compat: bool,
@@ -1744,7 +1746,7 @@ impl ReadLevelCache {
         };
 
         let gc = {
-            let seq = record.sequence().as_ref();
+            let seq = record.sequence();
             if seq.is_empty() {
                 None
             } else {
@@ -1798,7 +1800,7 @@ impl BaseCovariateCache {
     fn populate_base_level(
         &mut self,
         base_level: &[Stratifier],
-        record: &RecordBuf,
+        record: &RikerRecord,
         read_offset: usize,
         ref_pos: u32,
         region: &RegionContext,
@@ -1895,8 +1897,8 @@ const fn is_valid_base(base: u8) -> bool {
 }
 
 /// Get the read base at the given offset, oriented to sequencing direction.
-fn read_base_at(record: &RecordBuf, read_offset: usize, is_reverse: bool) -> Option<u8> {
-    let seq = record.sequence().as_ref();
+fn read_base_at(record: &RikerRecord, read_offset: usize, is_reverse: bool) -> Option<u8> {
+    let seq = record.sequence();
     let base = *seq.get(read_offset)?;
     let oriented = if is_reverse { complement(base) } else { base };
     if is_valid_base(oriented) { Some(oriented) } else { None }
@@ -1906,7 +1908,7 @@ fn read_base_at(record: &RecordBuf, read_offset: usize, is_reverse: bool) -> Opt
 /// `delta` is -1 for previous, +1 for next in sequencing direction.
 #[expect(clippy::cast_sign_loss, reason = "array_delta is checked non-negative before cast")]
 fn read_base_in_sequencing_order(
-    record: &RecordBuf,
+    record: &RikerRecord,
     read_offset: usize,
     is_reverse: bool,
     delta: i32,
@@ -1920,7 +1922,7 @@ fn read_base_in_sequencing_order(
     } else {
         read_offset.checked_sub(array_delta.unsigned_abs() as usize)?
     };
-    let seq = record.sequence().as_ref();
+    let seq = record.sequence();
     let base = *seq.get(target)?;
     let oriented = if is_reverse { complement(base) } else { base };
     if is_valid_base(oriented) { Some(oriented) } else { None }
@@ -1930,8 +1932,8 @@ fn read_base_in_sequencing_order(
 ///
 /// Matches Picard's `stratifyHomopolymerLength`: counts consecutive identical
 /// bases in the read before this position in the direction of sequencing.
-fn compute_hp_length(record: &RecordBuf, read_offset: usize, is_reverse: bool) -> u32 {
-    let seq = record.sequence().as_ref();
+fn compute_hp_length(record: &RikerRecord, read_offset: usize, is_reverse: bool) -> u32 {
+    let seq = record.sequence();
     let len = seq.len();
 
     if is_reverse {
@@ -1968,20 +1970,9 @@ fn compute_hp_length(record: &RecordBuf, read_offset: usize, is_reverse: bool) -
 }
 
 /// Extract the NM tag value from a record.
-fn get_nm_tag(record: &RecordBuf) -> Option<u32> {
-    use noodles::sam::alignment::record_buf::data::field::Value;
-    let data = record.data();
-    let tag: [u8; 2] = *b"NM";
-    let value = data.get(&tag)?;
-    match value {
-        Value::UInt8(v) => Some(u32::from(*v)),
-        Value::UInt16(v) => Some(u32::from(*v)),
-        Value::UInt32(v) => Some(*v),
-        Value::Int8(v) => u32::try_from(*v).ok(),
-        Value::Int16(v) => u32::try_from(*v).ok(),
-        Value::Int32(v) => u32::try_from(*v).ok(),
-        _ => None,
-    }
+fn get_nm_tag(record: &RikerRecord) -> Option<u32> {
+    let v = record.aux_tag(*b"NM")?.as_int()?;
+    u32::try_from(v).ok()
 }
 
 /// Compute a phred-scaled Q-score from error count and total.
@@ -2009,17 +2000,16 @@ fn q_score(errors: u64, total: u64) -> f64 {
     clippy::cast_possible_truncation,
     reason = "genomic positions and CIGAR op lengths fit in u32"
 )]
-fn build_aligned_bases(record: &RecordBuf, min_bq: u8) -> Vec<(u32, u8)> {
+fn build_aligned_bases(record: &RikerRecord, min_bq: u8) -> Vec<(u32, u8)> {
     let Some(alignment_start) = record.alignment_start() else { return Vec::new() };
     let alignment_start = (alignment_start.get() - 1) as u32;
-    let seq = record.sequence().as_ref();
-    let quals = record.quality_scores().as_ref();
+    let seq = record.sequence();
+    let quals = record.quality_scores();
     let mut bases = Vec::with_capacity(seq.len());
     let mut ref_pos = alignment_start;
     let mut read_pos: usize = 0;
 
-    for op_result in record.cigar().iter() {
-        let Ok(op) = op_result else { return bases };
+    for op in record.cigar_ops() {
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for _ in 0..op.len() {

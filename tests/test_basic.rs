@@ -25,9 +25,11 @@ fn run_basic(builder: &SamBuilder) -> (TempDir, std::path::PathBuf) {
     let mut collector = BasicCollector::new(bam.path(), &prefix);
     collector.initialize(&header).unwrap();
 
-    let (mut reader, hdr) =
-        riker_lib::sam::alignment_reader::AlignmentReader::new(bam.path(), None).unwrap();
-    for result in reader.record_bufs(&hdr) {
+    let mut reader =
+        riker_lib::sam::alignment_reader::AlignmentReader::open(bam.path(), None).unwrap();
+    let hdr = reader.header().clone();
+    let requirements = collector.field_needs();
+    for result in reader.riker_records(&requirements) {
         let record = result.unwrap();
         collector.accept(&record, &hdr).unwrap();
     }

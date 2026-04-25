@@ -588,9 +588,10 @@ fn test_parallel_more_threads_than_collectors() -> Result<()> {
     let single_prefix = single_dir.path().join("out");
     make_multi(bam.path(), &single_prefix, vec![CollectorKind::Isize]).execute()?;
 
-    // Parallel with 4 threads but only 1 collector — three workers are idle
-    // (blocked on recv) most of the time while one processes. Output must
-    // still match the serial path.
+    // Parallel with --threads 4 (1 reader + 3 workers) but only 1
+    // collector — two workers are idle (blocked on the per-collector
+    // mutex) most of the time while one processes. Output must still
+    // match the serial path.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
     make_multi_threaded(bam.path(), &parallel_prefix, vec![CollectorKind::Isize], 4).execute()?;

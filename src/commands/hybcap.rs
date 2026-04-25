@@ -3,15 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, ensure};
 use clap::Args;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::Cigar as CigarTrait;
 use noodles::sam::alignment::record::cigar::Op;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::collector::Collector;
+use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::fasta::Fasta;
@@ -22,6 +20,7 @@ use crate::overlapper::Overlapper;
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::derive_sample;
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 use crate::simd;
 
@@ -154,9 +153,9 @@ pub struct HybCap {
 
 impl Command for HybCap {
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) =
-            AlignmentReader::new(&self.input.input, self.reference.reference.as_deref())?;
-        let sample = derive_sample(&self.input.input, &header);
+        let mut reader =
+            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+        let sample = derive_sample(&self.input.input, reader.header());
 
         // Load reference if provided (needed for GC dropout)
         let fasta = match &self.reference.reference {
@@ -166,15 +165,10 @@ impl Command for HybCap {
 
         let mut collector = HybCapCollector::new(&self.output.output, fasta, sample, &self.options);
 
-        collector.initialize(&header)?;
+        collector.initialize(reader.header())?;
 
         let mut progress = ProgressLogger::new("hybcap", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            collector.accept(record, &header)?;
-            progress.record_with(record, &header);
-            Ok(())
-        })?;
-        progress.finish();
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
 
         collector.finish()?;
         Ok(())
@@ -331,12 +325,12 @@ impl HybCapCollector {
     /// CIGAR walk.  Returns `(ref_start_0based, ref_end_exclusive, aligned_bases, blocks)`
     /// or `None` if unmapped.  The blocks are `(block_start, block_end)` pairs in 0-based
     /// half-open coordinates that can be reused for bait classification without re-walking.
-    fn alignment_span_and_blocks(record: &RecordBuf) -> Option<AlignmentInfo> {
+    fn alignment_span_and_blocks(record: &RikerRecord) -> Option<AlignmentInfo> {
         let start = record.alignment_start()?.get() - 1; // 1-based to 0-based
         let mut end = start;
         let mut aligned: u64 = 0;
         let mut blocks: SmallVec<[(u32, u32); 8]> = SmallVec::new();
-        for op in record.cigar().iter().flatten() {
+        for op in record.cigar_ops() {
             match op.kind() {
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                     #[expect(
@@ -402,7 +396,7 @@ impl HybCapCollector {
     /// on ties the second-of-pair is clipped.  Returns the mate's 0-based alignment
     /// start so the coverage walk can clip bases at or past that position.
     #[expect(clippy::cast_possible_truncation, reason = "genomic coordinates fit in u32")]
-    fn compute_mate_clip_ref_pos(record: &RecordBuf) -> Option<u32> {
+    fn compute_mate_clip_ref_pos(record: &RikerRecord) -> Option<u32> {
         let flags = record.flags();
 
         if !flags.is_segmented() || flags.is_unmapped() || flags.is_mate_unmapped() {
@@ -441,13 +435,13 @@ impl HybCapCollector {
     )]
     fn walk_cigar_for_coverage(
         &mut self,
-        record: &RecordBuf,
+        record: &RikerRecord,
         start: u32,
         mate_clip_ref_pos: Option<u32>,
         is_mapped_pair: bool,
         target_idxs: &SmallVec<[usize; 4]>,
     ) {
-        let qual_bytes: &[u8] = record.quality_scores().as_ref();
+        let qual_bytes: &[u8] = record.quality_scores();
         // Sentinel value: u32::MAX means "no clipping"
         let clip_ref_pos = mate_clip_ref_pos.unwrap_or(u32::MAX);
 
@@ -471,12 +465,8 @@ impl HybCapCollector {
         // Supports up to 64 overlapping targets per read.
         let mut counted_mask: u64 = 0;
 
-        for op_result in record.cigar().iter() {
-            let op: Op = match op_result {
-                Ok(op) => op,
-                Err(_) => continue,
-            };
-
+        for op in record.cigar_ops() {
+            let op: Op = op;
             match op.kind() {
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                     let block_end = ref_pos + op.len() as u32;
@@ -890,7 +880,7 @@ impl Collector for HybCapCollector {
         Ok(())
     }
 
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         let flags = record.flags();
 
         // ── Gate 0: Skip secondary alignments and non-PF (QC fail) reads ──
@@ -919,7 +909,7 @@ impl Collector for HybCapCollector {
         let span_info = if is_mapped { Self::alignment_span_and_blocks(record) } else { None };
 
         // ── Base-level counters ──
-        let read_len = record.sequence().len() as u64;
+        let read_len = record.sequence_len() as u64;
         if !is_supplementary {
             self.total_bases += read_len;
         }
@@ -1235,6 +1225,10 @@ impl Collector for HybCapCollector {
 
     fn name(&self) -> &'static str {
         "hybcap"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        RikerRecordRequirements::NONE
     }
 }
 

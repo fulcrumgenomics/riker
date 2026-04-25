@@ -9,12 +9,11 @@ use kuva::plot::legend::LegendPosition;
 use kuva::render::layout::Layout;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::Collector;
+use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::counter::Counter;
@@ -24,8 +23,9 @@ use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{FG_BLUE, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::mate_buffer::{MateBuffer, Peek};
+use crate::sam::mate_buffer::{MateBuffer, MateProbeFields, Peek};
 use crate::sam::record_utils::derive_sample;
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 
 // ─── File suffixes ─────────────────────────────────────────────────────────────
@@ -136,20 +136,15 @@ impl Command for Wgs {
     /// # Errors
     /// Returns an error if the BAM or reference cannot be read, or if output cannot be written.
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) =
-            AlignmentReader::new(&self.input.input, Some(&self.reference.reference))?;
+        let mut reader = AlignmentReader::open(&self.input.input, Some(&self.reference.reference))?;
         let reference = Fasta::from_path(&self.reference.reference)?;
 
         let mut collector =
             WgsCollector::new(&self.input.input, &self.output.output, reference, &self.options)?;
 
-        collector.initialize(&header)?;
+        collector.initialize(reader.header())?;
         let mut progress = ProgressLogger::new("wgs", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
         collector.finish()
     }
 }
@@ -592,16 +587,15 @@ impl WgsCollector {
     ///   mate already counted (`excl_overlap`), push depth elsewhere.
     ///
     /// The `DepthAction` methods for unused hooks are zero-cost default
-    /// implementations; monomorphisation compiles each call site into the
-    /// same code the three former `process_single` / `process_single_with_bitmap`
-    /// / `process_pair` functions emitted.
+    /// implementations; monomorphisation compiles each call site into
+    /// straight-line per-action code with no branches on the action kind.
     #[inline]
-    fn walk_depth<A: DepthAction>(&mut self, record: &RecordBuf, mut action: A) {
+    fn walk_depth<A: DepthAction>(&mut self, record: &RikerRecord, mut action: A) {
         let Some(pos_1based) = record.alignment_start() else {
             return;
         };
         let ref_start_u64 = pos_1based.get() as u64 - 1;
-        let quals: &[u8] = record.quality_scores().as_ref();
+        let quals: &[u8] = record.quality_scores();
         let contig_len_u64 = self.depth.len() as u64;
         let min_bq = self.min_bq;
 
@@ -665,7 +659,7 @@ impl Collector for WgsCollector {
         Ok(())
     }
 
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         let flags = record.flags();
 
         // Skip reads that should never enter the pileup.
@@ -717,17 +711,43 @@ impl Collector for WgsCollector {
             self.begin_contig(ref_id)?;
         }
 
-        // Route the record through the mate buffer. Probe first so the
-        // Buffered branch can build the overlap bitmap inline with the depth
-        // walk — one CIGAR iteration, not two.
-        match self.mate_buffer.probe(record) {
+        // Pre-extract the fields once; the same values feed both `probe_fields`
+        // (which consumes the struct) and the WouldBuffer follow-up `insert_fields`,
+        // so we don't have to re-read them from `record` after the probe.
+        // `name()` returns `&BStr`; deref to raw bytes — the mate buffer hashes on
+        // bytes, not on string semantics.
+        let ref_id = record.reference_sequence_id();
+        let name: Option<&[u8]> = record.name().map(|n| &**n);
+        let mate_alignment_start = record.mate_alignment_start();
+        let probe_fields = MateProbeFields {
+            flags,
+            ref_id,
+            mate_ref_id: record.mate_reference_sequence_id(),
+            name,
+            alignment_start: record.alignment_start(),
+            alignment_end: record.alignment_end(),
+            mate_alignment_start,
+        };
+        match self.mate_buffer.probe_fields(probe_fields) {
             Peek::Alone => self.walk_depth(record, AloneAction),
             Peek::WouldBuffer { overlap_start, overlap_len } => {
                 let mut bitmap = bitvec![u64, Lsb0; 0; overlap_len as usize];
                 self.walk_depth(record, BufferAction { overlap_start, bitmap: &mut bitmap });
-                self.mate_buffer.insert(record, CachedMate { overlap_start, bitmap });
+                // Contract of `probe_fields` mirrors `probe`: on WouldBuffer
+                // the ref_id, name, and mate_alignment_start are all present.
+                let ref_id = ref_id.expect("probe_fields WouldBuffer guarantees ref_id is Some");
+                let name = name.expect("probe_fields WouldBuffer guarantees name is Some");
+                let mate_pos = mate_alignment_start.map_or(0, |p| p.get());
+                self.mate_buffer.insert_fields(
+                    ref_id,
+                    name,
+                    mate_pos,
+                    CachedMate { overlap_start, bitmap },
+                );
             }
-            Peek::PairWith(cached) => self.walk_depth(record, PairAction { cached: &cached }),
+            Peek::PairWith(cached) => {
+                self.walk_depth(record, PairAction { cached: &cached });
+            }
         }
 
         Ok(())
@@ -741,6 +761,10 @@ impl Collector for WgsCollector {
 
     fn name(&self) -> &'static str {
         "wgs"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        RikerRecordRequirements::NONE
     }
 }
 
@@ -885,8 +909,8 @@ impl ContigDepth {
     /// to push past the cap bump the capped-exclusion counter instead.
     fn push(&mut self, ref_pos: u32) {
         let pos = ref_pos as usize;
-        // Defensive: callers already bound `ref_pos` by `contig_len` via the
-        // truncation check in process_single/pair, so this should never hit.
+        // Defensive: `walk_depth` already truncates each block to the contig
+        // length, so this branch should never hit.
         if pos >= self.depth.len() {
             return;
         }
@@ -1018,10 +1042,10 @@ impl DepthAction for PairAction<'_> {
 /// `alignment_start` and `read_offset` indexes into the record's quality /
 /// sequence arrays. Non-M CIGAR ops advance the ref/read cursors but do not
 /// yield.
-fn iter_aligned_blocks(record: &RecordBuf) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+fn iter_aligned_blocks(record: &RikerRecord) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
     let mut ref_off: u32 = 0;
     let mut read_off: u32 = 0;
-    record.cigar().as_ref().iter().filter_map(move |&op| {
+    record.cigar_ops().filter_map(move |op| {
         // CIGAR op lengths are stored as u32 in BAM/SAM, so the cast is lossless.
         #[allow(clippy::cast_possible_truncation)]
         let len = op.len() as u32;
@@ -1065,11 +1089,9 @@ fn ln_factorial(k: u64) -> f64 {
 // ─── CIGAR helper ─────────────────────────────────────────────────────────────
 
 /// Count the number of reference-aligned bases (M/=/X) in a record's CIGAR.
-fn count_aligned_bases(record: &RecordBuf) -> u64 {
+fn count_aligned_bases(record: &RikerRecord) -> u64 {
     let mut count: u64 = 0;
-    // Concrete slice iteration — avoids the boxed dyn iterator that
-    // `Cigar::iter()` would return.
-    for &op in record.cigar().as_ref() {
+    for op in record.cigar_ops() {
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 count += op.len() as u64;

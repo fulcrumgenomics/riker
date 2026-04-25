@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
+
+use crate::sam::riker_record::RikerRecord;
 
 /// Extract the sample name from the first read group's SM tag, or fall back to
 /// the BAM file stem.
@@ -19,19 +19,13 @@ pub fn derive_sample(input: &Path, header: &Header) -> String {
 }
 
 /// Extract an integer value from an auxiliary BAM tag, returning `None` if the
-/// tag is absent.  Handles all signed/unsigned integer variants.
+/// tag is absent. Negative signed values clamp to zero (matching historical
+/// behaviour where a negative `NM` has no sensible interpretation).
 #[allow(clippy::cast_sign_loss)]
 #[must_use]
-pub fn get_integer_tag(record: &RecordBuf, tag: [u8; 2]) -> Option<u32> {
-    match record.data().get(&tag) {
-        Some(DataValue::UInt8(v)) => Some(u32::from(*v)),
-        Some(DataValue::UInt16(v)) => Some(u32::from(*v)),
-        Some(DataValue::UInt32(v)) => Some(*v),
-        Some(DataValue::Int8(v)) => Some((*v).max(0) as u32),
-        Some(DataValue::Int16(v)) => Some((*v).max(0) as u32),
-        Some(DataValue::Int32(v)) => Some((*v).max(0) as u32),
-        _ => None,
-    }
+pub fn get_integer_tag(record: &RikerRecord, tag: [u8; 2]) -> Option<u32> {
+    let value = record.aux_tag(tag)?.as_int()?;
+    Some(u32::try_from(value.max(0)).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -81,10 +75,14 @@ mod tests {
 
     // ── get_integer_tag ──────────────────────────────────────────────────────
 
-    fn record_with_tag(tag_name: [u8; 2], value: DataValue) -> RecordBuf {
+    use noodles::sam::alignment::RecordBuf;
+    use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
+
+    fn record_with_tag(tag_name: [u8; 2], value: DataValue) -> RikerRecord {
         let mut data = noodles::sam::alignment::record_buf::Data::default();
         data.insert(tag_name.into(), value);
-        RecordBuf::builder().set_data(data).build()
+        let buf = RecordBuf::builder().set_data(data).build();
+        RikerRecord::from_alignment_record(&Header::default(), &buf).unwrap()
     }
 
     #[test]
@@ -131,7 +129,8 @@ mod tests {
 
     #[test]
     fn test_get_integer_tag_missing() {
-        let rec = RecordBuf::default();
+        let buf = RecordBuf::default();
+        let rec = RikerRecord::from_alignment_record(&Header::default(), &buf).unwrap();
         assert_eq!(get_integer_tag(&rec, *b"NM"), None);
     }
 
