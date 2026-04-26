@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use log::Level;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
+
+use crate::sam::riker_record::RikerRecord;
 
 /// Width of the formatted count field, enough for `"1,000,000,000"` (13 chars).
 const COUNT_WIDTH: usize = 13;
@@ -84,7 +85,7 @@ impl ProgressLogger {
     ///
     /// The header lookup and string allocation for the position are deferred until
     /// a milestone is actually hit, avoiding ~800M allocations on a 30× WGS run.
-    pub fn record_with(&mut self, record: &RecordBuf, header: &Header) {
+    pub fn record_with(&mut self, record: &RikerRecord, header: &Header) {
         self.count += 1;
         if self.count >= self.next_milestone {
             self.next_milestone += self.every;
@@ -142,8 +143,8 @@ impl ProgressLogger {
     }
 }
 
-/// Extract a `(chrom, 1-based-pos)` pair from a SAM record for use in log messages.
-fn extract_chrom_pos(record: &RecordBuf, header: &Header) -> (String, u64) {
+/// Extract a `(chrom, 1-based-pos)` pair from a record for use in log messages.
+fn extract_chrom_pos(record: &RikerRecord, header: &Header) -> (String, u64) {
     let chrom = record
         .reference_sequence_id()
         .and_then(|id| header.reference_sequences().get_index(id))
@@ -253,6 +254,7 @@ mod tests {
     #[test]
     fn test_extract_chrom_pos_mapped() {
         use noodles::core::Position;
+        use noodles::sam::alignment::RecordBuf;
         use noodles::sam::alignment::record::Flags;
         use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
         use std::num::NonZeroUsize;
@@ -269,17 +271,21 @@ mod tests {
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::new(100).unwrap())
             .build();
+        let riker = RikerRecord::from_alignment_record(&header, &rec).unwrap();
 
-        let (chrom, pos) = extract_chrom_pos(&rec, &header);
+        let (chrom, pos) = extract_chrom_pos(&riker, &header);
         assert_eq!(chrom, "chr1");
         assert_eq!(pos, 100);
     }
 
     #[test]
     fn test_extract_chrom_pos_unmapped() {
+        use noodles::sam::alignment::RecordBuf;
+
         let header = Header::default();
         let rec = RecordBuf::default();
-        let (chrom, pos) = extract_chrom_pos(&rec, &header);
+        let riker = RikerRecord::from_alignment_record(&header, &rec).unwrap();
+        let (chrom, pos) = extract_chrom_pos(&riker, &header);
         assert_eq!(chrom, "<unmapped>");
         assert_eq!(pos, 0);
     }

@@ -10,11 +10,10 @@ use kuva::render::annotations::ReferenceLine;
 use kuva::render::layout::{Layout, TickFormat};
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::Collector;
+use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::fasta::Fasta;
@@ -25,6 +24,7 @@ use crate::plotting::{
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::{derive_sample, get_integer_tag};
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 
 // ─── File suffixes ─────────────────────────────────────────────────────────────
@@ -159,21 +159,14 @@ impl Command for GcBias {
     /// # Errors
     /// Returns an error if the BAM or reference cannot be read, or if output cannot be written.
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) =
-            AlignmentReader::new(&self.input.input, Some(&self.reference.reference))?;
+        let mut reader = AlignmentReader::open(&self.input.input, Some(&self.reference.reference))?;
         let reference = Fasta::from_path(&self.reference.reference)?;
 
         let mut collector =
             GcBiasCollector::new(&self.input.input, &self.output.output, reference, &self.options);
 
-        collector.initialize(&header)?;
         let mut progress = ProgressLogger::new("gcbias", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 
@@ -253,7 +246,7 @@ impl GcBiasCollector {
     }
 
     /// Process a single BAM record.
-    fn process_record(&mut self, record: &RecordBuf) -> Result<()> {
+    fn process_record(&mut self, record: &RikerRecord) -> Result<()> {
         let flags = record.flags();
 
         // Filter: skip unmapped, secondary, QC-fail; supplementary only if excluded
@@ -300,12 +293,16 @@ impl GcBiasCollector {
             self.current_contig_id = Some(ref_id);
         }
 
-        // Position: forward strand → alignment_start; reverse → alignment_end - window_size
+        // Position: forward strand → alignment_start; reverse → alignment_end - window_size.
+        // The reverse branch needs alignment_end (1-based inclusive == 0-based
+        // exclusive), which is only `None` for records with no CIGAR; on those
+        // we have nothing better than the start, so fall through to the
+        // forward formula.
         let alignment_start = record.alignment_start().map_or(0, |p| usize::from(p) - 1); // 0-based
-        let pos = if flags.is_reverse_complemented() {
-            let ref_span = record.cigar().alignment_span();
-            let alignment_end = alignment_start + ref_span;
-            alignment_end.saturating_sub(self.window_size as usize)
+        let pos = if flags.is_reverse_complemented()
+            && let Some(end) = record.alignment_end()
+        {
+            usize::from(end).saturating_sub(self.window_size as usize)
         } else {
             alignment_start
         };
@@ -326,7 +323,7 @@ impl GcBiasCollector {
         self.reads_by_gc[gc] += 1;
 
         // Read length (sequence bases)
-        let read_len = record.sequence().len() as u64;
+        let read_len = record.sequence_len() as u64;
         self.bases_by_gc[gc] += read_len;
 
         // NM tag
@@ -334,7 +331,7 @@ impl GcBiasCollector {
         self.errors_by_gc[gc] += u64::from(nm);
 
         // Base quality accumulation (integer)
-        let qual_bytes: &[u8] = record.quality_scores().as_ref();
+        let qual_bytes: &[u8] = record.quality_scores();
         if !qual_bytes.is_empty() {
             self.quality_sum_by_gc[gc] += qual_bytes.iter().map(|&q| u64::from(q)).sum::<u64>();
             self.quality_bases_by_gc[gc] += qual_bytes.len() as u64;
@@ -542,7 +539,7 @@ impl Collector for GcBiasCollector {
         Ok(())
     }
 
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         self.process_record(record)
     }
 
@@ -564,6 +561,13 @@ impl Collector for GcBiasCollector {
 
     fn name(&self) -> &'static str {
         "gcbias"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        // Uses `sequence_len()` (no decode) + `NM` aux tag + quality scores
+        // (always available). Sequence bases are never read, so we don't
+        // declare `with_sequence`.
+        RikerRecordRequirements::NONE.with_aux_tag(*b"NM")
     }
 }
 

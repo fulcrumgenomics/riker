@@ -1,28 +1,45 @@
-//! The `multi` command: one BAM pass, many collectors, run in parallel.
+//! The `multi` command: one pass over the input, many collectors, run in parallel.
 //!
 //! ## Threading model
 //!
-//! There is a single **reader thread** and `--threads` **pool workers**,
-//! connected through three channels:
+//! `--threads N` is the **total** thread count: 1 reader thread plus
+//! `N - 1` pool workers. So `--threads 2` means 1 reader + 1 worker,
+//! `--threads 4` means 1 reader + 3 workers. `--threads 1` skips the
+//! parallel pipeline entirely (see "Single-threaded path" below).
 //!
-//! - `batch_pool` — an unbounded mpsc channel of empty `Vec<RecordBuf>`
-//!   slots the reader pulls from (and which [`RecyclableBatch::drop`]
-//!   returns to). This recycles pre-allocated [`RecordBuf`]s across the
-//!   whole run so the reader does not allocate per-record.
+//! Reader and workers are connected through three channels:
+//!
+//! - `batch_pool` — an unbounded mpsc channel of empty
+//!   `Vec<RikerRecord>` slots the reader pulls from (and which
+//!   [`RecyclableBatch::drop`] returns to). Slots are pre-allocated as
+//!   the record variant the reader writes into: `RikerRecord::Bam` for
+//!   BAM, `RikerRecord::Fallback` for SAM. The pool is empty for CRAM
+//!   because CRAM batches are one-way (see below).
 //! - `work_queue` — a bounded crossbeam MPMC queue of
 //!   `(collector_idx, Arc<RecyclableBatch>)`. The reader fans each batch
 //!   onto it once per collector; pool workers block on it.
 //! - `return` — the mpsc `return_tx`/`return_rx` captured inside each
 //!   `RecyclableBatch`. When the last `Arc` reference drops,
-//!   [`RecyclableBatch::drop`] sends the inner `Vec` back to the pool.
+//!   [`RecyclableBatch::drop`] sends the inner `Vec` back to the pool
+//!   (BAM/SAM) or just drops it (CRAM, `return_tx: None`).
 //!
-//! The reader reads records in place into a batch (`read_record_buf`
-//! overwrites each slot), wraps the full batch in an `Arc`, and clones
-//! it once per collector onto the work queue. Workers block on
-//! `work_rx.recv()` — no polling, no condvar. On receipt they lock the
-//! per-collector mutex and call `accept_multiple`, which serialises
-//! accesses to any single collector while still letting different
-//! collectors process in parallel across workers.
+//! For BAM and SAM the reader reads records in place into a batch
+//! (`AlignmentReader::fill_record` overwrites each slot). For CRAM it
+//! drives `AlignmentReader::riker_records` — noodles allocates each
+//! record fresh, and the bounded work queue provides backpressure
+//! instead of a pool. Either way the reader wraps the batch in an
+//! `Arc`, clones it once per collector onto the work queue, and workers
+//! block on `work_rx.recv()` — no polling, no condvar. On receipt they
+//! lock the per-collector mutex and call `accept_multiple`, which
+//! serialises accesses to any single collector while still letting
+//! different collectors process in parallel across workers.
+//!
+//! The reader also consults the union of every active collector's
+//! [`Collector::field_needs`] once up front and passes it down. On BAM
+//! (where aux decode is lazy) this gates which decoders run per record,
+//! so a collector set that never reads aux tags pays zero aux-decode
+//! cost. SAM and CRAM decode eagerly inside noodles, so the union is
+//! informational there.
 //!
 //! When the reader hits EOF it drops `work_tx`, the queue closes, and
 //! workers exit once they have drained. `Collector::finish` is called
@@ -47,11 +64,19 @@
 //! Errors are surfaced by `handle.join()` on the main thread — the
 //! reader's error wins if present, otherwise the first pool-worker error.
 //!
+//! All `poison` flag accesses use `Ordering::Relaxed`. Relaxed is
+//! sufficient because the flag is a hint that *some* thread errored;
+//! the actual shared state (per-collector mutexes, the work queue) is
+//! synchronised by its own primitives and provides whatever
+//! happens-before edges the program needs.
+//!
 //! ## Single-threaded path
 //!
 //! For `--threads 1` the whole thing collapses to [`run_single_threaded`]:
-//! no channels, no extra threads, just a serial loop. Useful for testing
-//! and small runs where threading overhead isn't worth it.
+//! no channels, no extra threads, just a serial loop that drives the
+//! same reader API (in-place fills for BAM/SAM, iterator for CRAM).
+//! Useful for testing and small runs where threading overhead isn't
+//! worth it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -63,7 +88,6 @@ use anyhow::{Result, anyhow};
 use clap::{Args, ValueEnum};
 use crossbeam_channel::{Receiver, Sender};
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
 
 use crate::collector::Collector;
 use crate::commands::alignment::{AlignmentCollector, MultiAlignmentOptions};
@@ -76,10 +100,10 @@ use crate::commands::hybcap::{HybCapCollector, MultiHybCapOptions};
 use crate::commands::isize::{InsertSizeCollector, MultiIsizeOptions};
 use crate::commands::wgs::{MultiWgsOptions, WgsCollector};
 use crate::fasta::Fasta;
-
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::derive_sample;
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
 /// Number of records per batch sent through channels.
 const BATCH_SIZE: usize = 256;
@@ -134,7 +158,11 @@ pub struct Multi {
     )]
     pub tools: Vec<CollectorKind>,
 
-    /// Number of threads for parallel collection. 1 = single-threaded (no threading overhead).
+    /// Total number of threads to use. The reader counts as one of them, so
+    /// `--threads N` means 1 reader + `N - 1` pool workers. `--threads 1`
+    /// disables the parallel pipeline entirely (no reader thread, no
+    /// channels) and runs serially on the main thread; `--threads 2` is
+    /// 1 reader + 1 pool worker; and so on.
     #[arg(long, default_value_t = 2, help_heading = "Multi Command Options")]
     pub threads: usize,
 
@@ -277,29 +305,15 @@ impl Command for Multi {
             }
         }
 
-        // Pre-read the header so we can build interval maps for WGS if needed.
-        let (reader, header) =
-            AlignmentReader::new(&self.input.input, self.reference.reference.as_deref())?;
+        // Open the reader so we can build interval maps for WGS if needed.
+        let reader = AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
 
-        let collectors = self.build_collectors(&seen, &header)?;
+        let collectors = self.build_collectors(&seen, reader.header())?;
 
-        // The parallel path relies on in-place `read_record_buf` reads into a
-        // pool of pre-allocated `RecordBuf`s. noodles does not support this
-        // for CRAM, so for CRAM inputs we transparently drop back to the
-        // single-threaded path (which uses the cloning iterator that handles
-        // CRAM). BAM/SAM/GzippedSam take the multi-threaded path as usual.
-        let use_parallel = self.threads > 1 && reader.supports_in_place_reads();
-        if self.threads > 1 && !reader.supports_in_place_reads() {
-            log::info!(
-                "multi: CRAM input — running collectors single-threaded \
-                 (parallel path requires in-place BAM/SAM reads)"
-            );
-        }
-
-        if use_parallel {
-            run_parallel(reader, &header, collectors, self.threads)?;
+        if self.threads > 1 {
+            run_parallel(reader, collectors, self.threads)?;
         } else {
-            run_single_threaded(reader, &header, collectors)?;
+            run_single_threaded(reader, collectors)?;
         }
 
         Ok(())
@@ -349,10 +363,9 @@ impl fmt::Display for CollectorKind {
 /// A batch of records shared across collector channels.
 ///
 /// Wrapping the records in `RecyclableBatch` lets us send the inner
-/// `Vec<RecordBuf>` back to the reader's pool when the last `Arc` reference
+/// `Vec<RikerRecord>` back to the reader's pool when the last `Arc` reference
 /// drops (i.e. the last collector has finished with it), so the reader can
-/// reuse the pre-allocated `RecordBuf` slots on the next read and avoid the
-/// per-record clone that `Reader::record_bufs` would do.
+/// reuse the pre-allocated record slots on the next read.
 type Batch = Arc<RecyclableBatch>;
 
 /// A single work item on the MPMC work queue: which collector the batch is
@@ -361,50 +374,63 @@ type WorkItem = (usize, Batch);
 type WorkTx = Sender<WorkItem>;
 type WorkRx = Receiver<WorkItem>;
 
-/// Owns a pre-allocated `Vec<RecordBuf>` of capacity `BATCH_SIZE` plus a count
-/// of valid records. On drop, the inner `Vec` is returned to the reader's
-/// pool via `return_tx` so its allocations can be reused.
+/// Owns a `Vec<RikerRecord>` of capacity `BATCH_SIZE` plus a count of
+/// valid records. On drop, if `return_tx` is `Some`, the inner `Vec` is
+/// returned to the reader's pool so its allocations can be reused.
+///
+/// One-way batches (CRAM, where slots can't be recycled because each
+/// record is a fresh allocation anyway) carry `return_tx: None`; the
+/// `Vec` is just dropped on the last `Arc` release.
 struct RecyclableBatch {
-    records: Vec<RecordBuf>,
+    records: Vec<RikerRecord>,
     len: usize,
-    return_tx: mpsc::Sender<Vec<RecordBuf>>,
+    return_tx: Option<mpsc::Sender<Vec<RikerRecord>>>,
 }
 
 impl RecyclableBatch {
     /// Valid records in the batch, as a slice.
-    fn records(&self) -> &[RecordBuf] {
+    fn records(&self) -> &[RikerRecord] {
         &self.records[..self.len]
     }
 }
 
 impl Drop for RecyclableBatch {
     fn drop(&mut self) {
-        // Hand the inner Vec back to the reader's pool for reuse. The receiver
-        // is dropped during shutdown; ignore send errors in that case.
-        let records = std::mem::take(&mut self.records);
-        let _ = self.return_tx.send(records);
+        if let Some(tx) = self.return_tx.take() {
+            // Hand the inner Vec back to the reader's pool for reuse. The
+            // receiver is dropped during shutdown; ignore send errors then.
+            let records = std::mem::take(&mut self.records);
+            let _ = tx.send(records);
+        }
     }
 }
 
-/// Run all collectors sequentially on a single thread (no threading overhead).
+/// Run all collectors sequentially on a single thread (no threading
+/// overhead). Drives the reader the same way the parallel reader thread
+/// does — in-place fills for BAM/SAM, allocate-per-record iterator for
+/// CRAM — but loops over every collector for each record instead of
+/// fanning out via channels.
 fn run_single_threaded(
     mut reader: AlignmentReader,
-    header: &Header,
     mut collectors: Vec<Box<dyn Collector>>,
 ) -> Result<()> {
+    let header = reader.header().clone();
     for collector in &mut collectors {
-        collector.initialize(header)?;
+        collector.initialize(&header)?;
     }
 
+    let requirements = combined_requirements(&collectors);
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
-    reader.for_each_record(header, |record| {
-        progress.record_with(record, header);
-        for collector in &mut collectors {
-            collector.accept(record, header)?;
-        }
-        Ok(())
-    })?;
+
+    let read_result = run_single_threaded_loop(
+        &mut reader,
+        &mut collectors,
+        &requirements,
+        &header,
+        &mut progress,
+    );
     progress.finish();
+    read_result?;
 
     for collector in &mut collectors {
         collector.finish()?;
@@ -413,34 +439,83 @@ fn run_single_threaded(
     Ok(())
 }
 
+fn run_single_threaded_loop(
+    reader: &mut AlignmentReader,
+    collectors: &mut [Box<dyn Collector>],
+    requirements: &RikerRecordRequirements,
+    header: &Header,
+    progress: &mut ProgressLogger,
+) -> Result<()> {
+    if reader.supports_in_place_reads() {
+        let mut record = reader.empty_record();
+        while reader.fill_record(requirements, &mut record)? {
+            progress.record_with(&record, header);
+            for collector in collectors.iter_mut() {
+                collector.accept(&record, header)?;
+            }
+        }
+    } else {
+        for result in reader.riker_records(requirements) {
+            let record = result?;
+            progress.record_with(&record, header);
+            for collector in collectors.iter_mut() {
+                collector.accept(&record, header)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute the union of every collector's [`RikerRecordRequirements`]. The
+/// reader uses this to decide which decoder steps to run on every record;
+/// each collector then sees the same fully-populated record.
+fn combined_requirements(collectors: &[Box<dyn Collector>]) -> RikerRecordRequirements {
+    collectors.iter().fold(RikerRecordRequirements::NONE, |acc, c| acc.union(c.field_needs()))
+}
+
 /// Run collectors in parallel with a dedicated reader thread and a shared
 /// worker pool.
 ///
 /// Architecture:
-/// - One **reader thread** pulls empty [`RecyclableBatch`] slots from a pool,
-///   fills them in place via `read_record_buf`, wraps each in an `Arc`, and
-///   fans it out onto a shared `(collector_idx, Batch)` work queue — one entry
-///   per collector.
+/// - One **reader thread** pulls empty [`RecyclableBatch`] slots from a pool
+///   (BAM/SAM) or allocates them on the fly (CRAM), fills each batch via the
+///   reader API, wraps it in an `Arc`, and fans it out onto a shared
+///   `(collector_idx, Batch)` work queue — one entry per collector.
 /// - `threads` **pool threads** block on the shared work queue. On receipt of
 ///   a work item they lock that collector's mutex and call `accept_multiple`.
 ///   The mutex serializes per-collector accepts (required since `Collector`
 ///   is stateful) while still allowing different collectors' batches to
 ///   process in parallel across threads.
 /// - When the last `Arc<RecyclableBatch>` drops, its `Drop` returns the inner
-///   `Vec<RecordBuf>` to the reader's pool via an mpsc channel.
+///   `Vec<RikerRecord>` to the reader's pool via an mpsc channel — except
+///   for one-way CRAM batches (`return_tx: None`), which just drop.
 ///
-/// Properties vs. the previous try_lock+sleep design: no busy-polling, no
-/// `Condvar`, and `--threads` directly controls how many worker threads run.
+/// `threads` is the **total** thread count (reader + workers), so the
+/// pool spawns `threads - 1` workers. Caller is responsible for ensuring
+/// `threads >= 2` (the `--threads 1` case routes to
+/// [`run_single_threaded`] instead).
+///
+/// Workers block on the MPMC work queue; the reader fans batches through
+/// the queue with backpressure provided by its bounded capacity. No
+/// busy-polling, no `Condvar`.
 fn run_parallel(
     mut reader: AlignmentReader,
-    header: &Header,
     mut collectors: Vec<Box<dyn Collector>>,
     threads: usize,
 ) -> Result<()> {
-    // Initialize all collectors before spawning threads.
+    debug_assert!(threads >= 2, "run_parallel requires at least 2 total threads");
+    let pool_workers = threads - 1;
+    // Clone the header up front so worker threads (which borrow it) and
+    // the reader thread (which owns the AlignmentReader) don't fight over
+    // it. Header.clone() is one shot at startup.
+    let header = reader.header().clone();
     for collector in &mut collectors {
-        collector.initialize(header)?;
+        collector.initialize(&header)?;
     }
+
+    // Each collector declares which expensive fields it reads; the union
+    // tells the reader which decoder steps to run per record.
+    let requirements = combined_requirements(&collectors);
 
     // Each collector lives behind a Mutex so a pool thread can claim exclusive
     // access before calling `accept_multiple`. The mutex only serializes accesses
@@ -452,16 +527,26 @@ fn run_parallel(
     let (work_tx, work_rx): (WorkTx, WorkRx) =
         crossbeam_channel::bounded(CHANNEL_DEPTH * slots.len().max(1));
 
-    // Pool of reusable record-batch allocations. When a `RecyclableBatch`
-    // drops (all collectors done with it), its inner `Vec<RecordBuf>` is
-    // sent back here so the reader can reuse those pre-allocated slots.
-    // Unbounded so `RecyclableBatch::drop` never blocks.
-    let (pool_tx, pool_rx) = mpsc::channel::<Vec<RecordBuf>>();
-    let pool_size = CHANNEL_DEPTH + POOL_EXTRA;
-    for _ in 0..pool_size {
-        let mut vec: Vec<RecordBuf> = Vec::with_capacity(BATCH_SIZE);
-        vec.resize_with(BATCH_SIZE, RecordBuf::default);
-        pool_tx.send(vec).expect("pool receiver exists on startup, send cannot fail");
+    // Pool of reusable record-batch allocations, used for BAM and SAM where
+    // we read in place. CRAM cannot recycle slots (each record is freshly
+    // allocated by noodles), so its batches are one-way (`return_tx: None`)
+    // and we don't pre-fill the pool. Unbounded so `RecyclableBatch::drop`
+    // never blocks.
+    //
+    // Pool slots are pre-allocated as the variant the reader writes to —
+    // `RikerRecord::Bam(BamRec::new())` for BAM (skips the eager aux-tag
+    // decode) and `RikerRecord::Fallback(FallbackRec::empty())` for SAM.
+    let (pool_tx, pool_rx) = mpsc::channel::<Vec<RikerRecord>>();
+    if reader.supports_in_place_reads() {
+        let pool_size = CHANNEL_DEPTH + POOL_EXTRA;
+        for _ in 0..pool_size {
+            let mut vec: Vec<RikerRecord> = Vec::with_capacity(BATCH_SIZE);
+            vec.resize_with(BATCH_SIZE, || reader.empty_record());
+            // Channel is unbounded (mpsc) and `pool_rx` is held in this
+            // function until the reader thread takes ownership later, so
+            // the send cannot fail here.
+            pool_tx.send(vec).expect("pool send cannot fail: channel is unbounded and rx is alive");
+        }
     }
 
     // Poison: set when any thread errors. Signals the reader to stop early.
@@ -471,16 +556,18 @@ fn run_parallel(
     // Run the reader + worker threads inside a scope so they can borrow
     // `slots` and `poison`. The scope ends (and borrows release) before we
     // reclaim `slots` to call `finish()`.
+    let header_ref = &header;
     std::thread::scope(|scope| -> Result<()> {
         let slots_ref: &[Mutex<Box<dyn Collector>>] = &slots;
         let poison_ref: &AtomicBool = &poison;
 
-        // Pool workers share `work_rx` (MPMC) and the slots.
-        let mut pool_handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
+        // Pool workers share `work_rx` (MPMC) and the slots. We spawn
+        // `threads - 1` of them; the reader counts as the Nth thread.
+        let mut pool_handles = Vec::with_capacity(pool_workers);
+        for _ in 0..pool_workers {
             let work_rx = work_rx.clone();
             pool_handles.push(
-                scope.spawn(move || pool_worker_loop(work_rx, slots_ref, header, poison_ref)),
+                scope.spawn(move || pool_worker_loop(work_rx, slots_ref, header_ref, poison_ref)),
             );
         }
         // Drop our outer receiver handle so the queue closes once the reader's
@@ -488,14 +575,16 @@ fn run_parallel(
         drop(work_rx);
 
         // Reader owns the work-queue sender and the batch pool.
+        let requirements_ref = &requirements;
         let reader_handle = scope.spawn(move || {
             let reader_result = reader_thread_loop(
                 &mut reader,
-                header,
+                header_ref,
                 &work_tx,
                 n_collectors,
                 pool_tx,
                 pool_rx,
+                requirements_ref,
                 poison_ref,
             );
             drop(work_tx);
@@ -543,81 +632,176 @@ fn run_parallel(
     Ok(())
 }
 
-/// Reader thread: reads BAM records in batches into pooled `RecordBuf` slots
-/// and fans each batch onto the shared work queue once per collector.
+/// Reader thread: pulls records into batches and fans each batch onto the
+/// shared work queue once per collector.
+///
+/// Two paths inside one function. BAM/SAM use the in-place pool: the reader
+/// pulls a pre-allocated `Vec<RikerRecord>` from `pool_rx` and fills each
+/// slot via [`AlignmentReader::fill_record`]; on drop the batch returns its
+/// `Vec` to the pool. CRAM uses [`AlignmentReader::riker_records`] —
+/// noodles allocates each `RikerRecord::Fallback` afresh — and the batch
+/// is one-way (`return_tx: None`), so the pool channel is unused.
 #[allow(
     clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
     reason = "pool_tx and pool_rx move into this (scoped) thread: the reader \
               is the only thread that receives from the pool, and we want the \
               reader's handle on pool_tx to drop when the reader exits so \
               in-flight RecyclableBatch Drops (which each carry a clone of \
               pool_tx) become the last senders and the pool channel can \
-              close naturally on shutdown"
+              close naturally on shutdown; the split into helper fns needs \
+              these"
 )]
 fn reader_thread_loop(
     reader: &mut AlignmentReader,
     header: &Header,
     work_tx: &WorkTx,
     n_collectors: usize,
-    pool_tx: mpsc::Sender<Vec<RecordBuf>>,
-    pool_rx: mpsc::Receiver<Vec<RecordBuf>>,
+    pool_tx: mpsc::Sender<Vec<RikerRecord>>,
+    pool_rx: mpsc::Receiver<Vec<RikerRecord>>,
+    requirements: &RikerRecordRequirements,
     poison: &AtomicBool,
 ) -> Result<()> {
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
 
-    // Wrap the loop in an IIFE so `progress.finish()` runs on every exit —
-    // EOF, poison trip, pool-channel close, fan-out send failure, and the
-    // `?` on `read_record_buf`. Without this, the final-count log line
-    // silently disappears on any non-EOF shutdown.
-    let result = (|| -> Result<()> {
-        loop {
-            if poison.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            // Blocks if every batch is currently in flight — acts as backpressure.
-            let Ok(mut records) = pool_rx.recv() else {
-                return Ok(());
-            };
-
-            // Read directly into the pre-allocated slots. Each RecordBuf's inner
-            // Vecs (name, cigar, sequence, quality, data) are reused.
-            let mut len = 0;
-            while len < records.len() {
-                let bytes = reader.read_record_buf(header, &mut records[len])?;
-                if bytes == 0 {
-                    break;
-                }
-                progress.record_with(&records[len], header);
-                len += 1;
-            }
-
-            if len == 0 {
-                // EOF: recycle the unused batch and stop.
-                let _ = pool_tx.send(records);
-                return Ok(());
-            }
-
-            // Wrap once, fan out via Arc clones on the shared work queue. The
-            // last `Arc` drop (after the last pool worker processes it) triggers
-            // `RecyclableBatch::drop`, which recycles `records` to the pool.
-            let batch = Arc::new(RecyclableBatch { records, len, return_tx: pool_tx.clone() });
-            for idx in 0..n_collectors {
-                if poison.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                if work_tx.send((idx, Arc::clone(&batch))).is_err() {
-                    // All pool threads gone (they errored and dropped their
-                    // receivers) — stop and let the parent surface the error.
-                    return Ok(());
-                }
-            }
-            drop(batch);
-        }
-    })();
+    let result = if reader.supports_in_place_reads() {
+        run_in_place_reader(
+            reader,
+            header,
+            work_tx,
+            n_collectors,
+            &pool_tx,
+            &pool_rx,
+            requirements,
+            poison,
+            &mut progress,
+        )
+    } else {
+        run_iterator_reader(
+            reader,
+            header,
+            work_tx,
+            n_collectors,
+            requirements,
+            poison,
+            &mut progress,
+        )
+    };
 
     progress.finish();
     result
+}
+
+/// In-place reader path: pull a pre-allocated batch from the pool, fill
+/// it via [`AlignmentReader::fill_record`], dispatch, and let the
+/// `RecyclableBatch` return the slots to the pool on drop.
+#[allow(clippy::too_many_arguments, reason = "all parameters are needed; this is a private helper")]
+fn run_in_place_reader(
+    reader: &mut AlignmentReader,
+    header: &Header,
+    work_tx: &WorkTx,
+    n_collectors: usize,
+    pool_tx: &mpsc::Sender<Vec<RikerRecord>>,
+    pool_rx: &mpsc::Receiver<Vec<RikerRecord>>,
+    requirements: &RikerRecordRequirements,
+    poison: &AtomicBool,
+    progress: &mut ProgressLogger,
+) -> Result<()> {
+    loop {
+        if poison.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Blocks when every batch is in flight — natural backpressure.
+        let Ok(mut records) = pool_rx.recv() else {
+            return Ok(());
+        };
+
+        let mut len = 0;
+        while len < records.len() {
+            if !reader.fill_record(requirements, &mut records[len])? {
+                break;
+            }
+            progress.record_with(&records[len], header);
+            len += 1;
+        }
+
+        if len == 0 {
+            let _ = pool_tx.send(records);
+            return Ok(());
+        }
+
+        let batch = Arc::new(RecyclableBatch { records, len, return_tx: Some(pool_tx.clone()) });
+        if !dispatch_batch(work_tx, &batch, n_collectors, poison) {
+            return Ok(());
+        }
+        drop(batch);
+    }
+}
+
+/// Iterator reader path: noodles owns the record allocation. Used for
+/// CRAM, where the batch is one-way (no recycling) and the pool channel
+/// is unused.
+fn run_iterator_reader(
+    reader: &mut AlignmentReader,
+    header: &Header,
+    work_tx: &WorkTx,
+    n_collectors: usize,
+    requirements: &RikerRecordRequirements,
+    poison: &AtomicBool,
+    progress: &mut ProgressLogger,
+) -> Result<()> {
+    let mut iter = reader.riker_records(requirements);
+    let mut records: Vec<RikerRecord> = Vec::with_capacity(BATCH_SIZE);
+    loop {
+        if poison.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        records.clear();
+        for _ in 0..BATCH_SIZE {
+            match iter.next() {
+                Some(Ok(rec)) => {
+                    progress.record_with(&rec, header);
+                    records.push(rec);
+                }
+                Some(Err(e)) => return Err(e),
+                None => break,
+            }
+        }
+
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let len = records.len();
+        let owned = std::mem::replace(&mut records, Vec::with_capacity(BATCH_SIZE));
+        let batch = Arc::new(RecyclableBatch { records: owned, len, return_tx: None });
+        if !dispatch_batch(work_tx, &batch, n_collectors, poison) {
+            return Ok(());
+        }
+        drop(batch);
+    }
+}
+
+/// Fan a batch out onto the shared work queue once per collector. Returns
+/// `false` when poisoned or when the queue closes (caller should stop).
+fn dispatch_batch(
+    work_tx: &WorkTx,
+    batch: &Batch,
+    n_collectors: usize,
+    poison: &AtomicBool,
+) -> bool {
+    for idx in 0..n_collectors {
+        if poison.load(Ordering::Relaxed) {
+            return false;
+        }
+        if work_tx.send((idx, Arc::clone(batch))).is_err() {
+            // All pool threads gone (they errored and dropped their receivers).
+            return false;
+        }
+    }
+    true
 }
 
 /// Pool worker: blocks on the shared work queue and dispatches each
@@ -652,4 +836,104 @@ fn pool_worker_loop(
         }
     }
     Ok(())
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sam::riker_record::RikerRecord;
+
+    /// Collector that fails on the Nth `accept` call to exercise the
+    /// poison-flag shutdown path of `run_parallel`.
+    struct FailingCollector {
+        seen: u64,
+        fail_after: u64,
+    }
+
+    impl Collector for FailingCollector {
+        fn initialize(&mut self, _h: &Header) -> Result<()> {
+            Ok(())
+        }
+        fn accept(&mut self, _r: &RikerRecord, _h: &Header) -> Result<()> {
+            self.seen += 1;
+            if self.seen >= self.fail_after {
+                return Err(anyhow!("synthetic failure after {} records", self.seen));
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+        fn field_needs(&self) -> RikerRecordRequirements {
+            RikerRecordRequirements::NONE
+        }
+    }
+
+    /// A failing collector inside `run_parallel` should propagate its
+    /// error out and not deadlock or panic. Asserts on both the error
+    /// type and that `run_parallel` actually returns (rather than
+    /// hanging forever waiting for the reader).
+    #[test]
+    fn run_parallel_propagates_collector_error() -> Result<()> {
+        use std::path::Path;
+        // Build a small in-memory BAM via the helpers crate. We rebuild
+        // the helper inline because helpers/ is only on the integration
+        // test target. A few hundred records is plenty to ensure the
+        // failing collector trips before EOF.
+        use noodles::bam;
+        use noodles::sam::Header;
+        use noodles::sam::alignment::RecordBuf;
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record::Flags;
+        use noodles::sam::alignment::record::cigar::Op;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+
+        let header = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(10_000).unwrap()),
+            )
+            .build();
+        let tmp = tempfile::NamedTempFile::with_suffix(".bam")?;
+        {
+            let file = std::fs::File::create(tmp.path())?;
+            let mut writer = bam::io::Writer::new(std::io::BufWriter::new(file));
+            writer.write_header(&header)?;
+            let cigar: Cigar = [Op::new(Kind::Match, 50)].into_iter().collect();
+            for i in 0u32..2_000 {
+                let pos =
+                    noodles::core::Position::new(usize::try_from(i).unwrap() % 9_000 + 1).unwrap();
+                let record = RecordBuf::builder()
+                    .set_name(format!("r{i}").into_bytes())
+                    .set_flags(Flags::empty())
+                    .set_reference_sequence_id(0)
+                    .set_alignment_start(pos)
+                    .set_cigar(cigar.clone())
+                    .set_sequence(Sequence::from(vec![b'A'; 50]))
+                    .set_quality_scores(QualityScores::from(vec![30u8; 50]))
+                    .build();
+                writer.write_alignment_record(&header, &record)?;
+            }
+        }
+
+        let reader = AlignmentReader::open(Path::new(tmp.path()), None)?;
+        let collectors: Vec<Box<dyn Collector>> =
+            vec![Box::new(FailingCollector { seen: 0, fail_after: 100 })];
+
+        // 2 threads = 1 reader + 1 worker, the minimal parallel config.
+        let result = run_parallel(reader, collectors, 2);
+        let err = result.expect_err("run_parallel should propagate the collector error");
+        assert!(
+            err.to_string().contains("synthetic failure"),
+            "expected the failing collector's error, got: {err}"
+        );
+        Ok(())
+    }
 }

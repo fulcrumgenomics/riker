@@ -302,11 +302,9 @@ impl SamBuilder {
         self
     }
 
-    /// Write all records to a BAM file at `path`, respecting the configured sort order.
-    ///
-    /// # Errors
-    /// Returns an error if the BAM file cannot be created or a record cannot be written.
-    pub fn write_to_file(&self, path: &Path) -> Result<()> {
+    /// Collect record references, sorted per the configured `sort_order`.
+    /// Used by every writer to apply the same ordering policy.
+    fn sorted_records(&self) -> Vec<&RecordBuf> {
         let mut records: Vec<&RecordBuf> = self.records.iter().collect();
         match self.sort_order {
             SortOrder::Unsorted => {}
@@ -326,14 +324,63 @@ impl SamBuilder {
                 });
             }
         }
+        records
+    }
 
+    /// Write all records to a BAM file at `path`, respecting the configured sort order.
+    ///
+    /// # Errors
+    /// Returns an error if the BAM file cannot be created or a record cannot be written.
+    pub fn write_to_file(&self, path: &Path) -> Result<()> {
         let file = std::fs::File::create(path)?;
         let mut writer = bam::io::Writer::new(BufWriter::new(file));
         writer.write_header(&self.header)?;
-        for record in records {
+        for record in self.sorted_records() {
             AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
         }
         Ok(())
+    }
+
+    /// Write all records to a CRAM file at `path`, using `fasta_path` as
+    /// the reference. Reference sequences in the BAM header must match
+    /// the sequences in the FASTA index for CRAM encoding to round-trip.
+    /// Sort order is honoured the same way [`Self::write_to_file`] does.
+    ///
+    /// # Errors
+    /// Returns an error if the CRAM file or its references cannot be
+    /// resolved, or if record writing fails.
+    pub fn write_cram_to_file(&self, path: &Path, fasta_path: &Path) -> Result<()> {
+        use noodles::cram;
+        use noodles::fasta;
+
+        let fasta_reader =
+            fasta::io::indexed_reader::Builder::default().build_from_path(fasta_path)?;
+        let repo =
+            fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(fasta_reader));
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = cram::io::writer::Builder::default()
+            .set_reference_sequence_repository(repo)
+            .build_from_writer(file);
+        writer.write_header(&self.header)?;
+        for record in self.sorted_records() {
+            AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
+        }
+        writer.try_finish(&self.header)?;
+        Ok(())
+    }
+
+    /// Write to a temporary CRAM file and return the handle (deleted on
+    /// drop). `fasta_path` is the indexed FASTA the CRAM encodes
+    /// against.
+    ///
+    /// # Errors
+    /// Returns an error if the temp file cannot be created or written.
+    #[allow(dead_code)]
+    pub fn to_temp_cram(&self, fasta_path: &Path) -> Result<NamedTempFile> {
+        let tmp = NamedTempFile::with_suffix(".cram")?;
+        self.write_cram_to_file(tmp.path(), fasta_path)?;
+        Ok(tmp)
     }
 
     /// Write to a temporary BAM file and return the handle (deleted on drop).
@@ -344,6 +391,37 @@ impl SamBuilder {
     pub fn to_temp_bam(&self) -> Result<NamedTempFile> {
         let tmp = NamedTempFile::with_suffix(".bam")?;
         self.write_to_file(tmp.path())?;
+        Ok(tmp)
+    }
+
+    /// Write all records to a plain (uncompressed) SAM file at `path`.
+    /// Sort order is honoured the same way [`Self::write_to_file`] does.
+    ///
+    /// # Errors
+    /// Returns an error if the SAM file cannot be created or a record
+    /// cannot be written.
+    #[allow(dead_code)]
+    pub fn write_sam_to_file(&self, path: &Path) -> Result<()> {
+        use noodles::sam;
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = sam::io::Writer::new(BufWriter::new(file));
+        writer.write_header(&self.header)?;
+        for record in self.sorted_records() {
+            AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
+        }
+        Ok(())
+    }
+
+    /// Write to a temporary `.sam` file and return the handle. Used by
+    /// integration tests that exercise the SAM in-place fill path.
+    ///
+    /// # Errors
+    /// Returns an error if the temp file cannot be created or written.
+    #[allow(dead_code)]
+    pub fn to_temp_sam(&self) -> Result<NamedTempFile> {
+        let tmp = NamedTempFile::with_suffix(".sam")?;
+        self.write_sam_to_file(tmp.path())?;
         Ok(tmp)
     }
 

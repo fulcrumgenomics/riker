@@ -3,13 +3,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::Cigar as CigarTrait;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::Collector;
+use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::counter::Counter;
@@ -20,6 +18,7 @@ use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::record_utils::{derive_sample, get_integer_tag};
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::simd;
 
 /// File suffix appended to the output prefix for alignment summary metrics.
@@ -88,8 +87,8 @@ impl Command for Alignment {
     /// # Errors
     /// Returns an error if the BAM cannot be read or the output cannot be written.
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) =
-            AlignmentReader::new(&self.input.input, self.reference.reference.as_deref())?;
+        let mut reader =
+            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
 
         let mut collector = AlignmentCollector::new(
             &self.input.input,
@@ -98,14 +97,8 @@ impl Command for Alignment {
             &self.options,
         );
 
-        collector.initialize(&header)?;
         let mut progress = ProgressLogger::new("alignment", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 
@@ -158,7 +151,7 @@ impl Collector for AlignmentCollector {
         Ok(())
     }
 
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         let flags = record.flags();
 
         // Skip secondary and supplementary alignments entirely.
@@ -211,6 +204,18 @@ impl Collector for AlignmentCollector {
 
     fn name(&self) -> &'static str {
         "alignment"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        // Reads sequence bases + quality scores + the NM, MQ, and SA aux tags.
+        RikerRecordRequirements::NONE
+            .with_sequence()
+            .with_aux_tag(*b"NM")
+            .with_aux_tag(*b"MQ")
+            // SA is `Z`-typed; we only check existence (chimera detection),
+            // never read its content. Presence-only skips the per-record
+            // `String(Vec<u8>)` allocation.
+            .with_aux_tag_presence(*b"SA")
     }
 }
 
@@ -369,7 +374,7 @@ impl CategoryAccumulator {
     }
 
     /// Process one PF, non-secondary, non-supplementary read.
-    fn process_record(&mut self, record: &RecordBuf, min_mapq: u8, max_insert_size: u32) {
+    fn process_record(&mut self, record: &RikerRecord, min_mapq: u8, max_insert_size: u32) {
         let flags = record.flags();
 
         self.total_reads += 1;
@@ -382,7 +387,7 @@ impl CategoryAccumulator {
         self.pf_reads += 1;
 
         // Read length (sequence stored in the BAM — includes soft-clipped, excludes hard-clipped).
-        let seq = record.sequence();
+        let seq: &[u8] = record.sequence();
         let read_len = seq.len() as u64;
 
         self.read_length_histogram.count(read_len);
@@ -395,7 +400,7 @@ impl CategoryAccumulator {
         // Bad cycles: track per-cycle no-call (N base) counts.
         track_bad_cycles(
             &mut self.bad_cycle_nocalls,
-            seq.as_ref(),
+            seq,
             read_len,
             flags.is_reverse_complemented(),
         );
@@ -471,7 +476,7 @@ impl CategoryAccumulator {
         } else if is_hq {
             // Fragment or pair with unmapped mate: chimeric if SA tag present.
             self.chimeras_denominator += 1;
-            if record.data().get(b"SA").is_some() {
+            if record.has_aux_tag(*b"SA") {
                 self.chimeras += 1;
             }
         }
@@ -482,12 +487,11 @@ impl CategoryAccumulator {
     /// for soft-clip, alignment-length, and indel tracking.
     fn process_cigar(
         &mut self,
-        record: &RecordBuf,
+        record: &RikerRecord,
         is_hq: bool,
         negative_strand: bool,
     ) -> CigarStats {
-        let quals = record.quality_scores();
-        let qual_bytes: &[u8] = quals.as_ref();
+        let qual_bytes: &[u8] = record.quality_scores();
         let has_quals = !qual_bytes.is_empty();
         let mut read_pos: usize = 0;
 
@@ -501,7 +505,7 @@ impl CategoryAccumulator {
         let mut leading_sc = 0u64;
         let mut trailing_sc = 0u64;
 
-        for op in CigarTrait::iter(record.cigar()).filter_map(Result::ok) {
+        for op in record.cigar_ops() {
             let len = op.len();
             match op.kind() {
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
@@ -704,12 +708,8 @@ struct CigarStats {
 
 /// Sum the lengths of all CIGAR operators of a given kind.
 /// Used only for `HardClip` on the pre-mapping-filter path.
-fn sum_cigar_op(record: &RecordBuf, target: Kind) -> u64 {
-    CigarTrait::iter(record.cigar())
-        .filter_map(Result::ok)
-        .filter(|op| op.kind() == target)
-        .map(|op| op.len() as u64)
-        .sum()
+fn sum_cigar_op(record: &RikerRecord, target: Kind) -> u64 {
+    record.cigar_ops().filter(|op| op.kind() == target).map(|op| op.len() as u64).sum()
 }
 
 // ─── Chimera detection ────────────────────────────────────────────────────────
@@ -721,7 +721,7 @@ fn sum_cigar_op(record: &RecordBuf, target: Kind) -> u64 {
 /// 2. The absolute insert size exceeds `max_insert_size`.
 /// 3. The pair orientation is not FR (the expected orientation).
 /// 4. Either end has an SA (supplementary alignment) tag.
-fn is_chimeric_pair(record: &RecordBuf, max_insert_size: u32) -> bool {
+fn is_chimeric_pair(record: &RikerRecord, max_insert_size: u32) -> bool {
     // Different contigs.
     if record.reference_sequence_id() != record.mate_reference_sequence_id() {
         return true;
@@ -740,7 +740,7 @@ fn is_chimeric_pair(record: &RecordBuf, max_insert_size: u32) -> bool {
     }
 
     // SA tag (split-read / chimeric alignment within one end).
-    if record.data().get(b"SA").is_some() {
+    if record.has_aux_tag(*b"SA") {
         return true;
     }
 
@@ -791,13 +791,14 @@ fn count_bad_cycles(nocall_map: &Counter<u64>, total_reads: u64) -> u64 {
 mod tests {
     use super::*;
     use noodles::core::Position;
+    use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::{
         Flags, MappingQuality,
         cigar::{Op, op::Kind as CigarKind},
     };
     use noodles::sam::alignment::record_buf::{Cigar, Data, QualityScores, Sequence};
 
-    // ── Helper: build a minimal RecordBuf for unit tests ─────────────────────
+    // ── Helper: build a minimal RecordBuf and wrap as RikerRecord ────────────
 
     #[allow(clippy::too_many_arguments)]
     fn make_record(
@@ -811,7 +812,7 @@ mod tests {
         mate_ref_id: Option<usize>,
         tlen: i32,
         data: noodles::sam::alignment::record_buf::Data,
-    ) -> RecordBuf {
+    ) -> RikerRecord {
         let mut b = RecordBuf::builder()
             .set_flags(flags)
             .set_mapping_quality(MappingQuality::new(mapq).expect("mapq"))
@@ -830,7 +831,7 @@ mod tests {
         if let Some(p) = pos {
             b = b.set_alignment_start(Position::new(p).expect("pos"));
         }
-        b.build()
+        RikerRecord::from_alignment_record(&Header::default(), &b.build()).unwrap()
     }
 
     fn simple_cigar(len: usize) -> Cigar {
@@ -866,7 +867,7 @@ mod tests {
 
     // ── process_cigar ─────────────────────────────────────────────────────────
 
-    fn cigar_stats(record: &RecordBuf, negative_strand: bool) -> CigarStats {
+    fn cigar_stats(record: &RikerRecord, negative_strand: bool) -> CigarStats {
         let mut acc = CategoryAccumulator::new("TEST");
         acc.process_cigar(record, false, negative_strand)
     }
@@ -1193,7 +1194,7 @@ mod tests {
         mate_reverse: bool,
         read_len: usize,
         sa_tag: bool,
-    ) -> RecordBuf {
+    ) -> RikerRecord {
         let mut flags = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED | Flags::FIRST_SEGMENT;
         if is_reverse {
             flags |= Flags::REVERSE_COMPLEMENTED;
@@ -1206,7 +1207,7 @@ mod tests {
         if sa_tag {
             data.insert((*b"SA").into(), DataValue::String("chr1,100,+,50M,60,0".into()));
         }
-        RecordBuf::builder()
+        let buf = RecordBuf::builder()
             .set_flags(flags)
             .set_reference_sequence_id(ref_id)
             .set_alignment_start(Position::new(100).expect("pos"))
@@ -1218,7 +1219,8 @@ mod tests {
             .set_mate_alignment_start(Position::new(200).expect("pos"))
             .set_template_length(tlen)
             .set_data(data)
-            .build()
+            .build();
+        RikerRecord::from_alignment_record(&Header::default(), &buf).unwrap()
     }
 
     #[test]

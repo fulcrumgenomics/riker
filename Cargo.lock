@@ -1327,6 +1327,7 @@ dependencies = [
  "bitvec",
  "bstr",
  "built",
+ "bytemuck",
  "chrono",
  "clap",
  "crossbeam-channel",

@@ -1,4 +1,4 @@
-use noodles::sam::alignment::RecordBuf;
+use crate::sam::riker_record::RikerRecord;
 
 /// Pair orientation for paired-end reads.
 ///
@@ -22,7 +22,7 @@ pub enum PairOrientation {
 /// Requires that the record is paired, both reads are mapped, and both are on
 /// the same reference. Returns `None` if those preconditions are not met.
 #[must_use]
-pub fn get_pair_orientation(record: &RecordBuf) -> Option<PairOrientation> {
+pub fn get_pair_orientation(record: &RikerRecord) -> Option<PairOrientation> {
     let flags = record.flags();
     if !flags.is_segmented() || flags.is_unmapped() || flags.is_mate_unmapped() {
         return None;
@@ -47,8 +47,7 @@ pub fn get_pair_orientation(record: &RecordBuf) -> Option<PairOrientation> {
         reason = "genomic positions are non-negative and fit in i64"
     )]
     let (positive_five_prime, negative_five_prime) = if is_reverse {
-        let ref_len = record.cigar().alignment_span();
-        let end = alignment_start + ref_len.saturating_sub(1);
+        let end = record.alignment_end().map_or(alignment_start, usize::from);
         (mate_start as i64, end as i64)
     } else {
         (alignment_start as i64, alignment_start as i64 + i64::from(insert_size))
@@ -65,11 +64,18 @@ pub fn get_pair_orientation(record: &RecordBuf) -> Option<PairOrientation> {
 mod tests {
     use super::*;
     use noodles::core::Position;
+    use noodles::sam::Header;
+    use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::{
         Flags, MappingQuality,
         cigar::{Op, op::Kind},
     };
     use noodles::sam::alignment::record_buf::Cigar;
+
+    fn to_riker(record: &RecordBuf) -> RikerRecord {
+        let header = Header::default();
+        RikerRecord::from_alignment_record(&header, record).unwrap()
+    }
 
     fn make_paired_record(
         pos: usize,
@@ -105,7 +111,7 @@ mod tests {
     fn test_fr_orientation() {
         // Read1 forward at 100, read2 reverse at 300, tlen=300
         let record = make_paired_record(100, 300, 300, false, true, 100);
-        assert_eq!(get_pair_orientation(&record), Some(PairOrientation::Fr));
+        assert_eq!(get_pair_orientation(&to_riker(&record)), Some(PairOrientation::Fr));
     }
 
     #[test]
@@ -113,25 +119,25 @@ mod tests {
         // Read1 (reverse) at 100, read2 (forward/mate) at 300.
         // negative_5' = 100 + 100 - 1 = 199; positive_5' = 300 → 300 >= 199 → RF.
         let record = make_paired_record(100, 300, 300, true, false, 100);
-        assert_eq!(get_pair_orientation(&record), Some(PairOrientation::Rf));
+        assert_eq!(get_pair_orientation(&to_riker(&record)), Some(PairOrientation::Rf));
     }
 
     #[test]
     fn test_tandem_both_forward() {
         let record = make_paired_record(100, 300, 300, false, false, 100);
-        assert_eq!(get_pair_orientation(&record), Some(PairOrientation::Tandem));
+        assert_eq!(get_pair_orientation(&to_riker(&record)), Some(PairOrientation::Tandem));
     }
 
     #[test]
     fn test_tandem_both_reverse() {
         let record = make_paired_record(100, 300, 300, true, true, 100);
-        assert_eq!(get_pair_orientation(&record), Some(PairOrientation::Tandem));
+        assert_eq!(get_pair_orientation(&to_riker(&record)), Some(PairOrientation::Tandem));
     }
 
     #[test]
     fn test_unpaired_returns_none() {
         let record = RecordBuf::builder().build();
-        assert_eq!(get_pair_orientation(&record), None);
+        assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 
     #[test]
@@ -149,7 +155,7 @@ mod tests {
             .set_mate_alignment_start(Position::new(200).unwrap())
             .set_template_length(200)
             .build();
-        assert_eq!(get_pair_orientation(&record), None);
+        assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 
     #[test]
@@ -160,7 +166,7 @@ mod tests {
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::new(100).unwrap())
             .build();
-        assert_eq!(get_pair_orientation(&record), None);
+        assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 
     #[test]
@@ -171,7 +177,7 @@ mod tests {
             .set_mate_reference_sequence_id(0)
             .set_mate_alignment_start(Position::new(100).unwrap())
             .build();
-        assert_eq!(get_pair_orientation(&record), None);
+        assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 
     #[test]
@@ -191,6 +197,6 @@ mod tests {
             .set_mate_alignment_start(Position::new(100).unwrap())
             .set_template_length(0)
             .build();
-        assert_eq!(get_pair_orientation(&record), Some(PairOrientation::Rf));
+        assert_eq!(get_pair_orientation(&to_riker(&record)), Some(PairOrientation::Rf));
     }
 }

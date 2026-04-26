@@ -20,10 +20,13 @@ fn run_alignment(bam: &std::path::Path) -> Result<Vec<AlignmentSummaryMetric>> {
     let mut collector =
         AlignmentCollector::new(bam, &prefix_path, None, &AlignmentOptions::default());
 
-    let (mut reader, header) = AlignmentReader::new(bam, None)?;
+    let mut reader = AlignmentReader::open(bam, None)?;
+    let header = reader.header().clone();
     collector.initialize(&header)?;
-    for result in reader.record_bufs(&header) {
-        collector.accept(&result?, &header)?;
+    let requirements = collector.field_needs();
+    for result in reader.riker_records(&requirements) {
+        let record = result?;
+        collector.accept(&record, &header)?;
     }
     collector.finish()?;
 
@@ -568,8 +571,8 @@ fn test_reference_validation_missing_contig_errors() -> Result<()> {
         &AlignmentOptions::default(),
     );
 
-    let (_, header) = AlignmentReader::new(bam.path(), None)?;
-    let result = collector.initialize(&header);
+    let reader = AlignmentReader::open(bam.path(), None)?;
+    let result = collector.initialize(reader.header());
     assert!(result.is_err(), "expected error for missing contig");
     assert!(result.unwrap_err().to_string().contains("chrZ"));
     Ok(())
@@ -590,10 +593,13 @@ fn test_output_file_created_with_correct_suffix() -> Result<()> {
 
     let mut collector =
         AlignmentCollector::new(bam.path(), &prefix_path, None, &AlignmentOptions::default());
-    let (mut reader, header) = AlignmentReader::new(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let header = reader.header().clone();
     collector.initialize(&header)?;
-    for result in reader.record_bufs(&header) {
-        collector.accept(&result?, &header)?;
+    let requirements = collector.field_needs();
+    for result in reader.riker_records(&requirements) {
+        let record = result?;
+        collector.accept(&record, &header)?;
     }
     collector.finish()?;
 

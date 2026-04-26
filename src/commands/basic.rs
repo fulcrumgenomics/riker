@@ -8,11 +8,10 @@ use kuva::render::annotations::{Orientation, ShadedRegion};
 use kuva::render::layout::Layout;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::Collector;
+use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::metrics::write_tsv;
@@ -22,6 +21,7 @@ use crate::plotting::{
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::derive_sample;
+use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
 // ─── Output file suffixes ────────────────────────────────────────────────────
 
@@ -74,17 +74,11 @@ impl Command for Basic {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output files cannot be written.
     fn execute(&self) -> Result<()> {
-        let (mut reader, header) =
-            AlignmentReader::new(&self.input.input, self.reference.reference.as_deref())?;
+        let mut reader =
+            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
         let mut collector = BasicCollector::new(&self.input.input, &self.output.output);
-        collector.initialize(&header)?;
         let mut progress = ProgressLogger::new("basic", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 
@@ -424,7 +418,7 @@ impl Collector for BasicCollector {
         Ok(())
     }
 
-    fn accept(&mut self, record: &RecordBuf, _header: &Header) -> Result<()> {
+    fn accept(&mut self, record: &RikerRecord, _header: &Header) -> Result<()> {
         let flags = record.flags();
 
         // Skip secondary, supplementary, and QC-fail reads
@@ -432,12 +426,12 @@ impl Collector for BasicCollector {
             return Ok(());
         }
 
-        let seq: &[u8] = record.sequence().as_ref();
+        let seq: &[u8] = record.sequence();
         if seq.is_empty() {
             return Ok(());
         }
 
-        let quals: &[u8] = record.quality_scores().as_ref();
+        let quals: &[u8] = record.quality_scores();
         let len = seq.len();
         let is_reverse = flags.is_reverse_complemented();
 
@@ -462,20 +456,18 @@ impl Collector for BasicCollector {
 
         Self::ensure_capacity(base_counts, cycle_totals, qual_sums, qual_counts, len);
 
-        let has_quals = !quals.is_empty();
-
-        for i in 0..len {
+        // Quality scores can be shorter than the sequence on malformed
+        // input — guard with `quals.get(i)` rather than indexing directly,
+        // so a single bad record doesn't abort the whole run.
+        for (i, &base) in seq.iter().enumerate() {
             // Cycle: forward reads go 0..len, reverse reads go len-1..0
             let cycle_idx = if is_reverse { len - 1 - i } else { i };
-
-            let base = seq[i];
             let bi = Self::base_index(base);
 
             base_counts[bi][cycle_idx] += 1;
             cycle_totals[cycle_idx] += 1;
 
-            if has_quals {
-                let q = quals[i];
+            if let Some(&q) = quals.get(i) {
                 qual_sums[cycle_idx] += f64::from(q);
                 qual_counts[cycle_idx] += 1;
 
@@ -508,6 +500,10 @@ impl Collector for BasicCollector {
 
     fn name(&self) -> &'static str {
         "basic"
+    }
+
+    fn field_needs(&self) -> RikerRecordRequirements {
+        RikerRecordRequirements::NONE.with_sequence()
     }
 }
 

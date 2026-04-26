@@ -25,9 +25,11 @@ fn run_basic(builder: &SamBuilder) -> (TempDir, std::path::PathBuf) {
     let mut collector = BasicCollector::new(bam.path(), &prefix);
     collector.initialize(&header).unwrap();
 
-    let (mut reader, hdr) =
-        riker_lib::sam::alignment_reader::AlignmentReader::new(bam.path(), None).unwrap();
-    for result in reader.record_bufs(&hdr) {
+    let mut reader =
+        riker_lib::sam::alignment_reader::AlignmentReader::open(bam.path(), None).unwrap();
+    let hdr = reader.header().clone();
+    let requirements = collector.field_needs();
+    for result in reader.riker_records(&requirements) {
         let record = result.unwrap();
         collector.accept(&record, &hdr).unwrap();
     }
@@ -398,4 +400,45 @@ fn test_plot_files_created() {
         assert!(path.exists(), "Missing plot file: {}", path.display());
         assert!(std::fs::metadata(&path).unwrap().len() > 0, "Empty plot file: {}", path.display());
     }
+}
+
+#[test]
+fn test_truncated_quality_scores_do_not_panic() {
+    // Malformed input: sequence has 4 bases but quality_scores has only 2.
+    // Without the `quals.get(i)` guard this would panic on `quals[2]` and
+    // abort the whole run. With the guard, all 4 bases contribute to the
+    // base distribution; only the 2 cycles with quality data contribute
+    // to the per-cycle quality sums.
+    //
+    // The BAM writer rejects mismatched seq/qual lengths at write time,
+    // which is what stops this from happening on well-formed files; we
+    // exercise the collector directly via the in-process API rather than
+    // round-tripping through a temp BAM.
+    use noodles::sam::Header;
+    use riker_lib::sam::riker_record::RikerRecord;
+
+    let buf = make_record("truncated", Flags::empty(), b"ACGT", &[30, 30]);
+    let header = Header::default();
+    let record = RikerRecord::from_alignment_record(&header, &buf).unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+    let mut collector = BasicCollector::new(std::path::Path::new("none"), &prefix);
+    collector.initialize(&header).unwrap();
+    // The line that would have panicked pre-fix:
+    collector.accept(&record, &header).unwrap();
+    collector.finish().unwrap();
+
+    // Base distribution should reflect all 4 bases (4 cycles).
+    let bd_path =
+        std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
+    let base_dist: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&bd_path).unwrap();
+    assert_eq!(base_dist.len(), 4, "expected 4 cycles in base distribution");
+
+    // Mean quality should only have 2 cycles populated (the rest skipped
+    // for lack of quality data).
+    let mq_path =
+        std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), MEAN_QUAL_SUFFIX));
+    let mean_qual: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&mq_path).unwrap();
+    assert_eq!(mean_qual.len(), 2, "expected only 2 cycles with quality data");
 }
