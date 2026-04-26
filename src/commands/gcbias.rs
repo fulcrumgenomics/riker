@@ -138,8 +138,8 @@ impl Default for GcBiasOptions {
     long_about,
     after_long_help = "\
 Examples:
-  riker gcbias -i input.bam -o out_prefix -R ref.fa
-  riker gcbias -i input.bam -o out_prefix -R ref.fa --window-size 150"
+  riker gcbias -i input.bam -o out_prefix -r ref.fa
+  riker gcbias -i input.bam -o out_prefix -r ref.fa --window-size 150"
 )]
 pub struct GcBias {
     #[command(flatten)]

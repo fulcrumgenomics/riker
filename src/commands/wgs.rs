@@ -114,9 +114,9 @@ impl Default for WgsOptions {
     long_about,
     after_long_help = "\
 Examples:
-  riker wgs -i input.bam -o out_prefix -R ref.fa
-  riker wgs -i input.bam -o out_prefix -R ref.fa -L intervals.bed
-  riker wgs -i input.bam -o out_prefix -R ref.fa --coverage-cap 500"
+  riker wgs -i input.bam -o out_prefix -r ref.fa
+  riker wgs -i input.bam -o out_prefix -r ref.fa -L intervals.bed
+  riker wgs -i input.bam -o out_prefix -r ref.fa --coverage-cap 500"
 )]
 pub struct Wgs {
     #[command(flatten)]

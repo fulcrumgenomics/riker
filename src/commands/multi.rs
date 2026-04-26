@@ -150,9 +150,9 @@ const NUM_BATCHES_POOLED: usize = 16;
     long_about,
     after_long_help = "\
 Examples:
-  riker multi -i input.bam -o out_prefix -R ref.fa
-  riker multi -i input.bam -o out_prefix -R ref.fa --tools alignment basic isize
-  riker multi -i input.bam -o out_prefix -R ref.fa --threads 4
+  riker multi -i input.bam -o out_prefix -r ref.fa
+  riker multi -i input.bam -o out_prefix -r ref.fa --tools alignment basic isize
+  riker multi -i input.bam -o out_prefix -r ref.fa --threads 4
   riker multi -i input.bam -o out_prefix --tools hybcap --hybcap::targets t.bed --hybcap::baits b.bed"
 )]
 pub struct Multi {
