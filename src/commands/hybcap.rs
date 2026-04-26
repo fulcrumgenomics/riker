@@ -134,7 +134,7 @@ impl Default for HybCapOptions {
     after_long_help = "\
 Examples:
   riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed
-  riker hybcap -i input.bam -o out_prefix --baits baits.interval_list --targets targets.interval_list -R ref.fa
+  riker hybcap -i input.bam -o out_prefix --baits baits.interval_list --targets targets.interval_list -r ref.fa
   riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-target-coverage"
 )]
 pub struct HybCap {

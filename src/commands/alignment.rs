@@ -67,7 +67,7 @@ impl Default for AlignmentOptions {
     after_long_help = "\
 Examples:
   riker alignment -i input.bam -o out_prefix
-  riker alignment -i input.bam -o out_prefix -R ref.fa"
+  riker alignment -i input.bam -o out_prefix -r ref.fa"
 )]
 pub struct Alignment {
     #[command(flatten)]
