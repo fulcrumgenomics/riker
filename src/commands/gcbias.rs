@@ -293,13 +293,16 @@ impl GcBiasCollector {
             self.current_contig_id = Some(ref_id);
         }
 
-        // Position: forward strand → alignment_start; reverse → alignment_end - window_size
+        // Position: forward strand → alignment_start; reverse → alignment_end - window_size.
+        // The reverse branch needs alignment_end (1-based inclusive == 0-based
+        // exclusive), which is only `None` for records with no CIGAR; on those
+        // we have nothing better than the start, so fall through to the
+        // forward formula.
         let alignment_start = record.alignment_start().map_or(0, |p| usize::from(p) - 1); // 0-based
-        let pos = if flags.is_reverse_complemented() {
-            // alignment_end is 1-based inclusive; convert to 0-based exclusive
-            // by taking its value directly (since end_1based == start_0based + span).
-            let alignment_end = record.alignment_end().map_or(alignment_start, usize::from);
-            alignment_end.saturating_sub(self.window_size as usize)
+        let pos = if flags.is_reverse_complemented()
+            && let Some(end) = record.alignment_end()
+        {
+            usize::from(end).saturating_sub(self.window_size as usize)
         } else {
             alignment_start
         };
