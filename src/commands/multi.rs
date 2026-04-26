@@ -105,15 +105,26 @@ use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
-/// Number of records per batch sent through channels.
-const BATCH_SIZE: usize = 256;
+/// Number of records per batch sent through the work queue.
+///
+/// Picked at 128 from a `batch ∈ {32,48,64,128} × pool ∈ {16,32,48,64} ×
+/// threads ∈ {2,4,8}` sweep on M1 Max and Graviton 3. Smaller batches
+/// (e.g. 32) win marginally at `--threads 2` but cause heavy sys-time
+/// blowup at higher thread counts: each batch acquires/releases the
+/// per-collector mutex, so small batches make many workers fight for the
+/// lock. 128 keeps each `accept_multiple` call long enough that mutex
+/// churn stays cheap, while the working set (`128 × 16 = 2048` records,
+/// ~1.5 MB for typical 150 bp WGS reads) still fits comfortably in L2 on
+/// M1 Max and shared L3 on Graviton 3.
+const BATCH_SIZE: usize = 128;
 
-/// Number of batches buffered per collector channel.
-const CHANNEL_DEPTH: usize = 128;
-
-/// Extra pool slots beyond `CHANNEL_DEPTH` to absorb the in-flight batch and
-/// any transient ordering between dispatch and per-collector drain.
-const POOL_EXTRA: usize = 2;
+/// Number of pre-allocated batches in the recycling pool.
+///
+/// The pool is the sole backpressure between the reader and pool workers:
+/// at most this many batches can be in flight at any instant (each batch
+/// holds a real `Vec<RikerRecord>` from the pool). Picked at 16 from the
+/// same sweep — keeps the working set small enough to stay cache-resident.
+const NUM_BATCHES_POOLED: usize = 16;
 
 // ─── Multi command struct ────────────────────────────────────────────────────
 
@@ -522,10 +533,12 @@ fn run_parallel(
     // to a single collector; different collectors process in parallel.
     let slots: Vec<Mutex<Box<dyn Collector>>> = collectors.into_iter().map(Mutex::new).collect();
 
-    // Shared MPMC work queue: reader sends (collector_idx, batch) items; pool
-    // threads pull and dispatch to the matching collector.
-    let (work_tx, work_rx): (WorkTx, WorkRx) =
-        crossbeam_channel::bounded(CHANNEL_DEPTH * slots.len().max(1));
+    // Shared MPMC work queue: reader sends `(collector_idx, batch)` items; pool
+    // threads pull and dispatch to the matching collector. Unbounded — the
+    // pool below is the sole backpressure (in-flight batches ≤
+    // `NUM_BATCHES_POOLED` because each batch holds a real `Vec<RikerRecord>`
+    // from the pool, and the reader can't proceed until one is recycled).
+    let (work_tx, work_rx): (WorkTx, WorkRx) = crossbeam_channel::unbounded();
 
     // Pool of reusable record-batch allocations, used for BAM and SAM where
     // we read in place. CRAM cannot recycle slots (each record is freshly
@@ -538,8 +551,7 @@ fn run_parallel(
     // decode) and `RikerRecord::Fallback(FallbackRec::empty())` for SAM.
     let (pool_tx, pool_rx) = mpsc::channel::<Vec<RikerRecord>>();
     if reader.supports_in_place_reads() {
-        let pool_size = CHANNEL_DEPTH + POOL_EXTRA;
-        for _ in 0..pool_size {
+        for _ in 0..NUM_BATCHES_POOLED {
             let mut vec: Vec<RikerRecord> = Vec::with_capacity(BATCH_SIZE);
             vec.resize_with(BATCH_SIZE, || reader.empty_record());
             // Channel is unbounded (mpsc) and `pool_rx` is held in this
@@ -829,7 +841,7 @@ fn pool_worker_loop(
         let mut collector = slots[idx].lock().unwrap();
         if let Err(e) = collector.accept_multiple(batch.records(), header) {
             // Signal the reader and any sibling workers to stop so we don't
-            // process another ~CHANNEL_DEPTH batches before the reader's
+            // process the rest of the in-flight batches before the reader's
             // send-fails-due-to-no-receivers path triggers shutdown.
             poison.store(true, Ordering::Relaxed);
             return Err(e);
