@@ -46,12 +46,16 @@ use noodles::core::Region;
 use noodles::sam::Header;
 use noodles::sam::alignment::RecordBuf;
 use noodles::{bam, cram, fasta, sam};
-use noodles_bgzf as bgzf;
-use noodles_bgzf::io::Reader as BgzfReader;
 
 use super::riker_record::{
     AuxTagRequirements, BamRec, FallbackRec, RikerRecord, RikerRecordRequirements,
 };
+
+/// Capacity of the `BufReader` placed between the file and the BGZF decoder
+/// on the sequential BAM path. The BGZF reader issues two `read_exact` calls
+/// per block (18-byte header + payload up to ~64 KiB); a 256 KiB buffer covers
+/// several blocks per refill and keeps the per-byte syscall overhead negligible.
+const BAM_READ_BUFFER_BYTES: usize = 256 * 1024;
 
 // ─── AlignmentReader (sequential) ───────────────────────────────────────────
 
@@ -72,7 +76,7 @@ pub struct AlignmentReader {
 enum Inner {
     Sam(sam::io::Reader<BufReader<File>>),
     GzippedSam(Box<sam::io::Reader<BufReader<MultiGzDecoder<File>>>>),
-    Bam(bam::io::Reader<BgzfReader<File>>),
+    Bam(bam::io::Reader<bgzf::Reader<BufReader<File>>>),
     Cram(cram::io::Reader<File>),
 }
 
@@ -99,8 +103,15 @@ impl AlignmentReader {
                 Ok(Self { inner: Inner::GzippedSam(Box::new(reader)), header })
             }
             AlignmentFormat::Bam => {
+                // TODO: noodles PR https://github.com/zaeleus/noodles/pull/389 lands
+                // libdeflater-backed CRC32 inside noodles-bgzf. Once it ships to
+                // crates.io, re-bench `fulcrumgenomics/bgzf` against
+                // `noodles_bgzf + BufReader` and drop the extra dep if there's no
+                // remaining win.
                 let file = File::open(path).with_context(|| open_context(path))?;
-                let mut reader = bam::io::Reader::new(file);
+                let buf = BufReader::with_capacity(BAM_READ_BUFFER_BYTES, file);
+                let bgzf_reader = bgzf::Reader::new(buf);
+                let mut reader = bam::io::Reader::from(bgzf_reader);
                 let header = reader.read_header().with_context(|| header_context(path))?;
                 Ok(Self { inner: Inner::Bam(reader), header })
             }
@@ -240,7 +251,7 @@ pub struct IndexedAlignmentReader {
 
 /// Format-specific reader state for [`IndexedAlignmentReader`].
 enum IndexedInner {
-    Bam(bam::io::IndexedReader<bgzf::io::Reader<File>>),
+    Bam(bam::io::IndexedReader<noodles_bgzf::io::Reader<File>>),
     Cram { reader: cram::io::Reader<File>, index: cram::crai::Index },
 }
 
