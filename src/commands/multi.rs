@@ -17,7 +17,12 @@
 //!   because CRAM batches are one-way (see below).
 //! - `work_queue` — a bounded crossbeam MPMC queue of
 //!   `(collector_idx, Arc<RecyclableBatch>)`. The reader fans each batch
-//!   onto it once per collector; pool workers block on it.
+//!   onto it once per collector; pool workers block on it. The bound is
+//!   sized as `(NUM_BATCHES_POOLED + 1) * n_collectors`: one batch worth
+//!   above the pool's natural in-flight max, so the BAM/SAM reader never
+//!   actually blocks on send — the pool is still the practical
+//!   backpressure there. The bound's real job is to backstop the CRAM
+//!   path, which has no pool.
 //! - `return` — the mpsc `return_tx`/`return_rx` captured inside each
 //!   `RecyclableBatch`. When the last `Arc` reference drops,
 //!   [`RecyclableBatch::drop`] sends the inner `Vec` back to the pool
@@ -26,9 +31,10 @@
 //! For BAM and SAM the reader reads records in place into a batch
 //! (`AlignmentReader::fill_record` overwrites each slot). For CRAM it
 //! drives `AlignmentReader::riker_records` — noodles allocates each
-//! record fresh, and the bounded work queue provides backpressure
-//! instead of a pool. Either way the reader wraps the batch in an
-//! `Arc`, clones it once per collector onto the work queue, and workers
+//! record fresh, and the bounded work queue caps how far ahead the
+//! reader can run when there's no recyclable pool. Either way the
+//! reader wraps the batch in an `Arc`, clones it once per collector
+//! onto the work queue, and workers
 //! block on `work_rx.recv()` — no polling, no condvar. On receipt they
 //! lock the per-collector mutex and call `accept_multiple`, which
 //! serialises accesses to any single collector while still letting
@@ -507,8 +513,11 @@ fn combined_requirements(collectors: &[Box<dyn Collector>]) -> RikerRecordRequir
 /// [`run_single_threaded`] instead).
 ///
 /// Workers block on the MPMC work queue; the reader fans batches through
-/// the queue with backpressure provided by its bounded capacity. No
-/// busy-polling, no `Condvar`.
+/// it. Backpressure on BAM/SAM comes from the recycling pool (the reader
+/// blocks on `pool_rx.recv()` once `NUM_BATCHES_POOLED` batches are in
+/// flight). The work queue is bounded too, but at one batch worth above
+/// the pool's natural in-flight max, so its bound only kicks in on the
+/// CRAM path (which has no pool). No busy-polling, no `Condvar`.
 fn run_parallel(
     mut reader: AlignmentReader,
     mut collectors: Vec<Box<dyn Collector>>,
@@ -534,11 +543,18 @@ fn run_parallel(
     let slots: Vec<Mutex<Box<dyn Collector>>> = collectors.into_iter().map(Mutex::new).collect();
 
     // Shared MPMC work queue: reader sends `(collector_idx, batch)` items; pool
-    // threads pull and dispatch to the matching collector. Unbounded — the
-    // pool below is the sole backpressure (in-flight batches ≤
-    // `NUM_BATCHES_POOLED` because each batch holds a real `Vec<RikerRecord>`
-    // from the pool, and the reader can't proceed until one is recycled).
-    let (work_tx, work_rx): (WorkTx, WorkRx) = crossbeam_channel::unbounded();
+    // threads pull and dispatch to the matching collector.
+    //
+    // The bound is set one batch worth above the pool's natural in-flight max:
+    // BAM/SAM produce at most `NUM_BATCHES_POOLED * n_collectors` items in the
+    // queue (every in-flight batch fanned to every collector), so the +1 batch
+    // of slack means the BAM/SAM reader never blocks on send — the pool stays
+    // the practical backpressure there. The bound's real job is the CRAM path,
+    // which has no pool: without it, a slow collector would let the reader
+    // pull arbitrarily many records into memory ahead of workers. `.max(1)`
+    // keeps a 0-collector run from creating a 0-capacity channel.
+    let work_queue_bound = (NUM_BATCHES_POOLED + 1) * slots.len().max(1);
+    let (work_tx, work_rx): (WorkTx, WorkRx) = crossbeam_channel::bounded(work_queue_bound);
 
     // Pool of reusable record-batch allocations, used for BAM and SAM where
     // we read in place. CRAM cannot recycle slots (each record is freshly
