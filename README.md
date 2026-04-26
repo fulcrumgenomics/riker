@@ -119,7 +119,7 @@ riker basic -i sample.bam -o out_prefix
 Collect alignment summary metrics with a reference:
 
 ```bash
-riker alignment -i sample.bam -R ref.fa -o out_prefix
+riker alignment -i sample.bam -r ref.fa -o out_prefix
 ```
 
 Collect base-level error metrics with stratification:
@@ -138,21 +138,21 @@ riker isize -i sample.bam -o out_prefix
 Collect whole-genome coverage metrics:
 
 ```bash
-riker wgs -i sample.bam -R ref.fa -o out_prefix
-riker wgs -i sample.bam -R ref.fa -o out_prefix -L intervals.bed
+riker wgs -i sample.bam -r ref.fa -o out_prefix
+riker wgs -i sample.bam -r ref.fa -o out_prefix -L intervals.bed
 ```
 
 Collect GC bias metrics:
 
 ```bash
-riker gcbias -i sample.bam -R ref.fa -o out_prefix
+riker gcbias -i sample.bam -r ref.fa -o out_prefix
 ```
 
 Collect hybrid capture metrics:
 
 ```bash
 riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed
-riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed -R ref.fa
+riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed -r ref.fa
 ```
 
 Run multiple collectors in a single pass:
@@ -160,7 +160,7 @@ Run multiple collectors in a single pass:
 ```bash
 riker multi \
   -i sample.bam \
-  -R ref.fa \
+  -r ref.fa \
   -o out_prefix \
   --tools alignment isize basic hypcap \
   --hybcap::baits baits.bed \
