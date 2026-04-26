@@ -457,30 +457,6 @@ impl BamRec {
         Ok(n)
     }
 
-    /// Read the next record directly from a noodles BAM **indexed**
-    /// reader into `self`, reusing all of this struct's buffer
-    /// allocations. Returns the BAM block size, or `0` at EOF.
-    ///
-    /// Mirrors [`Self::read_from`] but takes the indexed flavour, which
-    /// is a different concrete type in noodles. We can't generalize the
-    /// two via a trait without leaking lifetime parameters into every
-    /// signature.
-    ///
-    /// # Errors
-    /// Returns an error if the underlying read fails or the record's
-    /// scalars can't be validated.
-    pub(crate) fn read_from_indexed<R: std::io::Read>(
-        &mut self,
-        reader: &mut bam::io::IndexedReader<R>,
-    ) -> Result<usize> {
-        let n = reader.read_record(&mut self.inner).context("Failed to read BAM record")?;
-        if n == 0 {
-            return Ok(0);
-        }
-        self.refresh_cache()?;
-        Ok(n)
-    }
-
     /// Replace the inner `bam::Record` with the supplied one and refresh
     /// the cached scalars. Useful when the record is produced by a higher-
     /// level iterator (e.g. `bam::io::indexed_reader::Reader::query`) that

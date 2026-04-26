@@ -23,7 +23,7 @@ use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{FG_BLUE, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::mate_buffer::{MateBuffer, MateProbeFields, Peek};
+use crate::sam::mate_buffer::{MateBuffer, Peek};
 use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
@@ -709,39 +709,16 @@ impl Collector for WgsCollector {
             self.begin_contig(ref_id)?;
         }
 
-        // Pre-extract the fields once; the same values feed both `probe_fields`
-        // (which consumes the struct) and the WouldBuffer follow-up `insert_fields`,
-        // so we don't have to re-read them from `record` after the probe.
-        // `name()` returns `&BStr`; deref to raw bytes — the mate buffer hashes on
-        // bytes, not on string semantics.
-        let ref_id = record.reference_sequence_id();
-        let name: Option<&[u8]> = record.name().map(|n| &**n);
-        let mate_alignment_start = record.mate_alignment_start();
-        let probe_fields = MateProbeFields {
-            flags,
-            ref_id,
-            mate_ref_id: record.mate_reference_sequence_id(),
-            name,
-            alignment_start: record.alignment_start(),
-            alignment_end: record.alignment_end(),
-            mate_alignment_start,
-        };
-        match self.mate_buffer.probe_fields(probe_fields) {
+        // Probe-then-insert lets us build the overlap bitmap inline with
+        // the depth walk (one CIGAR pass instead of two): probe decides
+        // routing, the WouldBuffer arm walks once with the bitmap as a
+        // side-effect, and insert deposits the cached state.
+        match self.mate_buffer.probe(record) {
             Peek::Alone => self.walk_depth(record, AloneAction),
             Peek::WouldBuffer { overlap_start, overlap_len } => {
                 let mut bitmap = bitvec![u64, Lsb0; 0; overlap_len as usize];
                 self.walk_depth(record, BufferAction { overlap_start, bitmap: &mut bitmap });
-                // Contract of `probe_fields` mirrors `probe`: on WouldBuffer
-                // the ref_id, name, and mate_alignment_start are all present.
-                let ref_id = ref_id.expect("probe_fields WouldBuffer guarantees ref_id is Some");
-                let name = name.expect("probe_fields WouldBuffer guarantees name is Some");
-                let mate_pos = mate_alignment_start.map_or(0, |p| p.get());
-                self.mate_buffer.insert_fields(
-                    ref_id,
-                    name,
-                    mate_pos,
-                    CachedMate { overlap_start, bitmap },
-                );
+                self.mate_buffer.insert(record, CachedMate { overlap_start, bitmap });
             }
             Peek::PairWith(cached) => {
                 self.walk_depth(record, PairAction { cached: &cached });

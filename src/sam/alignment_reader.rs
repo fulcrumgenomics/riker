@@ -1,8 +1,6 @@
 //! SAM/BAM/CRAM readers — sequential and indexed flavors. Both live in
-//! one module because they share the same record-shaping API
-//! ([`fill_record`](AlignmentReader::fill_record),
-//! [`riker_records`](AlignmentReader::riker_records)) and the same
-//! `RikerRecordRequirements`-driven decode logic.
+//! one module because they share the same `RikerRecordRequirements`-
+//! driven decode logic.
 //!
 //! ## Two types, not one
 //!
@@ -18,18 +16,20 @@
 //!
 //! ## Reading paths
 //!
-//! Both types expose:
+//! [`AlignmentReader`] (sequential, front-to-back) exposes both:
 //!
 //! - [`fill_record`](AlignmentReader::fill_record) — read in place into a
-//!   pre-allocated [`RikerRecord`] slot. Works for BAM and SAM (any of
-//!   their indexed/streaming variants); errors on CRAM, which noodles
-//!   does not let us read in place.
+//!   pre-allocated [`RikerRecord`] slot. Works for BAM and SAM; errors on
+//!   CRAM, which noodles does not let us read in place.
 //! - [`riker_records`](AlignmentReader::riker_records) — owned-record
 //!   iterator. Works for every format. Use for CRAM or low-volume
 //!   callers.
 //!
-//! [`IndexedAlignmentReader`] additionally has [`query`](IndexedAlignmentReader::query)
-//! for region lookups.
+//! [`IndexedAlignmentReader`] is region-query-only:
+//!
+//! - [`query_for_each`](IndexedAlignmentReader::query_for_each) — stream
+//!   records overlapping a region to a callback, reusing one scratch
+//!   slot for the whole region on the BAM fast path.
 //!
 //! Both consult a [`RikerRecordRequirements`] passed by the caller. On
 //! BAM (where aux decode is lazy) the requirements gate which decoders
@@ -296,70 +296,6 @@ impl IndexedAlignmentReader {
         &self.header
     }
 
-    /// True iff [`fill_record`](Self::fill_record) can populate a slot
-    /// without allocating. False for CRAM.
-    #[must_use]
-    pub fn supports_in_place_reads(&self) -> bool {
-        !matches!(self.inner, IndexedInner::Cram { .. })
-    }
-
-    /// See [`AlignmentReader::empty_record`].
-    #[must_use]
-    pub fn empty_record(&self) -> RikerRecord {
-        match self.inner {
-            IndexedInner::Bam(_) => RikerRecord::Bam(BamRec::new()),
-            IndexedInner::Cram { .. } => RikerRecord::Fallback(FallbackRec::empty()),
-        }
-    }
-
-    /// See [`AlignmentReader::fill_record`].
-    ///
-    /// # Errors
-    /// Returns an error if the underlying read fails, if the slot's
-    /// variant doesn't match the reader's format, or if the reader is
-    /// CRAM.
-    pub fn fill_record(
-        &mut self,
-        requirements: &RikerRecordRequirements,
-        slot: &mut RikerRecord,
-    ) -> Result<bool> {
-        match (&mut self.inner, slot) {
-            (IndexedInner::Bam(reader), RikerRecord::Bam(bam_rec)) => {
-                let n = bam_rec.read_from_indexed(reader)?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                apply_requirements(bam_rec, requirements)?;
-                Ok(true)
-            }
-            (IndexedInner::Cram { .. }, _) => {
-                bail!("fill_record does not support CRAM; iterate riker_records() instead")
-            }
-            (IndexedInner::Bam(_), _) => bail!("BAM reader requires a RikerRecord::Bam slot"),
-        }
-    }
-
-    /// See [`AlignmentReader::riker_records`].
-    pub fn riker_records<'a>(
-        &'a mut self,
-        requirements: &'a RikerRecordRequirements,
-    ) -> Box<dyn Iterator<Item = Result<RikerRecord>> + 'a> {
-        let header = &self.header;
-        match &mut self.inner {
-            IndexedInner::Bam(reader) => {
-                Box::new(IndexedBamRikerRecordIter { reader, requirements })
-            }
-            IndexedInner::Cram { reader, .. } => {
-                Box::new(reader.records(header).map(move |result| {
-                    let cram_rec = result.context("Failed to read CRAM record")?;
-                    let buf = RecordBuf::try_from_alignment_record(header, &cram_rec)
-                        .context("Failed to convert CRAM record to RecordBuf")?;
-                    Ok(RikerRecord::Fallback(FallbackRec::from_record_buf(buf)))
-                }))
-            }
-        }
-    }
-
     /// Stream records overlapping `region` to the callback `f`,
     /// applying `requirements` per record on the BAM fast path. CRAM
     /// records arrive as [`RikerRecord::Fallback`] with everything
@@ -440,31 +376,6 @@ impl<R: Read> Iterator for BamRikerRecordIter<'_, R> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut bam_rec = BamRec::new();
         match bam_rec.read_from(self.reader) {
-            Ok(0) => None,
-            Ok(_) => match apply_requirements(&mut bam_rec, self.requirements) {
-                Ok(()) => Some(Ok(RikerRecord::Bam(bam_rec))),
-                Err(e) => Some(Err(e)),
-            },
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
-
-/// BAM-side iterator yielding [`RikerRecord::Bam`] entries from an
-/// indexed reader. Same shape as [`BamRikerRecordIter`] but driven by
-/// `IndexedReader::read_record` (which yields a raw `bam::Record` we
-/// install into a fresh [`BamRec`]).
-struct IndexedBamRikerRecordIter<'a, R: Read> {
-    reader: &'a mut bam::io::IndexedReader<R>,
-    requirements: &'a RikerRecordRequirements,
-}
-
-impl<R: Read> Iterator for IndexedBamRikerRecordIter<'_, R> {
-    type Item = Result<RikerRecord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut bam_rec = BamRec::new();
-        match bam_rec.read_from_indexed(self.reader) {
             Ok(0) => None,
             Ok(_) => match apply_requirements(&mut bam_rec, self.requirements) {
                 Ok(()) => Some(Ok(RikerRecord::Bam(bam_rec))),

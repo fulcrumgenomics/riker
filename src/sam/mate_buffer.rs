@@ -47,26 +47,9 @@
 //! [`flush`]: MateBuffer::flush
 //! [`clear`]: MateBuffer::clear
 
-use noodles::core::Position;
-use noodles::sam::alignment::record::Flags;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::sam::riker_record::RikerRecord;
-
-/// Pre-extracted fields that [`MateBuffer::probe_fields`] needs — lets
-/// callers that don't hold a `RikerRecord` directly (e.g. the parallel
-/// fast path) drive the probe without implementing a new trait. Fields
-/// are crate-private; callers construct the struct via the literal and
-/// the buffer destructures it on entry.
-pub struct MateProbeFields<'a> {
-    pub(crate) flags: Flags,
-    pub(crate) ref_id: Option<usize>,
-    pub(crate) mate_ref_id: Option<usize>,
-    pub(crate) name: Option<&'a [u8]>,
-    pub(crate) alignment_start: Option<Position>,
-    pub(crate) alignment_end: Option<Position>,
-    pub(crate) mate_alignment_start: Option<Position>,
-}
 
 /// Tool-specific projection of a [`RikerRecord`] stored in the buffer until the
 /// mate arrives. Implementations should extract only the state needed for the
@@ -175,48 +158,18 @@ impl<T> MateBuffer<T> {
     /// [`insert`]: MateBuffer::insert
     #[allow(clippy::cast_possible_truncation, reason = "1-based genomic positions fit in u32")]
     pub fn probe(&mut self, record: &RikerRecord) -> Peek<T> {
-        self.probe_fields(MateProbeFields {
-            flags: record.flags(),
-            ref_id: record.reference_sequence_id(),
-            mate_ref_id: record.mate_reference_sequence_id(),
-            name: record.name().map(|n| &**n),
-            alignment_start: record.alignment_start(),
-            alignment_end: record.alignment_end(),
-            mate_alignment_start: record.mate_alignment_start(),
-        })
-    }
-
-    /// Lower-level variant of [`probe`] that works on pre-extracted fields.
-    /// Used by callers that want to avoid recomputing cached fields or that
-    /// need to pass non-record-shaped inputs. Same semantics, same return shape.
-    #[allow(clippy::cast_possible_truncation, reason = "1-based genomic positions fit in u32")]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "fields is a small POD struct; passing by reference would force \
-                  the caller to bind a local just to satisfy the reference, and \
-                  we destructure immediately, so by-value is more ergonomic"
-    )]
-    pub fn probe_fields(&mut self, fields: MateProbeFields<'_>) -> Peek<T> {
-        let MateProbeFields {
-            flags,
-            ref_id,
-            mate_ref_id,
-            name,
-            alignment_start,
-            alignment_end,
-            mate_alignment_start,
-        } = fields;
-
+        let flags = record.flags();
         if !flags.is_segmented() || flags.is_unmapped() || flags.is_mate_unmapped() {
             return Peek::Alone;
         }
-        let Some(ref_id) = ref_id else { return Peek::Alone };
-        if Some(ref_id) != mate_ref_id {
+        let Some(ref_id) = record.reference_sequence_id() else { return Peek::Alone };
+        if Some(ref_id) != record.mate_reference_sequence_id() {
             return Peek::Alone;
         }
         // The buffer is keyed on read name; unnamed records can't be paired
         // because two unrelated unnamed reads would collide on the empty key.
-        let Some(name_bytes) = name else { return Peek::Alone };
+        let Some(name) = record.name() else { return Peek::Alone };
+        let name_bytes: &[u8] = name;
 
         if let Some(entry) = self.buffer.remove(name_bytes) {
             return Peek::PairWith(entry.value);
@@ -227,7 +180,7 @@ impl<T> MateBuffer<T> {
         // common unmapped/mate-unmapped paths, so this guard mostly catches
         // malformed inputs that lie about pairing.
         let (Some(read_start_pos), Some(read_end_pos), Some(mate_start_pos)) =
-            (alignment_start, alignment_end, mate_alignment_start)
+            (record.alignment_start(), record.alignment_end(), record.mate_alignment_start())
         else {
             return Peek::Alone;
         };
@@ -258,26 +211,20 @@ impl<T> MateBuffer<T> {
     /// [`clear_behind`]: MateBuffer::clear_behind
     #[allow(clippy::cast_possible_truncation, reason = "1-based genomic positions fit in u32")]
     pub fn insert(&mut self, record: &RikerRecord, value: T) {
-        // `insert` is contracted as a follow-up to a `probe` that returned
-        // `WouldBuffer`, which guarantees both fields are present. A debug
-        // assertion catches callers that skip `probe` and insert cold.
+        // Contracted as a follow-up to a `probe` that returned `WouldBuffer`,
+        // which guarantees both fields are present. A debug assertion catches
+        // callers that skip `probe` and insert cold.
         debug_assert!(record.reference_sequence_id().is_some() && record.name().is_some());
         let Some(ref_id) = record.reference_sequence_id() else { return };
         let Some(name) = record.name() else { return };
         let mate_pos_1based = record.mate_alignment_start().map_or(0, |p| p.get());
-        self.insert_fields(ref_id, name, mate_pos_1based, value);
-    }
-
-    /// Lower-level variant of [`insert`] taking pre-extracted fields.
-    /// Mirrors [`probe_fields`](Self::probe_fields).
-    #[allow(clippy::cast_possible_truncation, reason = "1-based genomic positions fit in u32")]
-    pub fn insert_fields(&mut self, ref_id: usize, name: &[u8], mate_pos_1based: usize, value: T) {
         let entry = Entry {
             value,
             mate_ref_id: ref_id,
             mate_pos: mate_pos_1based.saturating_sub(1) as u32,
         };
-        self.buffer.insert(<[u8]>::to_vec(name), entry);
+        let name_bytes: &[u8] = name;
+        self.buffer.insert(name_bytes.to_vec(), entry);
     }
 
     /// Drain and return entries whose expected mate position is strictly before
