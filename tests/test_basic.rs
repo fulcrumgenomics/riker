@@ -405,13 +405,13 @@ fn test_plot_files_created() {
 #[test]
 fn test_truncated_quality_scores_do_not_panic() {
     // Malformed input: sequence has 4 bases but quality_scores has only 2.
-    // Without the `quals.get(i)` guard this would panic on `quals[2]` and
-    // abort the whole run. With the guard, all 4 bases contribute to the
-    // base distribution; only the 2 cycles with quality data contribute
-    // to the per-cycle quality sums.
+    // The collector hoists the seq/quals length reconciliation out of the
+    // hot loop (`n = seq.len().min(quals.len())`) and only walks the
+    // common prefix; trailing bases without quality data contribute to
+    // neither the base distribution nor the per-cycle quality sums.
     //
     // The BAM writer rejects mismatched seq/qual lengths at write time,
-    // which is what stops this from happening on well-formed files; we
+    // so this case can't be reached through a well-formed BAM; we
     // exercise the collector directly via the in-process API rather than
     // round-tripping through a temp BAM.
     use noodles::sam::Header;
@@ -429,16 +429,128 @@ fn test_truncated_quality_scores_do_not_panic() {
     collector.accept(&record, &header).unwrap();
     collector.finish().unwrap();
 
-    // Base distribution should reflect all 4 bases (4 cycles).
+    // Both base distribution and mean quality reflect only the 2 cycles
+    // covered by quality data.
     let bd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
     let base_dist: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&bd_path).unwrap();
-    assert_eq!(base_dist.len(), 4, "expected 4 cycles in base distribution");
+    assert_eq!(base_dist.len(), 2, "expected 2 cycles in base distribution");
 
-    // Mean quality should only have 2 cycles populated (the rest skipped
-    // for lack of quality data).
     let mq_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), MEAN_QUAL_SUFFIX));
     let mean_qual: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&mq_path).unwrap();
-    assert_eq!(mean_qual.len(), 2, "expected only 2 cycles with quality data");
+    assert_eq!(mean_qual.len(), 2, "expected 2 cycles with quality data");
+}
+
+#[test]
+fn test_lowercase_bases_handled_case_insensitively() {
+    // The `(base & 0x1F)` indexing folds case automatically, so 'a' and
+    // 'A' must produce identical metrics. BAM decode normally yields
+    // uppercase, but the collector contract is case-insensitive.
+    let mut upper = SamBuilder::new();
+    upper.add_record(make_record("u", Flags::empty(), b"ACGT", &[30, 30, 30, 30]));
+    let (_dir_u, prefix_u) = run_basic(&upper);
+
+    let mut lower = SamBuilder::new();
+    lower.add_record(make_record("l", Flags::empty(), b"acgt", &[30, 30, 30, 30]));
+    let (_dir_l, prefix_l) = run_basic(&lower);
+
+    let bd_u: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(
+        format!("{}{}", prefix_u.to_str().unwrap(), BASE_DIST_SUFFIX),
+    ))
+    .unwrap();
+    let bd_l: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(
+        format!("{}{}", prefix_l.to_str().unwrap(), BASE_DIST_SUFFIX),
+    ))
+    .unwrap();
+
+    assert_eq!(bd_u.len(), bd_l.len());
+    for (mu, ml) in bd_u.iter().zip(bd_l.iter()) {
+        assert_float_eq!(mu.frac_a, ml.frac_a, 1e-9);
+        assert_float_eq!(mu.frac_c, ml.frac_c, 1e-9);
+        assert_float_eq!(mu.frac_g, ml.frac_g, 1e-9);
+        assert_float_eq!(mu.frac_t, ml.frac_t, 1e-9);
+        assert_float_eq!(mu.frac_n, ml.frac_n, 1e-9);
+    }
+}
+
+#[test]
+fn test_iupac_ambiguity_codes_excluded_from_qual_dist() {
+    // BAM's 4-bit sequence encoding includes the IUPAC ambiguity codes
+    // (W, S, M, K, R, Y, B, D, H, V) alongside ACGTN. Picard's
+    // QualityScoreDistribution excludes any non-ACGT base from the
+    // quality histogram; riker matches that behaviour via the
+    // `(ACGT_BITMASK >> bi) & 1` gate. These bases still contribute to
+    // the per-cycle base distribution as `frac_n` (the residual bucket).
+    let mut builder = SamBuilder::new();
+    // Read order: A (Q10), W (Q20 — IUPAC), C (Q30)
+    builder.add_record(make_record("r1", Flags::empty(), b"AWC", &[10, 20, 30]));
+    let (_dir, prefix) = run_basic(&builder);
+
+    // Base distribution: cycle 2 (W) lands in frac_n.
+    let bd: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(
+        format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX),
+    ))
+    .unwrap();
+    assert_eq!(bd.len(), 3);
+    assert_float_eq!(bd[1].frac_n, 1.0, 1e-9);
+    assert_float_eq!(bd[1].frac_a, 0.0, 1e-9);
+
+    // Quality distribution: only A's Q10 and C's Q30 — W's Q20 excluded.
+    let qd: Vec<QualityScoreDistributionMetric> = read_metrics_tsv(&std::path::PathBuf::from(
+        format!("{}{}", prefix.to_str().unwrap(), QUAL_DIST_SUFFIX),
+    ))
+    .unwrap();
+    assert_eq!(qd.len(), 2, "expected only A's and C's qualities to appear");
+    assert!(qd.iter().any(|m| m.quality == 10 && m.count == 1));
+    assert!(qd.iter().any(|m| m.quality == 30 && m.count == 1));
+    assert!(qd.iter().all(|m| m.quality != 20), "W's Q20 should be excluded");
+}
+
+#[test]
+fn test_qual_histogram_bank_merge() {
+    // The qual_counts is a 4-way interleaved histogram keyed by `i & 3`.
+    // A single 8-base read with the same quality at every position
+    // distributes counts across all four banks (i=0..7 hits banks
+    // 0,1,2,3,0,1,2,3). The merged histogram in the output TSV must
+    // report the full count of 8 — an off-by-one in the bank-merge loop
+    // would silently drop one or more banks.
+    let mut builder = SamBuilder::new();
+    builder.add_record(make_record("r1", Flags::empty(), b"ACGTACGT", &[35; 8]));
+    let (_dir, prefix) = run_basic(&builder);
+
+    let qd: Vec<QualityScoreDistributionMetric> = read_metrics_tsv(&std::path::PathBuf::from(
+        format!("{}{}", prefix.to_str().unwrap(), QUAL_DIST_SUFFIX),
+    ))
+    .unwrap();
+    let q35 = qd.iter().find(|m| m.quality == 35).expect("expected Q35 entry");
+    assert_eq!(q35.count, 8, "all 8 bases should be counted across the 4 banks");
+}
+
+#[test]
+fn test_reverse_strand_with_heterogeneous_qualities() {
+    // Walks the `process_record::<true>` (REVERSE = true) path with
+    // distinct per-position qualities so that any miscalculation of the
+    // reverse cycle index would immediately show up as a per-cycle
+    // mean-quality mismatch. BAM stores reverse-complemented reads in
+    // the opposite orientation from sequencing, so seq[0] corresponds
+    // to the LAST cycle and seq[n-1] to the FIRST cycle.
+    let mut builder = SamBuilder::new();
+    // Stored seq: A(Q10) C(Q20) G(Q30) T(Q40)
+    // After reverse-cycle mapping the per-cycle qualities should be
+    // 40, 30, 20, 10 (cycle 1 = seq[3], cycle 2 = seq[2], ...).
+    builder.add_record(make_record("rev", Flags::REVERSE_COMPLEMENTED, b"ACGT", &[10, 20, 30, 40]));
+    let (_dir, prefix) = run_basic(&builder);
+
+    let mq: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(format!(
+        "{}{}",
+        prefix.to_str().unwrap(),
+        MEAN_QUAL_SUFFIX
+    )))
+    .unwrap();
+    assert_eq!(mq.len(), 4);
+    assert_float_eq!(mq[0].mean_quality, 40.0, 0.01);
+    assert_float_eq!(mq[1].mean_quality, 30.0, 0.01);
+    assert_float_eq!(mq[2].mean_quality, 20.0, 0.01);
+    assert_float_eq!(mq[3].mean_quality, 10.0, 0.01);
 }
