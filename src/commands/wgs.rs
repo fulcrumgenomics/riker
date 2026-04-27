@@ -349,14 +349,16 @@ impl WgsCollector {
         };
 
         // ── Exclusion fractions ───────────────────────────────────────────────
-        let total_excl = u128::from(
-            self.bases_excl_mapq
-                + self.bases_excl_dupe
-                + self.bases_excl_unpaired
-                + self.bases_excl_baseq
-                + self.bases_excl_overlap
-                + self.bases_excl_capped,
-        );
+        // Saturating chain rather than `+`: at WGS scale the sum is well
+        // under u64::MAX, but saturating keeps the metric finite under
+        // adversarial inputs without depending on overflow-checks.
+        let total_excl: u64 = self
+            .bases_excl_mapq
+            .saturating_add(self.bases_excl_dupe)
+            .saturating_add(self.bases_excl_unpaired)
+            .saturating_add(self.bases_excl_baseq)
+            .saturating_add(self.bases_excl_overlap)
+            .saturating_add(self.bases_excl_capped);
 
         let total_raw = total_excl as f64 + sum_depth;
 
