@@ -460,22 +460,8 @@ impl BasicCollector {
             return Ok(());
         }
 
-        // Determine the upper bound: max(45, max_quality).
-        let max_quality = metrics.iter().map(|m| usize::from(m.quality)).max().unwrap_or(45);
-        let upper = max_quality.max(45);
-
-        // Build a dense lookup from quality score to frac_bases.
-        let mut frac_by_q = vec![0.0_f64; upper + 1];
-        for m in metrics {
-            let q = usize::from(m.quality);
-            if q < frac_by_q.len() {
-                frac_by_q[q] = m.frac_bases;
-            }
-        }
-
-        // Build bin edges [0, 1, 2, ..., upper] and corresponding counts.
-        let edges: Vec<f64> = (0..=upper).map(|q| q as f64).collect();
-        let counts: Vec<f64> = frac_by_q[..upper].to_vec();
+        let (edges, counts) = Self::qual_dist_histogram_bins(metrics);
+        let x_axis_max = *edges.last().expect("histogram bins always produces non-empty edges");
 
         let plots = vec![Plot::Histogram(Histogram::from_bins(edges, counts).with_color(FG_BLUE))];
 
@@ -486,9 +472,40 @@ impl BasicCollector {
             .with_x_label("Quality Score")
             .with_y_label("Fraction of Bases")
             .with_x_axis_min(0.0)
-            .with_x_axis_max(upper as f64);
+            .with_x_axis_max(x_axis_max);
 
         write_plot_pdf(plots, layout, &self.qual_dist_plot_path)
+    }
+
+    /// Build the `(edges, counts)` inputs for the quality-distribution
+    /// histogram. Returns `counts.len()` adjacent bins where `counts[i]`
+    /// is the fraction of bases with quality score `i`, and `edges` has
+    /// length `counts.len() + 1` defining the bin boundaries
+    /// `[0, 1, 2, ..., upper + 1]`. `upper = max(45, max_observed_quality)`
+    /// so the X axis always extends to at least Q45 even on inputs with
+    /// only low-quality bases.
+    ///
+    /// The trailing `upper + 1` edge is load-bearing: without it, the bar
+    /// at the highest observed quality has no right boundary and is
+    /// silently dropped by `Histogram::from_bins`. This matters whenever
+    /// any base has quality ≥ 45 (PacBio HiFi, ONT, or even an exact-Q45
+    /// Illumina base).
+    fn qual_dist_histogram_bins(
+        metrics: &[QualityScoreDistributionMetric],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let max_quality = metrics.iter().map(|m| usize::from(m.quality)).max().unwrap_or(45);
+        let upper = max_quality.max(45);
+
+        let mut frac_by_q = vec![0.0_f64; upper + 1];
+        for m in metrics {
+            let q = usize::from(m.quality);
+            if q < frac_by_q.len() {
+                frac_by_q[q] = m.frac_bases;
+            }
+        }
+
+        let edges: Vec<f64> = (0..=upper + 1).map(|q| q as f64).collect();
+        (edges, frac_by_q)
     }
 }
 
@@ -660,6 +677,45 @@ mod tests {
         }
         // Lowercase n must fold to the same slot as uppercase N (case bit).
         assert_eq!(b'N' & BASE_BITS, b'n' & BASE_BITS);
+    }
+
+    /// `qual_dist_histogram_bins` previously sliced off the bar at the
+    /// highest observed quality (`frac_by_q[..upper]` excluded
+    /// `frac_by_q[upper]`). Lock in the corrected layout: the top quality
+    /// bin must be present and the trailing edge at `upper + 1` must
+    /// exist so `Histogram::from_bins` keeps the bar.
+    #[test]
+    fn test_qual_dist_histogram_bins_includes_top_quality_bin() {
+        let metrics = vec![
+            QualityScoreDistributionMetric { quality: 30, count: 100, frac_bases: 0.4 },
+            QualityScoreDistributionMetric { quality: 60, count: 150, frac_bases: 0.6 },
+        ];
+        let (edges, counts) = BasicCollector::qual_dist_histogram_bins(&metrics);
+
+        // Histogram convention: edges define `counts.len()` adjacent bins.
+        assert_eq!(edges.len(), counts.len() + 1);
+        // Q60 is the max → upper = 60 → counts spans 0..=60 (length 61).
+        assert_eq!(counts.len(), 61);
+        // The top bin holds Q60's fraction; nothing was dropped.
+        assert!((counts[60] - 0.6).abs() < 1e-9);
+        assert!((counts[30] - 0.4).abs() < 1e-9);
+        // Edges run 0.0 .. 61.0 inclusive.
+        assert!((edges[0] - 0.0).abs() < 1e-9);
+        assert!((edges[edges.len() - 1] - 61.0).abs() < 1e-9);
+    }
+
+    /// Even when no observed quality reaches 45, the X axis must still
+    /// extend through Q45 so the rendered chart has a consistent visual
+    /// scale across runs.
+    #[test]
+    fn test_qual_dist_histogram_bins_extends_to_q45_floor() {
+        let metrics =
+            vec![QualityScoreDistributionMetric { quality: 10, count: 100, frac_bases: 1.0 }];
+        let (edges, counts) = BasicCollector::qual_dist_histogram_bins(&metrics);
+        // upper = max(45, 10) = 45 → counts spans 0..=45 (length 46).
+        assert_eq!(counts.len(), 46);
+        assert_eq!(edges.len(), 47);
+        assert!((edges[edges.len() - 1] - 46.0).abs() < 1e-9);
     }
 
     /// `ACGT_BITMASK` is the bitset over `(base & 0x1F)` slots that
