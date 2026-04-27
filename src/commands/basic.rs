@@ -52,6 +52,11 @@ pub const QUAL_DIST_PLOT_SUFFIX: &str = ".quality-score-distribution.pdf";
 /// <prefix>.mean-quality-by-cycle.pdf,
 /// <prefix>.quality-score-distribution.txt, and
 /// <prefix>.quality-score-distribution.pdf.
+///
+/// Only bases with a corresponding quality score are counted. Well-formed
+/// BAMs always have `len(SEQ) == len(QUAL)` (the BAM writer enforces this
+/// at serialization time); on malformed records where the quality string
+/// is shorter than the sequence, the trailing bases are skipped.
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -84,6 +89,57 @@ impl Command for Basic {
 
 // ─── Collector ───────────────────────────────────────────────────────────────
 
+/// Mask used to index into `CycleStats::base_counts`. Taking the low 5 bits
+/// of an ASCII letter is case-insensitive (bit 5 is the case bit) and maps
+/// each of A/C/G/T/N to a distinct slot, with no collisions among the IUPAC
+/// ambiguity codes (W/S/M/K/R/Y/B/D/H/V) either.
+const BASE_BITS: u8 = 0x1F;
+/// Number of slots in `CycleStats::base_counts`; covers all values in `0..32`.
+const N_BASE_SLOTS: usize = 32;
+
+const IDX_A: usize = (b'A' & BASE_BITS) as usize;
+const IDX_C: usize = (b'C' & BASE_BITS) as usize;
+const IDX_G: usize = (b'G' & BASE_BITS) as usize;
+const IDX_T: usize = (b'T' & BASE_BITS) as usize;
+
+/// Bitmask of `(base & 0x1F)` slots that correspond to canonical A/C/G/T
+/// (case-insensitive). Used to gate the global quality-distribution
+/// histogram so that only ACGT bases — *not* N, lowercase n, or any of the
+/// IUPAC ambiguity codes (W/S/M/K/R/Y/B/D/H/V) — contribute to it. Picard
+/// excludes these too; the `(ACGT_BITMASK >> bi) & 1` check restores the
+/// case-insensitive symmetry between `base_counts` (which folds case via
+/// `& 0x1F`) and `qual_counts` (which previously checked literal `b'N'`).
+const ACGT_BITMASK: u32 = (1 << IDX_A) | (1 << IDX_C) | (1 << IDX_G) | (1 << IDX_T);
+
+/// Per-cycle accumulators. The hot loop touches exactly one `CycleStats`
+/// per base: one increment of `qual_sum` plus one increment of the slot in
+/// `base_counts` selected by `(base & 0x1F)`. Both the per-cycle total and
+/// the per-cycle quality count (which are equal — every counted base has
+/// an associated quality observation, since `accept` only walks the
+/// `min(len(SEQ), len(QUAL))` prefix) are recovered at finalize time as
+/// `base_counts.iter().sum()` — cheap (32 adds per cycle, paid once).
+#[derive(Clone, Default, Debug)]
+struct CycleStats {
+    /// Sum of quality scores observed at this cycle (for mean-quality calc).
+    /// Stored as `u64` so the inner loop avoids an int→float convert and a
+    /// floating-point add per base. Headroom is ample: at the worst-case
+    /// `q = 255` it would take ~7.2×10^16 reads at one cycle to overflow.
+    qual_sum: u64,
+    /// Per-base counts indexed by `(base & 0x1F) as usize`. Use
+    /// `IDX_A/C/G/T` to look up; everything else is folded into the
+    /// "other / N" bucket via `total - (a + c + g + t)` at finalize time.
+    base_counts: [u64; N_BASE_SLOTS],
+}
+
+impl CycleStats {
+    /// Total number of bases observed at this cycle. Equivalent to
+    /// `base_counts.iter().sum::<u64>()` — recomputed on demand so the hot
+    /// loop doesn't pay a per-base store to maintain it.
+    fn total(&self) -> u64 {
+        self.base_counts.iter().sum()
+    }
+}
+
 /// Collects base distribution, mean quality, and quality score distribution
 /// from a BAM file in a single pass.
 pub struct BasicCollector {
@@ -96,20 +152,19 @@ pub struct BasicCollector {
     qual_dist_plot_path: PathBuf,
     plot_title_prefix: String,
 
-    // Per read-end, per base (A=0,C=1,G=2,T=3,N=4), per cycle (0-indexed)
-    r1_base_counts: [Vec<u64>; 5],
-    r1_cycle_totals: Vec<u64>,
-    r2_base_counts: [Vec<u64>; 5],
-    r2_cycle_totals: Vec<u64>,
+    // Per read-end, per cycle.
+    r1_cycles: Vec<CycleStats>,
+    r2_cycles: Vec<CycleStats>,
 
-    // Per read-end, per cycle — quality sums and counts
-    r1_qual_sums: Vec<f64>,
-    r1_qual_counts: Vec<u64>,
-    r2_qual_sums: Vec<f64>,
-    r2_qual_counts: Vec<u64>,
-
-    // Quality score distribution (index = quality score)
-    qual_counts: [u64; 128],
+    /// Quality score distribution. Four interleaved sub-histograms
+    /// (indexed by `i & 3` where `i` is the base index within a read) so
+    /// that consecutive iterations of `accept`'s hot loop write to
+    /// different banks. This breaks the read-after-write dependency on
+    /// `qual_counts[qi]` that otherwise serializes at load-store latency
+    /// when consecutive bases share the same quality score (very common
+    /// in Illumina data). Summed across banks once in
+    /// `build_qual_dist_metrics`.
+    qual_counts: [[u64; 128]; 4],
 }
 
 impl BasicCollector {
@@ -125,74 +180,101 @@ impl BasicCollector {
             mean_qual_plot_path: super::command::output_path(prefix, MEAN_QUAL_PLOT_SUFFIX),
             qual_dist_plot_path: super::command::output_path(prefix, QUAL_DIST_PLOT_SUFFIX),
             plot_title_prefix: String::new(),
-            r1_base_counts: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            r1_cycle_totals: Vec::new(),
-            r2_base_counts: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            r2_cycle_totals: Vec::new(),
-            r1_qual_sums: Vec::new(),
-            r1_qual_counts: Vec::new(),
-            r2_qual_sums: Vec::new(),
-            r2_qual_counts: Vec::new(),
-            qual_counts: [0u64; 128],
+            r1_cycles: Vec::new(),
+            r2_cycles: Vec::new(),
+            qual_counts: [[0u64; 128]; 4],
         }
     }
 
-    /// Ensure all per-cycle vectors are long enough for `len` cycles.
-    fn ensure_capacity(
-        base_counts: &mut [Vec<u64>; 5],
-        cycle_totals: &mut Vec<u64>,
-        qual_sums: &mut Vec<f64>,
-        qual_counts: &mut Vec<u64>,
-        len: usize,
+    /// Ensure the per-cycle vector is long enough for `len` cycles.
+    fn ensure_capacity(cycles: &mut Vec<CycleStats>, len: usize) {
+        if len > cycles.len() {
+            cycles.resize(len, CycleStats::default());
+        }
+    }
+
+    /// Per-record inner loop, monomorphized on traversal direction so the
+    /// `is_reverse` choice happens once at dispatch time rather than once per
+    /// base. With `REVERSE = false` the cycle index is `i` (forward); with
+    /// `REVERSE = true` it is `n - 1 - i` (reverse-complemented reads in the
+    /// BAM are stored in the opposite orientation from sequencing).
+    ///
+    /// The caller guarantees `seq.len() == quals.len()` (call site
+    /// pre-slices both to `n = min(seq.len(), quals.len())`) and that
+    /// `cycles` covers at least `seq.len()` entries; the function reslices
+    /// `cycles[..n]` internally so the compiler has a clean bound for
+    /// `cycles[cycle_idx]`.
+    #[inline]
+    fn process_record<const REVERSE: bool>(
+        seq: &[u8],
+        quals: &[u8],
+        cycles: &mut [CycleStats],
+        qual_counts: &mut [[u64; 128]; 4],
     ) {
-        if len > cycle_totals.len() {
-            for bc in base_counts.iter_mut() {
-                bc.resize(len, 0);
+        let n = seq.len();
+        let cycles = &mut cycles[..n];
+        for i in 0..n {
+            let base = seq[i];
+            let q = quals[i];
+            let cycle_idx = if REVERSE { n - 1 - i } else { i };
+            // The mask proves `bi < 32`, so the indexed store skips bounds
+            // checks entirely.
+            let bi = (base & BASE_BITS) as usize;
+
+            let stats = &mut cycles[cycle_idx];
+            stats.base_counts[bi] += 1;
+            stats.qual_sum += u64::from(q);
+
+            // Quality distribution: only ACGT (case-insensitive) bases
+            // contribute. Excludes N/n and all IUPAC ambiguity codes —
+            // matching Picard's QualityScoreDistribution semantics. The
+            // bitmask test `(ACGT_BITMASK >> bi) & 1` is two ops vs the
+            // four compares a full `bi == IDX_A || ...` check would emit.
+            // Round-robin across 4 banks via `i & 3` to break the RAW
+            // dependency on `qual_counts[qi]` between consecutive
+            // iterations. The `q & 0x7F` mask folds the (impossible-in-
+            // valid-BAM) values q ≥ 128 into bins 0..=127; a missing-
+            // quality record encoded as 0xFF would land entirely in bin 127.
+            if (ACGT_BITMASK >> bi) & 1 != 0 {
+                let qi = (q & 0x7F) as usize;
+                qual_counts[i & 3][qi] += 1;
             }
-            cycle_totals.resize(len, 0);
-            qual_sums.resize(len, 0.0);
-            qual_counts.resize(len, 0);
         }
     }
 
-    /// Build base distribution metrics from the accumulated counts.
+    /// Build base distribution metrics from the accumulated counts. Counts
+    /// for A/C/G/T are read by their `(base & 0x1F)` slot; everything else
+    /// (N and any non-ACGT byte) is folded into `frac_n` as a residual.
     fn build_base_dist_metrics(&self) -> Vec<BaseDistributionByCycleMetric> {
         let mut metrics = Vec::new();
 
-        // R1 cycles
-        for i in 0..self.r1_cycle_totals.len() {
-            let total = self.r1_cycle_totals[i];
-            if total == 0 {
-                continue;
+        for (read_end, cycles) in [(1u8, &self.r1_cycles), (2u8, &self.r2_cycles)] {
+            for (i, c) in cycles.iter().enumerate() {
+                let total = c.total();
+                if total == 0 {
+                    continue;
+                }
+                let t = total as f64;
+                let a = c.base_counts[IDX_A];
+                let cnt_c = c.base_counts[IDX_C];
+                let g = c.base_counts[IDX_G];
+                let cnt_t = c.base_counts[IDX_T];
+                // `total = base_counts.iter().sum()` is the sum of all 32
+                // slots; the four named indices are pairwise disjoint, so
+                // `a + cnt_c + g + cnt_t` is at most `total`. The
+                // debug-only assertion documents this invariant.
+                debug_assert!(a + cnt_c + g + cnt_t <= total);
+                let n = total - (a + cnt_c + g + cnt_t);
+                metrics.push(BaseDistributionByCycleMetric {
+                    read_end,
+                    cycle: i + 1,
+                    frac_a: a as f64 / t,
+                    frac_c: cnt_c as f64 / t,
+                    frac_g: g as f64 / t,
+                    frac_t: cnt_t as f64 / t,
+                    frac_n: n as f64 / t,
+                });
             }
-            let t = total as f64;
-            metrics.push(BaseDistributionByCycleMetric {
-                read_end: 1,
-                cycle: i + 1,
-                frac_a: self.r1_base_counts[0][i] as f64 / t,
-                frac_c: self.r1_base_counts[1][i] as f64 / t,
-                frac_g: self.r1_base_counts[2][i] as f64 / t,
-                frac_t: self.r1_base_counts[3][i] as f64 / t,
-                frac_n: self.r1_base_counts[4][i] as f64 / t,
-            });
-        }
-
-        // R2 cycles
-        for i in 0..self.r2_cycle_totals.len() {
-            let total = self.r2_cycle_totals[i];
-            if total == 0 {
-                continue;
-            }
-            let t = total as f64;
-            metrics.push(BaseDistributionByCycleMetric {
-                read_end: 2,
-                cycle: i + 1,
-                frac_a: self.r2_base_counts[0][i] as f64 / t,
-                frac_c: self.r2_base_counts[1][i] as f64 / t,
-                frac_g: self.r2_base_counts[2][i] as f64 / t,
-                frac_t: self.r2_base_counts[3][i] as f64 / t,
-                frac_n: self.r2_base_counts[4][i] as f64 / t,
-            });
         }
 
         metrics
@@ -201,25 +283,27 @@ impl BasicCollector {
     /// Build mean quality by cycle metrics. R2 cycles are offset by max R1 cycle count.
     fn build_mean_qual_metrics(&self) -> Vec<MeanQualityByCycleMetric> {
         let mut metrics = Vec::new();
-        let r1_max = self.r1_qual_counts.len();
+        let r1_max = self.r1_cycles.len();
 
-        for i in 0..r1_max {
-            if self.r1_qual_counts[i] == 0 {
+        for (i, c) in self.r1_cycles.iter().enumerate() {
+            let total = c.total();
+            if total == 0 {
                 continue;
             }
             metrics.push(MeanQualityByCycleMetric {
                 cycle: i + 1,
-                mean_quality: self.r1_qual_sums[i] / self.r1_qual_counts[i] as f64,
+                mean_quality: c.qual_sum as f64 / total as f64,
             });
         }
 
-        for i in 0..self.r2_qual_counts.len() {
-            if self.r2_qual_counts[i] == 0 {
+        for (i, c) in self.r2_cycles.iter().enumerate() {
+            let total = c.total();
+            if total == 0 {
                 continue;
             }
             metrics.push(MeanQualityByCycleMetric {
                 cycle: r1_max + i + 1,
-                mean_quality: self.r2_qual_sums[i] / self.r2_qual_counts[i] as f64,
+                mean_quality: c.qual_sum as f64 / total as f64,
             });
         }
 
@@ -227,11 +311,19 @@ impl BasicCollector {
     }
 
     /// Build quality score distribution metrics (only non-zero counts).
+    /// Collapses the four interleaved sub-histograms maintained by `accept`
+    /// into a single 128-bin distribution before emitting metrics.
     #[allow(clippy::cast_possible_truncation)] // quality scores are always 0..127
     fn build_qual_dist_metrics(&self) -> Vec<QualityScoreDistributionMetric> {
-        let total: u64 = self.qual_counts.iter().sum();
+        let mut combined = [0u64; 128];
+        for bank in &self.qual_counts {
+            for (slot, &c) in bank.iter().enumerate() {
+                combined[slot] += c;
+            }
+        }
+        let total: u64 = combined.iter().sum();
         let total_f = total as f64;
-        self.qual_counts
+        combined
             .iter()
             .enumerate()
             .filter(|&(_, count)| *count > 0)
@@ -249,8 +341,8 @@ impl BasicCollector {
             return Ok(());
         }
 
-        let r1_max = self.r1_cycle_totals.len();
-        let max_cycle = (r1_max + self.r2_cycle_totals.len()) as f64;
+        let r1_max = self.r1_cycles.len();
+        let max_cycle = (r1_max + self.r2_cycles.len()) as f64;
         let base_names = ["A", "C", "G", "T", "N"];
         let base_colors = [FG_BLUE, FG_GREEN, FG_TEAL, FG_PACIFIC, FG_RED];
 
@@ -293,7 +385,7 @@ impl BasicCollector {
             .with_x_axis_max(max_cycle + 1.0)
             .with_legend_position(LegendPosition::OutsideRightMiddle);
 
-        if !self.r2_cycle_totals.is_empty() {
+        if !self.r2_cycles.is_empty() {
             layout.shaded_regions.push(ShadedRegion {
                 orientation: Orientation::Vertical,
                 min_val: 1.0,
@@ -319,8 +411,8 @@ impl BasicCollector {
             return Ok(());
         }
 
-        let r1_max = self.r1_qual_counts.len();
-        let has_r2 = !self.r2_qual_counts.is_empty();
+        let r1_max = self.r1_cycles.len();
+        let has_r2 = !self.r2_cycles.is_empty();
 
         let r1_xy: Vec<(f64, f64)> = metrics
             .iter()
@@ -347,7 +439,7 @@ impl BasicCollector {
             ));
         }
 
-        let max_cycle = (r1_max + self.r2_qual_counts.len()) as f64;
+        let max_cycle = (r1_max + self.r2_cycles.len()) as f64;
         let layout = Layout::auto_from_plots(&plots)
             .with_width(PLOT_WIDTH)
             .with_height(PLOT_HEIGHT)
@@ -398,17 +490,6 @@ impl BasicCollector {
 
         write_plot_pdf(plots, layout, &self.qual_dist_plot_path)
     }
-
-    /// Map a base byte to an index: A=0, C=1, G=2, T=3, N/other=4.
-    fn base_index(base: u8) -> usize {
-        match base {
-            b'A' | b'a' => 0,
-            b'C' | b'c' => 1,
-            b'G' | b'g' => 2,
-            b'T' | b't' => 3,
-            _ => 4, // N and anything else
-        }
-    }
 }
 
 impl Collector for BasicCollector {
@@ -427,56 +508,32 @@ impl Collector for BasicCollector {
         }
 
         let seq: &[u8] = record.sequence();
-        if seq.is_empty() {
+        let quals: &[u8] = record.quality_scores();
+        // Hoist the seq/quals length reconciliation out of the per-base
+        // loop. Well-formed BAMs always have `seq.len() == quals.len()`;
+        // the BAM writer enforces this at serialization time. Truncated /
+        // missing quality data falls out of `n` and contributes neither
+        // base counts nor quality stats.
+        let n = seq.len().min(quals.len());
+        if n == 0 {
             return Ok(());
         }
 
-        let quals: &[u8] = record.quality_scores();
-        let len = seq.len();
         let is_reverse = flags.is_reverse_complemented();
-
         // Determine R1 vs R2: paired + last_segment = R2, else R1
         let is_r2 = flags.is_segmented() && flags.is_last_segment();
 
-        let (base_counts, cycle_totals, qual_sums, qual_counts) = if is_r2 {
-            (
-                &mut self.r2_base_counts,
-                &mut self.r2_cycle_totals,
-                &mut self.r2_qual_sums,
-                &mut self.r2_qual_counts,
-            )
+        let cycles = if is_r2 { &mut self.r2_cycles } else { &mut self.r1_cycles };
+        Self::ensure_capacity(cycles, n);
+
+        // Dispatch on is_reverse once so the inner loop is a straight-line
+        // monomorphization for each direction (no per-base branch).
+        let seq = &seq[..n];
+        let quals = &quals[..n];
+        if is_reverse {
+            Self::process_record::<true>(seq, quals, cycles, &mut self.qual_counts);
         } else {
-            (
-                &mut self.r1_base_counts,
-                &mut self.r1_cycle_totals,
-                &mut self.r1_qual_sums,
-                &mut self.r1_qual_counts,
-            )
-        };
-
-        Self::ensure_capacity(base_counts, cycle_totals, qual_sums, qual_counts, len);
-
-        // Quality scores can be shorter than the sequence on malformed
-        // input — guard with `quals.get(i)` rather than indexing directly,
-        // so a single bad record doesn't abort the whole run.
-        for (i, &base) in seq.iter().enumerate() {
-            // Cycle: forward reads go 0..len, reverse reads go len-1..0
-            let cycle_idx = if is_reverse { len - 1 - i } else { i };
-            let bi = Self::base_index(base);
-
-            base_counts[bi][cycle_idx] += 1;
-            cycle_totals[cycle_idx] += 1;
-
-            if let Some(&q) = quals.get(i) {
-                qual_sums[cycle_idx] += f64::from(q);
-                qual_counts[cycle_idx] += 1;
-
-                // Quality distribution: exclude N bases
-                if bi != 4 {
-                    let qi = usize::from(q).min(127);
-                    self.qual_counts[qi] += 1;
-                }
-            }
+            Self::process_record::<false>(seq, quals, cycles, &mut self.qual_counts);
         }
 
         Ok(())
@@ -562,25 +619,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_base_index_standard_bases() {
-        assert_eq!(BasicCollector::base_index(b'A'), 0);
-        assert_eq!(BasicCollector::base_index(b'C'), 1);
-        assert_eq!(BasicCollector::base_index(b'G'), 2);
-        assert_eq!(BasicCollector::base_index(b'T'), 3);
-        assert_eq!(BasicCollector::base_index(b'N'), 4);
+    fn test_base_indices_distinct() {
+        let idxs = [IDX_A, IDX_C, IDX_G, IDX_T];
+        for (i, a) in idxs.iter().enumerate() {
+            for b in &idxs[i + 1..] {
+                assert_ne!(a, b, "base index collision: {a} == {b}");
+            }
+            assert!(*a < N_BASE_SLOTS);
+        }
     }
 
     #[test]
-    fn test_base_index_lowercase() {
-        assert_eq!(BasicCollector::base_index(b'a'), 0);
-        assert_eq!(BasicCollector::base_index(b'c'), 1);
-        assert_eq!(BasicCollector::base_index(b'g'), 2);
-        assert_eq!(BasicCollector::base_index(b't'), 3);
+    fn test_base_mask_is_case_insensitive() {
+        for (upper, lower) in [(b'A', b'a'), (b'C', b'c'), (b'G', b'g'), (b'T', b't')] {
+            assert_eq!(upper & BASE_BITS, lower & BASE_BITS);
+        }
     }
 
+    /// `(base & 0x1F)` must produce a distinct slot for every BAM-encodable
+    /// nucleotide character so that none of N, lowercase n, or any IUPAC
+    /// ambiguity code silently collides with A/C/G/T (which would corrupt
+    /// `frac_n` by inflating one of the canonical-base counts). Locks in
+    /// the load-bearing claim from `BASE_BITS`'s doc comment.
     #[test]
-    fn test_base_index_unknown() {
-        assert_eq!(BasicCollector::base_index(b'.'), 4);
-        assert_eq!(BasicCollector::base_index(b'X'), 4);
+    fn test_base_mask_no_collisions_with_iupac_or_n() {
+        let canonical = [(b'A', IDX_A), (b'C', IDX_C), (b'G', IDX_G), (b'T', IDX_T)];
+        // BAM 4-bit decode emits these characters: =ACMGRSVTWYHKDBN (no
+        // lowercase). All non-ACGT entries must map to a slot distinct
+        // from the four canonical-base slots above.
+        let non_acgt = b"=MRSVWYHKDBN";
+        for &b in non_acgt {
+            let slot = (b & BASE_BITS) as usize;
+            for &(_, canon) in &canonical {
+                assert_ne!(
+                    slot, canon,
+                    "non-ACGT byte 0x{b:02x} ({}) collides with canonical slot {canon}",
+                    b as char
+                );
+            }
+        }
+        // Lowercase n must fold to the same slot as uppercase N (case bit).
+        assert_eq!(b'N' & BASE_BITS, b'n' & BASE_BITS);
+    }
+
+    /// `ACGT_BITMASK` is the bitset over `(base & 0x1F)` slots that
+    /// represent canonical A/C/G/T. The hot loop tests it to gate
+    /// `qual_counts` updates, so collisions or omissions corrupt the
+    /// quality distribution. Lock down membership for the cases that
+    /// matter.
+    #[test]
+    fn test_acgt_bitmask_membership() {
+        for &b in b"ACGTacgt" {
+            let bi = (b & BASE_BITS) as usize;
+            assert_ne!(
+                (ACGT_BITMASK >> bi) & 1,
+                0,
+                "byte 0x{b:02x} ({}) should be in ACGT_BITMASK",
+                b as char
+            );
+        }
+        for &b in b"NnWSMKRYBDHV=" {
+            let bi = (b & BASE_BITS) as usize;
+            assert_eq!(
+                (ACGT_BITMASK >> bi) & 1,
+                0,
+                "non-ACGT byte 0x{b:02x} ({}) should not be in ACGT_BITMASK",
+                b as char
+            );
+        }
     }
 }
