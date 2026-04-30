@@ -54,3 +54,35 @@ jobs:
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Rustfmt check
         run: cargo ci-fmt
+
+  # Sanity-build the multivers launcher used for x86_64 release artifacts
+  # (bioconda, GitHub releases). Catches regressions in [profile.dist],
+  # [package.metadata.multivers.x86_64], or anything else that would break
+  # the release pipeline silently. ubuntu-latest is x86_64; aarch64 is
+  # exercised by the regular `test` job since it uses `cargo build` and the
+  # release-time multivers step is x86_64-only by design.
+  dist-build:
+    name: Multivers dist build (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Install cargo-multivers
+        run: cargo install --locked cargo-multivers
+      - name: Build multivers launcher
+        run: cargo multivers --profile dist
+      - name: Smoke-test launcher
+        run: |
+          set -euo pipefail
+          binary=$(find target -name riker -type f -executable | head -n1)
+          if [[ -z "$binary" ]]; then
+            echo "::error::could not locate built riker binary under target/"
+            exit 1
+          fi
+          echo "Found launcher: $binary"
+          file "$binary"
+          "$binary" --version
