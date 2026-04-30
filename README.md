@@ -11,11 +11,11 @@ Fast Rust CLI toolkit for sequencing QC metrics -- ports key QC metrics tools fr
 <p>
 <a href="https://fulcrumgenomics.com">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/logos/fulcrumgenomics-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset=".github/logos/fulcrumgenomics-light.svg">
-  <img alt="Fulcrum Genomics" src=".github/logos/fulcrumgenomics-light.svg" height="125">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/fulcrumgenomics/riker/main/.github/logos/fulcrumgenomics-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/fulcrumgenomics/riker/main/.github/logos/fulcrumgenomics-light.svg">
+  <img alt="Fulcrum Genomics" src="https://raw.githubusercontent.com/fulcrumgenomics/riker/main/.github/logos/fulcrumgenomics-light.svg" height="125">
 </picture>
-</a><img src=".github/logos/riker.png" height="125" style="padding-left: 30px;"/>
+</a><img src="https://raw.githubusercontent.com/fulcrumgenomics/riker/main/.github/logos/riker.png" height="125" style="padding-left: 30px;"/>
 </p>
 
 [Visit us at Fulcrum Genomics](https://www.fulcrumgenomics.com) to learn more about how we can power your Bioinformatics with riker and beyond.
