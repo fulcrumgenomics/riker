@@ -59,6 +59,45 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 
+# Release packaging profile used by `cargo multivers` (x86_64) and `cargo
+# build --profile dist` (aarch64). Identical codegen to `release` but with
+# incremental off so multivers' delta-compression across variants is
+# deterministic. Profiles can't carry rustflags on stable Rust, so the
+# per-variant `-C target-cpu=...` is provided by `cargo multivers` itself
+# via the metadata table below.
+[profile.dist]
+inherits = "release"
+incremental = false
+
+# x86_64 release binaries are packaged with `cargo multivers` into a single
+# launcher that embeds the variants below and dispatches to the highest
+# match at startup. Variants:
+#   - x86-64    : SSE2 baseline, runs on any 64-bit x86 CPU (2003+)
+#   - x86-64-v2 : SSE4.2 + POPCNT (~2008+); captures most modern codegen wins
+#   - x86-64-v4 : AVX-512 (current-gen Xeon / EPYC)
+#
+# v3 is omitted to match chelae's measurements: on similar streaming
+# bioinformatics workloads they found v3's auto-vectorization gains over
+# v2 small enough not to earn the variant slot. We have NOT independently
+# benchmarked v2/v3/v4 on riker -- our wgs measurements only compared the
+# default release build (effectively v1) against `target-cpu=native` on a
+# Granite Rapids (=v4) host (~4% gap). If a future bench shows v3 buys
+# something on riker specifically, add it here.
+#
+# Build invocation (release / bioconda recipes must branch on host arch):
+#   x86_64 : cargo multivers --profile dist
+#   aarch64: cargo build --profile dist   (single portable ARMv8-A binary)
+#
+# Do NOT run `cargo multivers` on aarch64. cargo-multivers only auto-limits
+# its CPU list to the v1-v4 microarchitecture levels on x86_64; on every
+# other arch it defaults to "all CPUs known to rustc" (76+ on aarch64),
+# which would attempt that many full release builds with negligible payoff
+# -- our wgs benchmarks on Graviton 4 showed `target-cpu=native` within
+# noise of generic ARMv8-A. The cargo-multivers project also notes that
+# only x86_64 is tested.
+[package.metadata.multivers.x86_64]
+cpus = ["x86-64", "x86-64-v2", "x86-64-v4"]
+
 # Profile that matches release perf closely but keeps symbol + line info for
 # samply/perf. Use via `cargo build --profile bench-prof`.
 #
