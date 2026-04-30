@@ -13,7 +13,18 @@ format.
 
 ```bash
 cargo build              # debug build
-cargo build --release    # optimized build
+cargo build --release    # optimized build (portable, runs anywhere)
+```
+
+`cargo build --release` deliberately does **not** set `target-cpu=native`
+so that `cargo install riker-ngs` from crates.io produces a binary that
+runs on any reasonable hardware. Distribution channels handle per-CPU
+tuning separately (`cargo multivers --profile dist` for x86_64 release
+artifacts and bioconda; `cargo build --profile dist` for aarch64). For a
+locally-tuned benchmarking build, opt in:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 ### Verification Checklist

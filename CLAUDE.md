@@ -26,6 +26,36 @@ cargo fmt --package riker              # apply formatting
 
 The `ci-*` aliases are defined in `.cargo/config.toml`. CI runs all three.
 
+## Release Packaging
+
+`cargo build --release` and `cargo install riker-ngs` produce **portable**
+binaries (no `target-cpu=native`) so users on any reasonable hardware get a
+working binary. Distribution channels do the per-platform tuning:
+
+- **x86_64 release / bioconda**: `cargo multivers --profile dist` produces
+  a single launcher embedding three CPU variants (`x86-64`, `x86-64-v2`,
+  `x86-64-v4`) and dispatches to the highest match at startup. Configured
+  via `[package.metadata.multivers.x86_64]` in `Cargo.toml`. The launcher
+  is tiny and the embedded variants are delta-compressed.
+- **aarch64 release / bioconda**: `cargo build --profile dist`. A single
+  portable ARMv8-A binary; `target-cpu=native` showed no measurable win on
+  Graviton 4 vs generic, so multivers isn't worth the variant infra.
+  Note: do not run `cargo multivers` on aarch64 -- the v1/v2/v3/v4 default
+  list is x86_64-only; on aarch64 it would attempt one build per CPU rustc
+  knows about (76+), which is slow and pointless given the ~0% gain.
+- **`[profile.dist]`** inherits `release` with `incremental = false` for
+  deterministic multivers delta-compression. Profiles can't carry
+  rustflags on stable Rust, so per-variant `-C target-cpu=...` is supplied
+  by `cargo multivers` itself.
+
+For local benchmarking on the host's full ISA (no distribution concerns):
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+This is opt-in to keep `cargo install` sensible for users on older silicon.
+
 ## Architecture
 
 ### Crate Structure
