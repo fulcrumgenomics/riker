@@ -229,6 +229,61 @@ fn test_histogram_output() {
     assert_eq!(e102.fr_count, 1);
 }
 
+/// Anomalous long-tail insert sizes (chimeras / mismapped pairs) should be
+/// dropped from the histogram TSV — only entries within the
+/// `median + deviations * MAD` window should survive.
+#[test]
+fn test_histogram_trims_long_tail() {
+    let mut builder = SamBuilder::new();
+    // 100 typical FR pairs spread over insert sizes 200..209.
+    for i in 0..100i32 {
+        let tlen = 200 + (i % 10);
+        builder.add_pair(&format!("ok{i}"), 0, 100, 300, tlen, 60, 50, false, false);
+    }
+    // 3 anomalous FR pairs with very large insert sizes that should not
+    // appear in the trimmed output.
+    for i in 0..3 {
+        builder.add_pair(&format!("anom{i}"), 0, 100, 100_000, 50_000, 60, 50, false, false);
+    }
+
+    let bam = builder.to_temp_bam().unwrap();
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+    make_cmd(bam.path(), &prefix, false, 0.0).execute().unwrap();
+
+    let metrics: Vec<InsertSizeMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
+    let fr = metrics.iter().find(|m| m.pair_orientation == "FR").expect("FR row");
+    let trim_max = fr.median_insert_size + 10.0 * fr.median_absolute_deviation;
+    // Sanity-check the test setup: tail values must actually be above the
+    // computed trim threshold; otherwise the assertions below are vacuous.
+    assert!(50_000.0 > trim_max, "tail (50000) should exceed trim_max ({trim_max})");
+
+    let hist: Vec<InsertSizeHistogramEntry> =
+        read_metrics_tsv(&dir.path().join(format!("out{HISTOGRAM_SUFFIX}"))).unwrap();
+    assert!(!hist.is_empty(), "trimmed histogram should still contain the bulk distribution");
+    // `trim_max` fits comfortably below `f64`'s 2^53 exact-integer range for
+    // realistic insert-size data; the cast back to u64 just lets us compare
+    // against the raw histogram keys.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "trim_max is non-negative and within u64 range for any plausible insert size"
+    )]
+    let trim_cutoff = trim_max as u64;
+    let beyond_trim: Vec<u64> =
+        hist.iter().map(|e| e.insert_size).filter(|&s| s > trim_cutoff).collect();
+    assert!(
+        beyond_trim.is_empty(),
+        "histogram contained entries past trim_max={trim_max}: {beyond_trim:?}"
+    );
+    // The bulk distribution must survive — guards against an over-aggressive
+    // trim that drops everything.
+    assert!(hist.iter().any(|e| e.insert_size == 200));
+    assert!(hist.iter().any(|e| e.insert_size == 209));
+    assert!(hist.iter().all(|e| e.insert_size != 50_000));
+}
+
 #[test]
 fn test_plot_output_created() {
     let mut builder = SamBuilder::new();
