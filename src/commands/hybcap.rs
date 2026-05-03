@@ -1252,12 +1252,13 @@ impl Collector for HybCapCollector {
             for (iv, cov) in &self.target_coverages {
                 let contig_name =
                     dict.get_by_index(iv.ref_id).map_or("?", |m| m.name()).to_string();
+                let target_name = iv.name().to_string();
                 for (offset, &depth) in cov.hq_depths.iter().enumerate() {
                     writer.write(&PerBaseCoverage {
                         sample: self.sample.clone(),
                         chrom: contig_name.clone(),
                         pos: u64::from(iv.start) + offset as u64 + 1, // 1-based output
-                        target: iv.name().to_string(),
+                        target: target_name.clone(),
                         coverage: u64::from(depth),
                     })?;
                 }

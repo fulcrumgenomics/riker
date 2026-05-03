@@ -918,8 +918,6 @@ fn test_per_base_coverage_output() {
 /// containing the same rows as the uncompressed variant.
 #[test]
 fn test_per_base_coverage_output_compressed() {
-    use flate2::read::GzDecoder;
-
     let dir = TempDir::new().unwrap();
     let bait_path = dir.path().join("baits.bed");
     let target_path = dir.path().join("targets.bed");
@@ -952,15 +950,17 @@ fn test_per_base_coverage_output_compressed() {
     assert!(!plain_path.exists(), "expected no plain TSV at {}", plain_path.display());
 
     let gz_path = PathBuf::from(format!("{}{PER_BASE_GZ_SUFFIX}", prefix.display()));
+    // Gzip magic number — guards against accidentally writing plain text under
+    // a `.gz` suffix; the rest of the assertions go through the read helper.
     let bytes = std::fs::read(&gz_path).unwrap();
-    // gzip magic number — guards against accidentally writing plain text.
     assert_eq!(&bytes[..2], &[0x1f, 0x8b], "missing gzip magic in {}", gz_path.display());
 
-    let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_reader(GzDecoder::new(std::fs::File::open(&gz_path).unwrap()));
-    let rows: Vec<PerBaseCoverage> = rdr.deserialize().map(|r| r.unwrap()).collect();
+    let rows: Vec<PerBaseCoverage> = read_metrics_tsv(&gz_path).unwrap();
     assert_eq!(rows.len(), 5);
+    // Sample column is derived from the temp BAM filename here (no SM tag in
+    // the synthetic header), so just guard against an empty value rather than
+    // tying the test to tempfile's naming scheme.
+    assert!(!rows[0].sample.is_empty(), "sample column should be populated");
     assert_eq!(rows[0].pos, 1);
     assert_eq!(rows[0].coverage, 1);
     assert_eq!(rows[4].pos, 5);
