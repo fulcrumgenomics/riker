@@ -11,8 +11,8 @@ use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
 use riker_lib::commands::command::Command;
 use riker_lib::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use riker_lib::commands::hybcap::{
-    HybCap, HybCapMetric, HybCapOptions, METRICS_SUFFIX, PER_BASE_SUFFIX, PER_TARGET_SUFFIX,
-    PerTargetCoverage,
+    HybCap, HybCapMetric, HybCapOptions, METRICS_SUFFIX, PER_BASE_GZ_SUFFIX, PER_BASE_SUFFIX,
+    PER_TARGET_SUFFIX, PerBaseCoverage, PerBaseCoverageFormat, PerTargetCoverage,
 };
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -893,13 +893,12 @@ fn test_per_base_coverage_output() {
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
-    options.per_base_coverage = true;
+    options.per_base_coverage = Some(PerBaseCoverageFormat::Uncompressed);
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
     cmd.execute().unwrap();
 
     let per_base_path = PathBuf::from(format!("{}{PER_BASE_SUFFIX}", prefix.display()));
-    let rows: Vec<riker_lib::commands::hybcap::PerBaseCoverage> =
-        read_metrics_tsv(&per_base_path).unwrap();
+    let rows: Vec<PerBaseCoverage> = read_metrics_tsv(&per_base_path).unwrap();
     assert_eq!(rows.len(), 5);
 
     // First 3 positions covered at 1x
@@ -913,6 +912,59 @@ fn test_per_base_coverage_output() {
     // Positions should be 1-based
     assert_eq!(rows[0].pos, 1);
     assert_eq!(rows[4].pos, 5);
+}
+
+/// Compressed per-base output should write a gzip-encoded TSV at the .gz suffix
+/// containing the same rows as the uncompressed variant.
+#[test]
+fn test_per_base_coverage_output_compressed() {
+    let dir = TempDir::new().unwrap();
+    let bait_path = dir.path().join("baits.bed");
+    let target_path = dir.path().join("targets.bed");
+    write_bed(&bait_path, &[("chr1", 0, 5)]);
+    write_bed(&target_path, &[("chr1", 0, 5)]);
+
+    let mut bld = coord_builder(&[("chr1", 10_000)]);
+    let qual = vec![30u8; 3];
+    add_single_record(
+        &mut bld,
+        "read1",
+        0,
+        1,
+        &[Op::new(Kind::Match, 3)],
+        &qual,
+        60,
+        Flags::empty(),
+    );
+
+    let bam = bld.to_temp_bam().unwrap();
+    let prefix = dir.path().join("out");
+
+    let mut options = opts(0, 0);
+    options.per_base_coverage = Some(PerBaseCoverageFormat::Compressed);
+    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    cmd.execute().unwrap();
+
+    // The plain-text variant must not exist when compressed output is selected.
+    let plain_path = PathBuf::from(format!("{}{PER_BASE_SUFFIX}", prefix.display()));
+    assert!(!plain_path.exists(), "expected no plain TSV at {}", plain_path.display());
+
+    let gz_path = PathBuf::from(format!("{}{PER_BASE_GZ_SUFFIX}", prefix.display()));
+    // Gzip magic number — guards against accidentally writing plain text under
+    // a `.gz` suffix; the rest of the assertions go through the read helper.
+    let bytes = std::fs::read(&gz_path).unwrap();
+    assert_eq!(&bytes[..2], &[0x1f, 0x8b], "missing gzip magic in {}", gz_path.display());
+
+    let rows: Vec<PerBaseCoverage> = read_metrics_tsv(&gz_path).unwrap();
+    assert_eq!(rows.len(), 5);
+    // Sample column is derived from the temp BAM filename here (no SM tag in
+    // the synthetic header), so just guard against an empty value rather than
+    // tying the test to tempfile's naming scheme.
+    assert!(!rows[0].sample.is_empty(), "sample column should be populated");
+    assert_eq!(rows[0].pos, 1);
+    assert_eq!(rows[0].coverage, 1);
+    assert_eq!(rows[4].pos, 5);
+    assert_eq!(rows[4].coverage, 0);
 }
 
 /// Bait classification: on-bait vs near-bait vs off-bait.

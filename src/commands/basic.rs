@@ -150,6 +150,7 @@ pub struct BasicCollector {
     base_dist_plot_path: PathBuf,
     mean_qual_plot_path: PathBuf,
     qual_dist_plot_path: PathBuf,
+    sample: String,
     plot_title_prefix: String,
 
     // Per read-end, per cycle.
@@ -179,6 +180,7 @@ impl BasicCollector {
             base_dist_plot_path: super::command::output_path(prefix, BASE_DIST_PLOT_SUFFIX),
             mean_qual_plot_path: super::command::output_path(prefix, MEAN_QUAL_PLOT_SUFFIX),
             qual_dist_plot_path: super::command::output_path(prefix, QUAL_DIST_PLOT_SUFFIX),
+            sample: String::new(),
             plot_title_prefix: String::new(),
             r1_cycles: Vec::new(),
             r2_cycles: Vec::new(),
@@ -266,6 +268,7 @@ impl BasicCollector {
                 debug_assert!(a + cnt_c + g + cnt_t <= total);
                 let n = total - (a + cnt_c + g + cnt_t);
                 metrics.push(BaseDistributionByCycleMetric {
+                    sample: self.sample.clone(),
                     read_end,
                     cycle: i + 1,
                     frac_a: a as f64 / t,
@@ -291,6 +294,7 @@ impl BasicCollector {
                 continue;
             }
             metrics.push(MeanQualityByCycleMetric {
+                sample: self.sample.clone(),
                 cycle: i + 1,
                 mean_quality: c.qual_sum as f64 / total as f64,
             });
@@ -302,6 +306,7 @@ impl BasicCollector {
                 continue;
             }
             metrics.push(MeanQualityByCycleMetric {
+                sample: self.sample.clone(),
                 cycle: r1_max + i + 1,
                 mean_quality: c.qual_sum as f64 / total as f64,
             });
@@ -328,6 +333,7 @@ impl BasicCollector {
             .enumerate()
             .filter(|&(_, count)| *count > 0)
             .map(|(q, count)| QualityScoreDistributionMetric {
+                sample: self.sample.clone(),
                 quality: q as u8,
                 count: *count,
                 frac_bases: if total > 0 { *count as f64 / total_f } else { 0.0 },
@@ -512,7 +518,8 @@ impl BasicCollector {
 impl Collector for BasicCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
         let label = derive_sample(&self.input, header);
-        self.plot_title_prefix = label;
+        self.plot_title_prefix.clone_from(&label);
+        self.sample = label;
         Ok(())
     }
 
@@ -586,6 +593,8 @@ impl Collector for BasicCollector {
 /// Base distribution by cycle, showing the fraction of each base at each sequencing cycle.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct BaseDistributionByCycleMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Read end (1 or 2).
     pub read_end: u8,
     /// Sequencing cycle number (1-based).
@@ -610,6 +619,8 @@ pub struct BaseDistributionByCycleMetric {
 /// Mean base quality by sequencing cycle.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct MeanQualityByCycleMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Sequencing cycle number (1-based).
     pub cycle: usize,
     /// Mean base quality score at this cycle.
@@ -620,6 +631,8 @@ pub struct MeanQualityByCycleMetric {
 /// Quality score distribution across all bases.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct QualityScoreDistributionMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Base quality score.
     pub quality: u8,
     /// Number of bases with this quality score.
@@ -687,8 +700,18 @@ mod tests {
     #[test]
     fn test_qual_dist_histogram_bins_includes_top_quality_bin() {
         let metrics = vec![
-            QualityScoreDistributionMetric { quality: 30, count: 100, frac_bases: 0.4 },
-            QualityScoreDistributionMetric { quality: 60, count: 150, frac_bases: 0.6 },
+            QualityScoreDistributionMetric {
+                sample: "s".to_string(),
+                quality: 30,
+                count: 100,
+                frac_bases: 0.4,
+            },
+            QualityScoreDistributionMetric {
+                sample: "s".to_string(),
+                quality: 60,
+                count: 150,
+                frac_bases: 0.6,
+            },
         ];
         let (edges, counts) = BasicCollector::qual_dist_histogram_bins(&metrics);
 
@@ -709,8 +732,12 @@ mod tests {
     /// scale across runs.
     #[test]
     fn test_qual_dist_histogram_bins_extends_to_q45_floor() {
-        let metrics =
-            vec![QualityScoreDistributionMetric { quality: 10, count: 100, frac_bases: 1.0 }];
+        let metrics = vec![QualityScoreDistributionMetric {
+            sample: "s".to_string(),
+            quality: 10,
+            count: 100,
+            frac_bases: 1.0,
+        }];
         let (edges, counts) = BasicCollector::qual_dist_histogram_bins(&metrics);
         // upper = max(45, 10) = 45 → counts spans 0..=45 (length 46).
         assert_eq!(counts.len(), 46);

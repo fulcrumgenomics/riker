@@ -113,6 +113,7 @@ pub struct InsertSizeCollector {
     metrics_path: PathBuf,
     histogram_path: PathBuf,
     plot_path: PathBuf,
+    sample: String,
     plot_title: String,
     include_duplicates: bool,
     min_frac: f64,
@@ -136,6 +137,7 @@ impl InsertSizeCollector {
             metrics_path,
             histogram_path,
             plot_path,
+            sample: String::new(),
             plot_title: String::new(),
             include_duplicates: options.include_duplicates,
             min_frac: options.min_frac,
@@ -206,6 +208,7 @@ impl Collector for InsertSizeCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
         let label = derive_sample(&self.input, header);
         self.plot_title = format!("Insert Size Distribution of {label}");
+        self.sample = label;
         Ok(())
     }
 
@@ -271,6 +274,7 @@ impl Collector for InsertSizeCollector {
             let (mean, stddev) = hist.trimmed_mean_and_stddev(trim_max);
 
             metrics.push(InsertSizeMetric {
+                sample: self.sample.clone(),
                 pair_orientation: (*name).to_string(),
                 read_pairs: count,
                 mean_insert_size: mean,
@@ -291,6 +295,7 @@ impl Collector for InsertSizeCollector {
         let hist_entries: Vec<InsertSizeHistogramEntry> = all_keys
             .into_iter()
             .map(|k| InsertSizeHistogramEntry {
+                sample: self.sample.clone(),
                 insert_size: k,
                 fr_count: self.fr.count_of(&k),
                 rf_count: self.rf.count_of(&k),
@@ -318,6 +323,8 @@ impl Collector for InsertSizeCollector {
 /// Insert size distribution metrics, one row per pair orientation.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct InsertSizeMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Pair orientation (FR, RF, or TANDEM).
     pub pair_orientation: String,
     /// Number of read pairs in this orientation.
@@ -345,6 +352,8 @@ pub struct InsertSizeMetric {
 /// Insert size histogram with counts per orientation at each size.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct InsertSizeHistogramEntry {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Insert size in base pairs.
     pub insert_size: u64,
     /// Number of FR (forward-reverse) pairs at this insert size.

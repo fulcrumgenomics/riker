@@ -1,4 +1,5 @@
 use anyhow::Result;
+use fgoxide::io::DelimFile;
 use noodles::bam;
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -580,12 +581,14 @@ impl Default for FastaBuilder {
 
 /// Read a tab-separated metrics file into a vector of typed rows.
 ///
+/// Backed by [`DelimFile::read_tsv`], which dispatches to gzip or plain
+/// reading based on the path's extension — `.gz` and `.bgz` files are
+/// transparently decompressed.
+///
 /// # Errors
 /// Returns an error if the file cannot be read or deserialized.
 pub fn read_metrics_tsv<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    let mut rdr = csv::ReaderBuilder::new().delimiter(b'\t').from_path(path)?;
-    let rows = rdr.deserialize().collect::<Result<Vec<T>, _>>()?;
-    Ok(rows)
+    Ok(DelimFile::default().read_tsv(path)?)
 }
 
 // ─── Shared test builders ────────────────────────────────────────────────────

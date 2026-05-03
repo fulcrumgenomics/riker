@@ -261,7 +261,11 @@ impl Command for Error {
         let dict = SequenceDictionary::from(&header);
 
         // Create collector (constructor handles group parsing, partitioning, accumulators)
-        let mut collector = ErrorCollector::new(&self.output.output, fasta, &self.options)?;
+        let mut collector =
+            ErrorCollector::new(&self.input.input, &self.output.output, fasta, &self.options)?;
+        // Standalone path bypasses `Collector::initialize`, so resolve the
+        // sample directly from the header here.
+        collector.sample = crate::sam::record_utils::derive_sample(&self.input.input, &header);
 
         let (parsed_intervals, intervals) = Self::build_intervals(&self.options, &dict)?;
 
@@ -389,6 +393,10 @@ pub struct ErrorCollector {
     overlap_path: PathBuf,
     indel_path: PathBuf,
 
+    // Sample identification (input path for fallback; sample resolved at initialize)
+    input_path: PathBuf,
+    sample: String,
+
     // Config
     reference: Fasta,
     vcf_path: Option<PathBuf>,
@@ -434,7 +442,12 @@ impl ErrorCollector {
     ///
     /// # Errors
     /// Returns an error if stratifier group names are invalid.
-    pub fn new(prefix: &Path, reference: Fasta, options: &ErrorOptions) -> Result<Self> {
+    pub fn new(
+        input: &Path,
+        prefix: &Path,
+        reference: Fasta,
+        options: &ErrorOptions,
+    ) -> Result<Self> {
         let mismatch_path = super::command::output_path(prefix, MISMATCH_SUFFIX);
         let overlap_path = super::command::output_path(prefix, OVERLAP_SUFFIX);
         let indel_path = super::command::output_path(prefix, INDEL_SUFFIX);
@@ -452,6 +465,8 @@ impl ErrorCollector {
             mismatch_path,
             overlap_path,
             indel_path,
+            input_path: input.to_path_buf(),
+            sample: String::new(),
             reference,
             vcf_path: options.vcf.clone(),
             variant_masks: std::collections::HashMap::new(),
@@ -557,6 +572,7 @@ impl ErrorCollector {
                 if mm.total_bases > 0 {
                     let frac = mm.error_bases as f64 / mm.total_bases as f64;
                     mismatch_rows.push(MismatchMetric {
+                        sample: self.sample.clone(),
                         stratifier: group_name.clone(),
                         covariate: formatted_key.clone(),
                         total_bases: mm.total_bases,
@@ -570,6 +586,7 @@ impl ErrorCollector {
                 let ov = &combined.overlap;
                 if ov.overlapping_read_bases > 0 {
                     overlap_rows.push(OverlappingMismatchMetric {
+                        sample: self.sample.clone(),
                         stratifier: group_name.clone(),
                         covariate: formatted_key.clone(),
                         overlapping_read_bases: ov.overlapping_read_bases,
@@ -597,6 +614,7 @@ impl ErrorCollector {
                     let total_events = ind.num_insertions + ind.num_deletions;
                     let total_for_rate = ind.total_bases.max(1);
                     indel_rows.push(IndelMetric {
+                        sample: self.sample.clone(),
                         stratifier: group_name.clone(),
                         covariate: formatted_key,
                         total_bases: ind.total_bases,
@@ -960,6 +978,7 @@ impl ErrorCollector {
 
 impl Collector for ErrorCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
+        self.sample = crate::sam::record_utils::derive_sample(&self.input_path, header);
         let dict = SequenceDictionary::from(header);
         if let Some(interval_path) = &self.interval_path {
             self.intervals =
@@ -1084,6 +1103,8 @@ impl Collector for ErrorCollector {
 /// the reference, along with the error rate and phred-scaled Q-score.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct MismatchMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// The stratification group (e.g. "read_num,cycle").
     pub stratifier: String,
     /// The covariate value(s) for this row.
@@ -1107,6 +1128,8 @@ pub struct MismatchMetric {
 /// from pre-sequencing (e.g. PCR or DNA damage) errors.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct OverlappingMismatchMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// The stratification group.
     pub stratifier: String,
     /// The covariate value(s) for this row.
@@ -1137,6 +1160,8 @@ pub struct OverlappingMismatchMetric {
 /// per-base stratifiers like base quality and read base.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct IndelMetric {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// The stratification group.
     pub stratifier: String,
     /// The covariate value(s) for this row.
