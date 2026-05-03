@@ -233,6 +233,7 @@ impl Multi {
                     }
                     let opts = error_opts.validate()?;
                     collectors.push(Box::new(ErrorCollector::new(
+                        &self.input.input,
                         &self.output.output,
                         reference,
                         &opts,

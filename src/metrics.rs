@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use csv::WriterBuilder;
+use fgoxide::io::{DelimFile, DelimFileWriter};
 use serde::Serialize;
 
 // ─── MetricDocs trait ─────────────────────────────────────────────────────────
@@ -108,19 +108,32 @@ where
 /// Write a slice of serializable rows to a tab-separated file.
 ///
 /// Produces lowercase headers (from serde field names), no metadata lines.
+/// When the path ends with a recognized gzip extension (`.gz` / `.bgz`) the
+/// output is gzip-compressed; otherwise it is plain TSV. Dispatch is handled
+/// by [`fgoxide::io::DelimFile`].
 ///
 /// # Errors
 /// Returns an error if the file cannot be created or a row cannot be serialized.
 pub fn write_tsv<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
-    let mut wtr = WriterBuilder::new()
-        .delimiter(b'\t')
-        .from_path(path)
-        .with_context(|| format!("Failed to create TSV: {}", path.display()))?;
-    for row in rows {
-        wtr.serialize(row).context("Failed to serialize row to TSV")?;
-    }
-    wtr.flush().context("Failed to flush TSV writer")?;
-    Ok(())
+    DelimFile::default()
+        .write_tsv(path, rows.iter())
+        .with_context(|| format!("Failed to write TSV: {}", path.display()))
+}
+
+/// Open a tab-separated streaming writer at `path` for rows of type `T`.
+///
+/// Use this when the row stream is large enough that buffering everything
+/// into a `Vec` for [`write_tsv`] is wasteful. Path-driven gzip dispatch
+/// matches [`write_tsv`] (a `.gz`/`.bgz` suffix produces compressed output).
+/// The header row is written when the writer is first constructed; rows
+/// follow via `write` / `write_all`.
+///
+/// # Errors
+/// Returns an error if the file cannot be created.
+pub fn tsv_writer<T: Serialize>(path: &Path) -> Result<DelimFileWriter<T>> {
+    DelimFile::default()
+        .new_writer(path, b'\t', true)
+        .with_context(|| format!("Failed to open TSV writer: {}", path.display()))
 }
 
 #[cfg(test)]

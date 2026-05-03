@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::Op;
 use noodles::sam::alignment::record::cigar::op::Kind;
@@ -15,7 +15,9 @@ use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOpti
 use crate::fasta::Fasta;
 use crate::intervals::{Interval, Intervals};
 use crate::math::{safe_div, safe_div_f};
-use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, write_tsv};
+use crate::metrics::{
+    serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, tsv_writer, write_tsv,
+};
 use crate::overlapper::Overlapper;
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
@@ -35,8 +37,20 @@ pub const METRICS_SUFFIX: &str = ".hybcap-metrics.txt";
 /// File suffix for the per-target coverage output.
 pub const PER_TARGET_SUFFIX: &str = ".hybcap-per-target.txt";
 
-/// File suffix for the per-base coverage output.
+/// File suffix for the uncompressed per-base coverage output.
 pub const PER_BASE_SUFFIX: &str = ".hybcap-per-base.txt";
+
+/// File suffix for the gzip-compressed per-base coverage output.
+pub const PER_BASE_GZ_SUFFIX: &str = ".hybcap-per-base.txt.gz";
+
+/// Output format for the per-base coverage file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PerBaseCoverageFormat {
+    /// Plain TSV (default).
+    Uncompressed,
+    /// Gzip-compressed TSV (suffix `.gz`).
+    Compressed,
+}
 
 // ─── CLI struct ───────────────────────────────────────────────────────────────
 
@@ -87,9 +101,17 @@ pub struct HybCapOptions {
     #[arg(long, default_value_t = false)]
     pub per_target_coverage: bool,
 
-    /// Output per-base coverage values.
-    #[arg(long, default_value_t = false)]
-    pub per_base_coverage: bool,
+    /// Output per-base coverage values. Pass `compressed` for a gzipped
+    /// `.hybcap-per-base.txt.gz` file or `uncompressed` (the default when the
+    /// flag is given without a value) for a plain `.hybcap-per-base.txt`.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        num_args = 0..=1,
+        default_missing_value = "uncompressed",
+    )]
+    pub per_base_coverage: Option<PerBaseCoverageFormat>,
 }
 
 impl HybCapOptions {
@@ -112,7 +134,7 @@ impl Default for HybCapOptions {
             dont_clip_overlapping_reads: false,
             include_indels: Self::DEFAULT_INCLUDE_INDELS,
             per_target_coverage: false,
-            per_base_coverage: false,
+            per_base_coverage: None,
         }
     }
 }
@@ -127,7 +149,9 @@ impl Default for HybCapOptions {
 /// all computations.
 ///
 /// Outputs are written to <prefix>.hybcap-metrics.txt, and optionally
-/// <prefix>.hybcap-per-target.txt and <prefix>.hybcap-per-base.txt.
+/// <prefix>.hybcap-per-target.txt and either <prefix>.hybcap-per-base.txt
+/// or <prefix>.hybcap-per-base.txt.gz (depending on
+/// `--per-base-coverage`).
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -135,7 +159,8 @@ impl Default for HybCapOptions {
 Examples:
   riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed
   riker hybcap -i input.bam -o out_prefix --baits baits.interval_list --targets targets.interval_list -r ref.fa
-  riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-target-coverage"
+  riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-target-coverage
+  riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-base-coverage compressed"
 )]
 pub struct HybCap {
     #[command(flatten)]
@@ -176,6 +201,7 @@ pub struct HybCapCollector {
     metrics_path: PathBuf,
     per_target_path: PathBuf,
     per_base_path: PathBuf,
+    per_base_format: Option<PerBaseCoverageFormat>,
 
     // Input/config
     baits_path: PathBuf,
@@ -192,7 +218,6 @@ pub struct HybCapCollector {
     clip_overlapping: bool,
     include_indels: bool,
     output_per_target: bool,
-    output_per_base: bool,
 
     // Initialized during initialize()
     dict: Option<SequenceDictionary>,
@@ -253,10 +278,17 @@ impl HybCapCollector {
         let panel_name = options.panel_name.clone().unwrap_or_else(|| {
             options.baits.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string()
         });
+        let per_base_suffix = match options.per_base_coverage {
+            Some(PerBaseCoverageFormat::Compressed) => PER_BASE_GZ_SUFFIX,
+            // Path is unused when per-base output is disabled, but matching the
+            // historical default keeps the field's debug output friendly.
+            Some(PerBaseCoverageFormat::Uncompressed) | None => PER_BASE_SUFFIX,
+        };
         Self {
             metrics_path: super::command::output_path(prefix, METRICS_SUFFIX),
             per_target_path: super::command::output_path(prefix, PER_TARGET_SUFFIX),
-            per_base_path: super::command::output_path(prefix, PER_BASE_SUFFIX),
+            per_base_path: super::command::output_path(prefix, per_base_suffix),
+            per_base_format: options.per_base_coverage,
 
             baits_path: options.baits.clone(),
             targets_path: options.targets.clone(),
@@ -275,7 +307,6 @@ impl HybCapCollector {
             clip_overlapping: !options.dont_clip_overlapping_reads,
             include_indels: options.include_indels,
             output_per_target: options.per_target_coverage,
-            output_per_base: options.per_base_coverage,
 
             dict: None,
             target_overlapper: None,
@@ -1177,8 +1208,11 @@ impl Collector for HybCapCollector {
         write_tsv(&self.metrics_path, &[metric])?;
 
         // ── Per-target coverage ──
+        // Stream rows row-by-row so we don't build a Vec the size of the target
+        // panel just to hand it to a writer.
         if self.output_per_target {
-            let mut rows = Vec::with_capacity(self.target_coverages.len());
+            log::info!("Writing per-target coverage to {}", self.per_target_path.display());
+            let mut writer = tsv_writer::<PerTargetCoverage>(&self.per_target_path)?;
             for (i, (iv, cov)) in self.target_coverages.iter().enumerate() {
                 let contig_name =
                     dict.get_by_index(iv.ref_id).map_or("?", |m| m.name()).to_string();
@@ -1188,8 +1222,8 @@ impl Collector for HybCapCollector {
                 } else {
                     0.0
                 };
-
-                rows.push(PerTargetCoverage {
+                writer.write(&PerTargetCoverage {
+                    sample: self.sample.clone(),
                     chrom: contig_name,
                     start: u64::from(iv.start) + 1,
                     end: u64::from(iv.end),
@@ -1202,29 +1236,33 @@ impl Collector for HybCapCollector {
                     max_coverage: cov.max_depth(),
                     frac_0x: cov.frac_at_0x(),
                     read_count: cov.read_count,
-                });
+                })?;
             }
-            log::info!("Writing per-target coverage to {}", self.per_target_path.display());
-            write_tsv(&self.per_target_path, &rows)?;
+            writer.flush()?;
         }
 
         // ── Per-base coverage ──
-        if self.output_per_base {
-            let mut rows = Vec::new();
+        // Stream rows row-by-row — at production target sizes this file can
+        // contain tens of millions of entries. Path-driven `.gz` dispatch
+        // (when `--per-base-coverage compressed`) is handled inside
+        // [`tsv_writer`].
+        if self.per_base_format.is_some() {
+            log::info!("Writing per-base coverage to {}", self.per_base_path.display());
+            let mut writer = tsv_writer::<PerBaseCoverage>(&self.per_base_path)?;
             for (iv, cov) in &self.target_coverages {
                 let contig_name =
                     dict.get_by_index(iv.ref_id).map_or("?", |m| m.name()).to_string();
                 for (offset, &depth) in cov.hq_depths.iter().enumerate() {
-                    rows.push(PerBaseCoverage {
+                    writer.write(&PerBaseCoverage {
+                        sample: self.sample.clone(),
                         chrom: contig_name.clone(),
                         pos: u64::from(iv.start) + offset as u64 + 1, // 1-based output
                         target: iv.name().to_string(),
                         coverage: u64::from(depth),
-                    });
+                    })?;
                 }
             }
-            log::info!("Writing per-base coverage to {}", self.per_base_path.display());
-            write_tsv(&self.per_base_path, &rows)?;
+            writer.flush()?;
         }
 
         Ok(())
@@ -1400,6 +1438,8 @@ pub struct HybCapMetric {
 /// Per-target coverage metrics (one row per merged target interval).
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct PerTargetCoverage {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Contig name.
     pub chrom: String,
     /// 1-based start position.
@@ -1433,6 +1473,8 @@ pub struct PerTargetCoverage {
 /// Per-base coverage (one row per target base position).
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct PerBaseCoverage {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Contig name.
     pub chrom: String,
     /// 1-based position.

@@ -408,6 +408,7 @@ impl WgsCollector {
                 let frac_bases = bases as f64 / total as f64;
                 let frac_bases_at_or_above = at_or_above[d] as f64 / total as f64;
                 WgsCoverageEntry {
+                    sample: self.sample.clone(),
                     depth: d as u64,
                     bases,
                     frac_bases,
@@ -834,6 +835,8 @@ pub struct WgsMetrics {
 /// One row of the per-depth coverage histogram.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct WgsCoverageEntry {
+    /// Sample name derived from the BAM read group SM tag or filename.
+    pub sample: String,
     /// Coverage depth (number of reads covering a position).
     pub depth: u64,
     /// Number of reference positions with exactly this depth.
