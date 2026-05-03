@@ -43,7 +43,10 @@ pub struct IsizeOptions {
     /// Minimum fraction of total read pairs required for an orientation to be reported.
     #[arg(long, default_value_t = IsizeOptions::DEFAULT_MIN_FRAC)]
     pub min_frac: f64,
-    /// Trim to MEDIAN ± DEVIATIONS × MAD before computing mean and standard deviation.
+    /// Trim to MEDIAN + DEVIATIONS × MAD before computing the mean and
+    /// standard deviation, and before writing the histogram TSV/plot. Per
+    /// orientation; the histogram TSV uses the largest threshold across
+    /// reported orientations so anomalous chimeric long tails are dropped.
     #[arg(long, default_value_t = IsizeOptions::DEFAULT_DEVIATIONS)]
     pub deviations: f64,
 }
@@ -70,6 +73,10 @@ impl Default for IsizeOptions {
 /// metrics file, a per-size histogram, and a distribution chart. Outputs
 /// are written to <prefix>.isize-metrics.txt,
 /// <prefix>.isize-histogram.txt, and <prefix>.isize-histogram.pdf.
+///
+/// The histogram TSV (and the chart) are trimmed to MEDIAN + DEVIATIONS ×
+/// MAD per orientation (matching Picard's CollectInsertSizeMetrics) so
+/// anomalous chimeric long tails do not pollute the output.
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -256,6 +263,11 @@ impl Collector for InsertSizeCollector {
             [("FR", &self.fr), ("RF", &self.rf), ("TANDEM", &self.tandem)];
 
         let mut metrics: Vec<InsertSizeMetric> = Vec::new();
+        // Track the largest per-orientation `median + deviations * MAD` so the
+        // histogram TSV can be trimmed to the same upper tail used for stats
+        // and plotting. Picard's `CollectInsertSizeMetrics` does the same to
+        // keep anomalous chimeric-pair tails out of the output.
+        let mut hist_trim_max: Option<f64> = None;
 
         for (name, hist) in &orientations {
             let count = hist.total();
@@ -272,6 +284,8 @@ impl Collector for InsertSizeCollector {
             let max_is = hist.max().expect("non-empty histogram");
             let trim_max = median + self.deviations * mad;
             let (mean, stddev) = hist.trimmed_mean_and_stddev(trim_max);
+
+            hist_trim_max = Some(hist_trim_max.map_or(trim_max, |m: f64| m.max(trim_max)));
 
             metrics.push(InsertSizeMetric {
                 sample: self.sample.clone(),
@@ -292,8 +306,12 @@ impl Collector for InsertSizeCollector {
         let all_keys: std::collections::BTreeSet<u64> =
             self.fr.keys().chain(self.rf.keys()).chain(self.tandem.keys()).copied().collect();
 
+        // When no orientation passes `min_frac` we have no trim threshold, so
+        // fall through and emit the raw histogram (matches the
+        // pre-trim-feature behaviour for that edge case).
         let hist_entries: Vec<InsertSizeHistogramEntry> = all_keys
             .into_iter()
+            .filter(|&k| hist_trim_max.is_none_or(|max| (k as f64) <= max))
             .map(|k| InsertSizeHistogramEntry {
                 sample: self.sample.clone(),
                 insert_size: k,
@@ -349,7 +367,9 @@ pub struct InsertSizeMetric {
     pub max_insert_size: u64,
 }
 
-/// Insert size histogram with counts per orientation at each size.
+/// Insert size histogram with counts per orientation at each size. Trimmed
+/// to MEDIAN + `--deviations` × MAD across reported orientations so the
+/// long tail of chimeric pairs does not appear in the output.
 #[derive(Debug, Serialize, Deserialize, MetricDocs)]
 pub struct InsertSizeHistogramEntry {
     /// Sample name derived from the BAM read group SM tag or filename.
