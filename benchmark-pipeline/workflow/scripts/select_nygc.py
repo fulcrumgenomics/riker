@@ -34,7 +34,12 @@ def list_crams(bucket: str, prefix: str) -> list[tuple[int, str]]:
     )
     out = []
     for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
         size_str, _, key = line.partition("\t")
+        if not key:
+            # No tab separator (header line, AWS CLI footer, etc.)
+            continue
         out.append((int(size_str), key.strip()))
     out.sort()
     return out

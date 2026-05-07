@@ -3,9 +3,15 @@
 # profiles. Bundle profiles don't include mosdepth (no analog of riker
 # multi).
 #
-# We always run with `--no-per-base -x` to skip the heavy per-base output
-# riker doesn't produce either; this matches "what users actually run for
-# QC". For hybcap, `--by <target.bed>` constrains to capture regions.
+# Both branches use `--no-per-base` to skip the heavy per-base output
+# riker doesn't produce either. The wgs branch additionally passes
+# `-x` (mosdepth fast-mode: skip CIGAR walk, count entire fragment as
+# one contiguous block); we deliberately omit `-x` from the hybcap
+# branch because riker `hybcap` and Picard `CollectHsMetrics` both
+# walk CIGARs to apportion bases across capture-region boundaries, and
+# we want mosdepth's accuracy comparable to theirs on capture data.
+# Hybcap's `--by <target.bed>` then constrains coverage to the kit
+# regions.
 #
 # Threading: deliberately omit `-t` so mosdepth uses its default
 # (`-t 0` = no extra decompression threads, htslib runs single-threaded).

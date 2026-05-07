@@ -60,8 +60,10 @@ rule fetch_reference:
             mv "$tmp" "$out_fa"
         fi
 
-        # Optional md5 check. Empty md5 means "not pinned yet" — first run
-        # populates it; subsequent runs MUST match.
+        # Optional md5 check. Empty md5 means "not pinned" — the check is
+        # skipped. To pin, edit references.yaml manually with the value of
+        # `md5sum stage_dir/refs/<ref>.fa` after a successful first fetch;
+        # subsequent runs will then fail loudly on any mismatch.
         if [[ -n {params.md5:q} ]]; then
             actual=$(md5sum "$out_fa" | awk '{{print $1}}')
             if [[ "$actual" != {params.md5:q} ]]; then

@@ -110,7 +110,10 @@ def _qualimap_version() -> str:
         for line in lines:
             if any(seg.startswith("v") and seg[1:2].isdigit() for seg in line.split()):
                 return line
-        return lines[0] if lines else "unknown"
+        # No useful identifier found — qualimap's first --help line is
+        # typically the JVM "Java memory size is set to ..." banner, which
+        # would only mislead a reader of bench.tsv.
+        return "unknown"
     except Exception as e:
         return f"error: {e}"
 

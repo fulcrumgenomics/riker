@@ -58,7 +58,10 @@ if ! $have_cc || ! $have_cxx || ! $have_cmake; then
       log "Installing build toolchain: ${pkgs[*]}"
       sudo dnf install -y -q "${pkgs[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
-      $have_cxx && pkgs=("${pkgs[@]/gcc/}")  # build-essential covers gcc + g++
+      # When c++ is missing we install build-essential, which covers BOTH
+      # gcc and g++ — drop any standalone gcc from the list to avoid
+      # apt-get complaining about a redundant package.
+      $have_cxx || pkgs=("${pkgs[@]/gcc/}")
       $have_cxx || pkgs+=(build-essential)
       $have_cmake || pkgs+=(cmake)
       log "Installing build toolchain: ${pkgs[*]}"

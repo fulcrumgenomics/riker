@@ -43,7 +43,10 @@ def parse(path: str | Path) -> dict:
             elif key == "Maximum resident set size (kbytes)":
                 out["max_rss_kb"] = int(value)
             elif key == "Percent of CPU this job got":
-                out["cpu_percent"] = int(value.rstrip("%"))
+                # `float` rather than `int` since the spec doesn't guarantee
+                # whole-number percents (in practice GNU time emits ints,
+                # but `int("99.5")` would raise on any future change).
+                out["cpu_percent"] = float(value.rstrip("%"))
             elif key == "Exit status":
                 out["exit_status"] = int(value)
     return out

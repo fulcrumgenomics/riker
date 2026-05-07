@@ -22,9 +22,10 @@ qualimap_xmx_gb_max:    16
 
 replicates:         1
 
-# Smoke runs all four profiles to exercise every code path (the hybcap
-# profiles only fire if samples.smoke.hybcap.tsv has rows; the default is
-# empty, leaving wgs-only + wgs-bundle as the smoke targets).
+# Only wgs-only + wgs-bundle run by default; samples.smoke.hybcap.tsv is
+# empty so the hybcap profiles wouldn't have rows to fan out over even
+# if listed here. Add rows to that TSV (and re-add the hybcap entries
+# below) to also exercise the hybcap code paths.
 profiles_enabled: [wgs-only, wgs-bundle]
 
 staging_threads:    8
