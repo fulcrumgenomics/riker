@@ -52,7 +52,14 @@ The obvious question is: why not just fix up Picard?  Riker exists for a number 
 
 ## Performance
 
-Numbers below are from a [reproducible benchmark pipeline](benchmark-pipeline/) run on a single AWS `r8id.xlarge` instance (4 vCPU, 32 GB RAM, local NVMe), against publicly-available 1000 Genomes 30× WGS BAMs (transcoded from CRAM) and the GIAB Ashkenazi exome trio.
+Numbers below are from a [reproducible benchmark pipeline](benchmark-pipeline/) run on **2026-05-06** on a single AWS `r8id.xlarge` instance (4 vCPU, 32 GB RAM, local NVMe), against publicly-available 1000 Genomes 30× WGS BAMs (transcoded from CRAM) and the GIAB Ashkenazi exome trio.
+
+Tool versions:
+
+- **Riker**: 0.2.0 release candidate (built from source on the host)
+- **Picard**: 3.4.0 on OpenJDK 25.0.2 (bioconda)
+- **mosdepth**: 0.3.14 (bioconda)
+- **samtools**: 1.23.1 (bioconda; used for staging — CRAM→BAM transcoding, downsampling with `view --subsample`, indexing)
 
 ### WGS — Riker wgs vs. Picard CollectWgsMetrics
 

@@ -69,18 +69,47 @@ def tool_family(tool: str) -> str:
 
 
 def safe_version(cmd: list[str]) -> str:
-    """Run a `--version` command and return the first non-empty line.
-    Best-effort — empty string on failure."""
+    """Run a `--version`-style command and return the first non-empty,
+    non-warning line from its combined stdout/stderr. Best-effort —
+    returns "" only on launch failures or timeouts.
+
+    Uses run(check=False) rather than check_output because some tools
+    (notably Picard) exit non-zero from `--version` by convention while
+    still printing the banner; check_output would raise and we'd lose
+    the version.
+    """
     try:
-        out = subprocess.check_output(cmd, text=True, timeout=15,
-                                      stderr=subprocess.STDOUT)
-        for line in out.splitlines():
-            line = line.strip()
-            if line:
-                return line
+        result = subprocess.run(cmd, text=True, timeout=15,
+                                capture_output=True, check=False)
     except Exception:
         return ""
+    # Picard prints the banner to stderr; mosdepth/riker print to stdout.
+    # Merge so the first version-y line wins regardless of stream.
+    for stream in (result.stdout, result.stderr):
+        for line in (stream or "").splitlines():
+            line = line.strip()
+            if line and not line.lower().startswith("warning"):
+                return line
     return ""
+
+
+def _picard_version() -> str:
+    """Probe picard's version. Picard's `--version` flag is per-tool; we
+    invoke it via MarkDuplicates because that tool's banner is short.
+    Returns a "Picard <version>" string."""
+    try:
+        result = subprocess.run(["picard", "MarkDuplicates", "--version"],
+                                text=True, timeout=15,
+                                capture_output=True, check=False)
+    except Exception as e:
+        return f"error: {e}"
+    # Picard banner format: "Version:3.4.0" on stderr.
+    for stream in (result.stderr, result.stdout):
+        for line in (stream or "").splitlines():
+            line = line.strip()
+            if line.lower().startswith("version:"):
+                return f"Picard {line.split(':', 1)[1].strip()}"
+    return "Picard (version unknown)"
 
 
 def collect_versions(riker_bin: str) -> dict[str, str]:
@@ -88,7 +117,8 @@ def collect_versions(riker_bin: str) -> dict[str, str]:
     config value because it lives outside the pixi env."""
     return {
         "riker":    safe_version([riker_bin, "--version"]),
-        "picard":   safe_version(["picard", "MarkDuplicates", "--version"]),
+        # Picard exits status 1 from `--version`; needs the dedicated probe.
+        "picard":   _picard_version(),
         "mosdepth": safe_version(["mosdepth", "--version"]),
         # qualimap doesn't have a --version. `qualimap --help` greets with
         # "Java memory size is set to ..." which is useless; grab the
