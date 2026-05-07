@@ -1,0 +1,4 @@
+name	source_url	reference	kit	approx_bam_gb	benchmark	notes
+HG002_av5	https://ftp.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG002_NA24385_son/OsloUniversityHospital_Exome/151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam	hs37d5	agilent_av5	9.6	Y	GIAB AJ son; aligned to hs37d5 (verified via @SQ headers + @PG ID:bwa)
+HG003_av5	https://ftp.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG003_NA24149_father/OsloUniversityHospital_Exome/151002_7001448_0359_AC7F6GANXX_Sample_HG003-EEogPU_v02-KIT-Av5_TCTTCACA_L008.posiSrt.markDup.bam	hs37d5	agilent_av5	8.4	Y	GIAB AJ father
+HG004_av5	https://ftp.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG004_NA24143_mother/OsloUniversityHospital_Exome/151002_7001448_0359_AC7F6GANXX_Sample_HG004-EEogPU_v02-KIT-Av5_CCGAAGTA_L008.posiSrt.markDup.bam	hs37d5	agilent_av5	9.5	Y	GIAB AJ mother

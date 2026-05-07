@@ -1,0 +1,263 @@
+# riker benchmark pipeline — top-level Snakefile.
+#
+# Job graph (per (sample, profile, tool, rep) cell):
+#   fetch_input -> [transcode_cram | downsample] -> stage/{sample}/input.bam
+#       -> {run_riker, run_picard_*, run_mosdepth, run_qualimap}
+#       -> aggregate_bench -> bench.tsv -> summarize_bench, plots
+#
+# Resource semantics: every timed rule reserves bench=100 (the full pool,
+# set by run.sh). Staging/aggregation/plotting reserve bench=1, so they
+# can run in parallel during fill-in but never DURING a timed rule.
+#
+# Adding a new comparator: add a rule under workflow/rules/, update
+# COMPARATORS in this file, and add it to the plot.R color palette.
+
+from pathlib import Path
+
+import pandas as pd
+import yaml
+
+
+configfile: "config/performance.config.yaml"
+
+
+WORKDIR = Path(workflow.basedir)
+
+
+# --- Resolve config paths (snakemake passes them in as relative-to-CWD) ---
+
+def _abs(p: str) -> Path:
+    pp = Path(p)
+    return pp if pp.is_absolute() else WORKDIR / pp
+
+
+SAMPLES_WGS_TSV    = _abs(config["samples_wgs_tsv"])
+SAMPLES_HYBCAP_TSV = _abs(config["samples_hybcap_tsv"])
+REFERENCES_YAML    = _abs(config["references_yaml"])
+KITS_YAML          = _abs(config["kits_yaml"])
+STAGE_DIR          = _abs(config["stage_dir"])
+RESULTS_DIR        = _abs(config["results_dir"])
+RIKER_BIN          = _abs(config["riker_bin"])
+
+with open(REFERENCES_YAML) as fh:
+    REFERENCES = yaml.safe_load(fh)
+with open(KITS_YAML) as fh:
+    KITS = yaml.safe_load(fh)
+
+
+# --- Sample sheets --------------------------------------------------------
+
+def _load_samples():
+    """Combine the WGS and hybcap sample sheets into one indexed DataFrame.
+    Empty sheets are tolerated (smoke configs may have an empty hybcap
+    sheet). Adds the `benchmark` column with default 'Y' if missing."""
+    frames = []
+    if SAMPLES_WGS_TSV.exists():
+        wgs = pd.read_csv(SAMPLES_WGS_TSV, sep="\t", dtype=str).fillna("-")
+        if len(wgs) > 0:
+            wgs["input_type"] = "wgs"
+            frames.append(wgs)
+    if SAMPLES_HYBCAP_TSV.exists():
+        hyb = pd.read_csv(SAMPLES_HYBCAP_TSV, sep="\t", dtype=str).fillna("-")
+        if len(hyb) > 0:
+            hyb["input_type"] = "hybcap"
+            # hybcap rows lack downsample_* columns; fill with placeholders
+            # so the merged frame has uniform schema.
+            for c in ("downsample_from", "downsample_frac", "downsample_seed"):
+                if c not in hyb.columns:
+                    hyb[c] = "-"
+            frames.append(hyb)
+    if not frames:
+        raise SystemExit("No samples loaded — check samples_wgs_tsv / samples_hybcap_tsv")
+    df = pd.concat(frames, ignore_index=True)
+    # Default benchmark=Y if column absent. Allows older sample sheets to
+    # still work without a forced edit.
+    if "benchmark" not in df.columns:
+        df["benchmark"] = "Y"
+    return df.set_index("name", drop=False)
+
+
+SAMPLES = _load_samples()
+SAMPLE_NAMES = list(SAMPLES.index)
+# Samples that actually get benchmarked (vs. samples staged purely as
+# downsample parents). DAG fanout uses BENCHMARK_SAMPLES; staging rules
+# operate on the full SAMPLES set so parents get fetched.
+BENCHMARK_SAMPLES = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "benchmark"].upper() == "Y"]
+
+# Useful subsets for rule wildcards / DAG construction.
+WGS_SAMPLES    = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "input_type"] == "wgs"]
+HYBCAP_SAMPLES = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "input_type"] == "hybcap"]
+DOWNSAMPLE_SAMPLES = [
+    s for s in SAMPLE_NAMES
+    if SAMPLES.loc[s, "downsample_from"] not in ("-", "")
+]
+SOURCE_SAMPLES = [s for s in SAMPLE_NAMES if s not in DOWNSAMPLE_SAMPLES]
+CRAM_SOURCE_SAMPLES = [
+    s for s in SOURCE_SAMPLES
+    if SAMPLES.loc[s, "source_url"].endswith(".cram")
+]
+BAM_SOURCE_SAMPLES = [
+    s for s in SOURCE_SAMPLES
+    if not SAMPLES.loc[s, "source_url"].endswith(".cram")
+]
+
+
+# --- Profile + comparator definitions ------------------------------------
+
+# Profile metadata. The riker_args field is exactly what gets passed to
+# the riker binary after `--threads N --input ... --output ...`.
+PROFILES = {
+    "wgs-only": {
+        "input_type": "wgs",
+        "riker_args": ["wgs"],
+        "needs_ref": True,
+    },
+    "wgs-bundle": {
+        "input_type": "wgs",
+        "riker_args": ["multi", "--tools", "wgs", "alignment", "basic", "isize", "gcbias"],
+        "needs_ref": True,
+    },
+    "hybcap-only": {
+        "input_type": "hybcap",
+        "riker_args": ["hybcap"],
+        "needs_ref": False,
+    },
+    "hybcap-bundle": {
+        "input_type": "hybcap",
+        "riker_args": ["multi", "--tools", "hybcap", "alignment", "basic", "isize"],
+        "needs_ref": False,
+    },
+}
+
+# Comparator coverage matrix — which tools run against which profile.
+# Each entry is a list of (tool_token, role) tuples. tool_token is the
+# directory name under results/run/{sample}/{profile}/; role is for the
+# bench.tsv `picard_bundle_role` column (and ignored otherwise).
+# Qualimap was originally in this matrix but was dropped from v1 after
+# repeatedly failing on 30x WGS at both 16 GB and 24 GB Java heap (and
+# user explicitly approved "screw it" as the response). The qualimap
+# rule still exists in workflow/rules/run_qualimap.smk; re-add it to
+# COMPARATORS to bring it back when running on a beefier host.
+COMPARATORS = {
+    "wgs-only": [
+        ("riker",       "main"),
+        ("picard-cwm",  "main"),       # CollectWgsMetrics
+        ("mosdepth",    "main"),
+    ],
+    "wgs-bundle": [
+        ("riker",          "main"),
+        ("picard-cmm",     "base"),    # CollectMultipleMetrics + GcBias
+        ("picard-cwm",     "supp"),    # CollectWgsMetrics (added on top)
+    ],
+    "hybcap-only": [
+        ("riker",       "main"),
+        ("picard-chsm", "main"),       # CollectHsMetrics
+        ("mosdepth",    "main"),
+    ],
+    "hybcap-bundle": [
+        ("riker",          "main"),
+        ("picard-cmm",     "base"),    # CollectMultipleMetrics (default 5 programs)
+        ("picard-chsm",    "supp"),
+    ],
+}
+
+PROFILES_ENABLED = config["profiles_enabled"]
+REPLICATES = list(range(1, int(config["replicates"]) + 1))
+
+
+# --- Per-sample helpers ---------------------------------------------------
+
+def ref_for_sample(sample: str) -> str:
+    """Path to the indexed FASTA used for staging + benchmarking this sample."""
+    ref_name = SAMPLES.loc[sample, "reference"]
+    return f"{STAGE_DIR}/refs/{ref_name}.fa"
+
+
+def kit_intervals_for_sample(sample: str) -> str:
+    """Picard interval_list path. Used by riker hybcap and Picard
+    CollectHsMetrics (both natively accept interval_list)."""
+    kit = SAMPLES.loc[sample, "kit"] if "kit" in SAMPLES.columns else "-"
+    return f"{STAGE_DIR}/kits/{kit}/intervals.list"
+
+
+def kit_bed_for_sample(sample: str) -> str:
+    """BED path derived from the interval_list. Used by mosdepth (which
+    only accepts BED via --by)."""
+    kit = SAMPLES.loc[sample, "kit"] if "kit" in SAMPLES.columns else "-"
+    return f"{STAGE_DIR}/kits/{kit}/intervals.bed"
+
+
+# Back-compat aliases — the Agilent v5 kit uses one interval_list file as
+# both baits and targets (vendor login wall on the separate BED files;
+# ~100% bait-target overlap is acceptable for runtime benchmarking).
+def bait_bed_for_sample(sample: str) -> str:
+    return kit_intervals_for_sample(sample)
+
+
+def target_bed_for_sample(sample: str) -> str:
+    return kit_intervals_for_sample(sample)
+
+
+def thread_count(profile: str) -> int:
+    """Single-tool profiles run all tools at 1 thread; bundle profiles
+    run riker (and qualimap) at 4."""
+    return 4 if profile.endswith("-bundle") else 1
+
+
+# --- DAG fan-out ----------------------------------------------------------
+
+def all_bench_targets():
+    out = []
+    for sample in BENCHMARK_SAMPLES:
+        input_type = SAMPLES.loc[sample, "input_type"]
+        for profile in PROFILES_ENABLED:
+            if PROFILES[profile]["input_type"] != input_type:
+                continue
+            for tool_token, _role in COMPARATORS[profile]:
+                for rep in REPLICATES:
+                    out.append(
+                        f"{RESULTS_DIR}/run/{sample}/{profile}/{tool_token}/rep{rep}/time.txt"
+                    )
+    return out
+
+
+# --- Top-level rule -------------------------------------------------------
+
+rule all:
+    input:
+        f"{RESULTS_DIR}/bench.tsv",
+        f"{RESULTS_DIR}/bench_summary.tsv",
+        f"{RESULTS_DIR}/host.json",
+        f"{RESULTS_DIR}/plots/01_wall_time_leaderboard.pdf",
+        f"{RESULTS_DIR}/plots/02_throughput_vs_size.pdf",
+        f"{RESULTS_DIR}/plots/03_max_rss_vs_size.pdf",
+        f"{RESULTS_DIR}/plots/04_riker_bundle_vs_picard.pdf",
+        f"{RESULTS_DIR}/plots/05_riker_vs_picard_cmm.pdf",
+        f"{RESULTS_DIR}/plots/06_per_comparator_ratio.pdf",
+
+
+# --- Wildcard constraints (must match disjoint subsets) -------------------
+
+# Snakemake rule resolution depends on these constraints to pick the right
+# upstream for stage/{sample}/input.bam. All sample-name constraints use
+# the same set of names so any rule can match by sample.
+_PROFILE_REGEX = "|".join(PROFILES.keys())
+_REP_REGEX = r"\d+"
+_TOOL_REGEX = "riker|picard-cmm|picard-cwm|picard-chsm|mosdepth|qualimap"
+
+
+wildcard_constraints:
+    sample = "|".join(SAMPLE_NAMES) if SAMPLE_NAMES else "DOESNOTMATCH",
+    profile = _PROFILE_REGEX,
+    tool = _TOOL_REGEX,
+    rep = _REP_REGEX,
+
+
+# --- Rule modules ---------------------------------------------------------
+
+include: "workflow/rules/stage_inputs.smk"
+include: "workflow/rules/run_riker.smk"
+include: "workflow/rules/run_picard.smk"
+include: "workflow/rules/run_mosdepth.smk"
+include: "workflow/rules/run_qualimap.smk"
+include: "workflow/rules/aggregate.smk"

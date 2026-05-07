@@ -1,0 +1,7 @@
+name	source_url	reference	downsample_from	downsample_frac	downsample_seed	approx_bam_gb	benchmark	notes
+HG00188_30x	s3://1000genomes/1000G_2504_high_coverage/data/ERR3240174/HG00188.final.cram	grch38_decoyhla	-	-	-	22	Y	small NYGC (5th pct of 2504 samples by CRAM size)
+HG02675_30x	s3://1000genomes/1000G_2504_high_coverage/data/ERR3242389/HG02675.final.cram	grch38_decoyhla	-	-	-	25	Y	medium NYGC (50th pct); ALSO anchor for downsample series
+HG02675_20x	-	grch38_decoyhla	HG02675_30x	0.6667	1	17	Y	derived from HG02675_30x via samtools view --subsample
+HG02675_15x	-	grch38_decoyhla	HG02675_30x	0.5	2	13	Y	derived from HG02675_30x
+HG02675_4x	-	grch38_decoyhla	HG02675_30x	0.1333	3	3.5	Y	derived from HG02675_30x; smoke fixture
+HG04131_30x	s3://1000genomes/1000G_2504_high_coverage/data/ERR3243060/HG04131.final.cram	grch38_decoyhla	-	-	-	52	N	large NYGC (95th pct) - dropped from v1: ~52 GB BAM doesn't fit alongside everything else on a 220 GB NVMe (r8id.xlarge). Re-enable on a bigger box.

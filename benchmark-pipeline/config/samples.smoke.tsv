@@ -1,0 +1,3 @@
+name	source_url	reference	downsample_from	downsample_frac	downsample_seed	approx_bam_gb	benchmark	notes
+HG02675_30x	s3://1000genomes/1000G_2504_high_coverage/data/ERR3242389/HG02675.final.cram	grch38_decoyhla	-	-	-	25	N	smoke fixture parent (staged but not benchmarked)
+HG02675_4x	-	grch38_decoyhla	HG02675_30x	0.1333	3	3.5	Y	smoke fixture: only sample benchmarked in smoke

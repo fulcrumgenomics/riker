@@ -1,0 +1,31 @@
+# Smoke-test config — exercises the full pipeline on the smallest possible
+# fixture (HG02675 downsampled to 4x, ~3.5 GB BAM). Total wall time should
+# be under 30 minutes on a modern EC2 instance with local NVMe.
+#
+# This is a plumbing test: validates that staging, every tool's argv, and
+# aggregation/plotting all work end-to-end. NOT a meaningful performance
+# benchmark.
+
+samples_wgs_tsv:    config/samples.smoke.tsv
+samples_hybcap_tsv: config/samples.smoke.hybcap.tsv
+references_yaml:    config/references.yaml
+kits_yaml:          config/kits.yaml
+
+stage_dir:          stage
+results_dir:        results
+
+riker_bin:          ../target/dist/riker
+
+picard_xmx_gb:          8
+qualimap_xmx_gb:        8
+qualimap_xmx_gb_max:    16
+
+replicates:         1
+
+# Only wgs-only + wgs-bundle run by default; samples.smoke.hybcap.tsv is
+# empty so the hybcap profiles wouldn't have rows to fan out over even
+# if listed here. Add rows to that TSV (and re-add the hybcap entries
+# below) to also exercise the hybcap code paths.
+profiles_enabled: [wgs-only, wgs-bundle]
+
+staging_threads:    8
