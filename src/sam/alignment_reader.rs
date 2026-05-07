@@ -19,36 +19,46 @@
 //! [`AlignmentReader`] (sequential, front-to-back) exposes both:
 //!
 //! - [`fill_record`](AlignmentReader::fill_record) — read in place into a
-//!   pre-allocated [`RikerRecord`] slot. Works for BAM and SAM; errors on
-//!   CRAM, which noodles does not let us read in place.
+//!   pre-allocated [`RikerRecord`] slot. Works for every format.
 //! - [`riker_records`](AlignmentReader::riker_records) — owned-record
-//!   iterator. Works for every format. Use for CRAM or low-volume
-//!   callers.
+//!   iterator. Works for every format. Use for low-volume callers where
+//!   per-record allocation isn't the bottleneck.
 //!
 //! [`IndexedAlignmentReader`] is region-query-only:
 //!
 //! - [`query_for_each`](IndexedAlignmentReader::query_for_each) — stream
 //!   records overlapping a region to a callback, reusing one scratch
-//!   slot for the whole region on the BAM fast path.
+//!   slot for the whole region.
 //!
 //! Both consult a [`RikerRecordRequirements`] passed by the caller. On
-//! BAM (where aux decode is lazy) the requirements gate which decoders
-//! run; on SAM and CRAM noodles decodes eagerly so requirements are
+//! BAM and CRAM (where aux decode is lazy) the requirements gate which
+//! decoders run; on SAM noodles decodes eagerly so requirements are
 //! informational.
+//!
+//! ## CRAM via rust-htslib
+//!
+//! CRAM reads go through `rust-htslib` rather than `noodles-cram`:
+//! benchmarks on a 3.1 GB exome CRAM showed htslib decoding ~3.8× faster
+//! than noodles-cram (1.05M vs 273k records/s). htslib also handles `.crai`
+//! indexing natively. SAM and BAM remain on noodles unchanged.
+//!
+//! htslib's textual SAM header is parsed into a `noodles::sam::Header` at
+//! open time so every collector and helper sees the same `Header` type
+//! regardless of format.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use noodles::core::Region;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
-use noodles::{bam, cram, fasta, sam};
+use noodles::{bam, sam};
+use rust_htslib::bam::Read as HtsRead;
 
 use super::riker_record::{
-    AuxTagRequirements, BamRec, FallbackRec, RikerRecord, RikerRecordRequirements,
+    AuxTagRequirements, BamRec, FallbackRec, HtslibRec, RikerRecord, RikerRecordRequirements,
 };
 
 /// Capacity of the `BufReader` placed between the file and the BGZF decoder
@@ -72,12 +82,15 @@ pub struct AlignmentReader {
 }
 
 /// Format-specific reader state for [`AlignmentReader`]. One variant per
-/// supported sequential format.
+/// supported sequential format. The CRAM arm is `Box`-ed because
+/// `rust_htslib::bam::Reader` is large (a few hundred bytes of fields,
+/// dwarfing the noodles BAM/SAM readers); boxing keeps the enum small
+/// and avoids per-record copies during reader-handle moves.
 enum Inner {
     Sam(sam::io::Reader<BufReader<File>>),
     GzippedSam(Box<sam::io::Reader<BufReader<MultiGzDecoder<File>>>>),
     Bam(bam::io::Reader<bgzf::Reader<BufReader<File>>>),
-    Cram(cram::io::Reader<File>),
+    Cram(Box<rust_htslib::bam::Reader>),
 }
 
 impl AlignmentReader {
@@ -117,13 +130,18 @@ impl AlignmentReader {
             }
             AlignmentFormat::Cram => match reference {
                 Some(ref_path) => {
-                    let repo = build_repository(ref_path)?;
-                    let mut reader = cram::io::reader::Builder::default()
-                        .set_reference_sequence_repository(repo)
-                        .build_from_path(path)
+                    let mut reader = rust_htslib::bam::Reader::from_path(path)
                         .with_context(|| open_context(path))?;
-                    let header = reader.read_header().with_context(|| header_context(path))?;
-                    Ok(Self { inner: Inner::Cram(reader), header })
+                    reader.set_reference(ref_path).with_context(|| {
+                        format!(
+                            "Failed to set CRAM reference {} on {}",
+                            ref_path.display(),
+                            path.display()
+                        )
+                    })?;
+                    let header = parse_htslib_header(reader.header().as_bytes())
+                        .with_context(|| header_context(path))?;
+                    Ok(Self { inner: Inner::Cram(Box::new(reader)), header })
                 }
                 None => {
                     bail!("CRAM files require a reference FASTA (--reference): {}", path.display())
@@ -138,44 +156,33 @@ impl AlignmentReader {
         &self.header
     }
 
-    /// True iff [`fill_record`](Self::fill_record) can populate a slot
-    /// without allocating. False only for CRAM, which noodles does not
-    /// let us read in place.
-    #[must_use]
-    pub fn supports_in_place_reads(&self) -> bool {
-        !matches!(self.inner, Inner::Cram(_))
-    }
-
     /// Construct an empty [`RikerRecord`] of the variant this reader
     /// fills on its in-place path. BAM hands back [`RikerRecord::Bam`];
-    /// every other format gets [`RikerRecord::Fallback`]. Used by
-    /// callers that pre-allocate a pool of slots before reading.
+    /// CRAM hands back [`RikerRecord::Htslib`]; SAM and gzipped-SAM hand
+    /// back [`RikerRecord::Fallback`]. Used by callers that pre-allocate
+    /// a pool of slots before reading.
     #[must_use]
     pub fn empty_record(&self) -> RikerRecord {
         match self.inner {
             Inner::Bam(_) => RikerRecord::Bam(BamRec::new()),
-            Inner::Sam(_) | Inner::GzippedSam(_) | Inner::Cram(_) => {
-                RikerRecord::Fallback(FallbackRec::empty())
-            }
+            Inner::Cram(_) => RikerRecord::Htslib(HtslibRec::new()),
+            Inner::Sam(_) | Inner::GzippedSam(_) => RikerRecord::Fallback(FallbackRec::empty()),
         }
     }
 
     /// Read the next record into `slot` in place, decoding only the
     /// fields named in `requirements`. Returns `Ok(true)` on success,
-    /// `Ok(false)` at EOF.
+    /// `Ok(false)` at EOF. Works for every format.
     ///
     /// `slot`'s variant must match this reader's format — BAM readers
-    /// fill [`RikerRecord::Bam`]; SAM readers fill
+    /// fill [`RikerRecord::Bam`]; CRAM readers fill
+    /// [`RikerRecord::Htslib`]; SAM readers fill
     /// [`RikerRecord::Fallback`]. Use [`empty_record`](Self::empty_record)
     /// to pre-allocate a slot of the correct variant.
     ///
-    /// CRAM is not supported on this path; use the
-    /// [`riker_records`](Self::riker_records) iterator instead.
-    ///
     /// # Errors
-    /// Returns an error if the underlying read fails, if the slot's
-    /// variant doesn't match the reader's format, or if the reader is
-    /// CRAM.
+    /// Returns an error if the underlying read fails or if the slot's
+    /// variant doesn't match the reader's format.
     pub fn fill_record(
         &mut self,
         requirements: &RikerRecordRequirements,
@@ -191,10 +198,11 @@ impl AlignmentReader {
             (Inner::GzippedSam(reader), RikerRecord::Fallback(fb)) => {
                 fill_sam_slot(reader, &self.header, fb)
             }
-            (Inner::Cram(_), _) => {
-                bail!("fill_record does not support CRAM; iterate riker_records() instead")
+            (Inner::Cram(reader), RikerRecord::Htslib(hts_rec)) => {
+                fill_htslib_slot(reader.as_mut(), hts_rec, requirements)
             }
             (Inner::Bam(_), _) => bail!("BAM reader requires a RikerRecord::Bam slot"),
+            (Inner::Cram(_), _) => bail!("CRAM reader requires a RikerRecord::Htslib slot"),
             (Inner::Sam(_) | Inner::GzippedSam(_), _) => {
                 bail!("SAM reader requires a RikerRecord::Fallback slot")
             }
@@ -202,13 +210,12 @@ impl AlignmentReader {
     }
 
     /// Returns an iterator that yields one [`RikerRecord`] per record in
-    /// the file, allocating a fresh [`BamRec`] / [`FallbackRec`] per
-    /// yield. Works for every format. Use
-    /// [`fill_record`](Self::fill_record) for BAM/SAM hot paths instead
-    /// — `fill_record` reuses one slot across the whole loop. This
-    /// iterator is the right tool for CRAM (where in-place reads aren't
-    /// available) or low-volume callers where per-record allocation
-    /// isn't the bottleneck.
+    /// the file, allocating a fresh [`BamRec`] / [`FallbackRec`] /
+    /// [`HtslibRec`] per yield. Works for every format. Use
+    /// [`fill_record`](Self::fill_record) for hot paths instead —
+    /// `fill_record` reuses one slot across the whole loop. This
+    /// iterator is the right tool for low-volume callers where
+    /// per-record allocation isn't the bottleneck.
     pub fn riker_records<'a>(
         &'a mut self,
         requirements: &'a RikerRecordRequirements,
@@ -224,12 +231,9 @@ impl AlignmentReader {
                 let buf = result.context("Failed to read SAM record")?;
                 Ok(RikerRecord::Fallback(FallbackRec::from_record_buf(buf)))
             })),
-            Inner::Cram(reader) => Box::new(reader.records(header).map(move |result| {
-                let cram_rec = result.context("Failed to read CRAM record")?;
-                let buf = RecordBuf::try_from_alignment_record(header, &cram_rec)
-                    .context("Failed to convert CRAM record to RecordBuf")?;
-                Ok(RikerRecord::Fallback(FallbackRec::from_record_buf(buf)))
-            })),
+            Inner::Cram(reader) => {
+                Box::new(HtslibRikerRecordIter { reader: reader.as_mut(), requirements })
+            }
         }
     }
 }
@@ -252,7 +256,7 @@ pub struct IndexedAlignmentReader {
 /// Format-specific reader state for [`IndexedAlignmentReader`].
 enum IndexedInner {
     Bam(bam::io::IndexedReader<noodles_bgzf::io::Reader<File>>),
-    Cram { reader: cram::io::Reader<File>, index: cram::crai::Index },
+    Cram(Box<rust_htslib::bam::IndexedReader>),
 }
 
 impl IndexedAlignmentReader {
@@ -280,19 +284,20 @@ impl IndexedAlignmentReader {
             AlignmentFormat::Cram => match reference {
                 Some(ref_path) => {
                     validate_cram_index_exists(path)?;
-                    let repo = build_repository(ref_path)?;
-                    let crai_path = append_extension(path, ".crai");
-                    let index = cram::crai::fs::read(&crai_path).with_context(|| {
-                        format!("Failed to read CRAM index: {}", crai_path.display())
-                    })?;
-                    let mut reader = cram::io::reader::Builder::default()
-                        .set_reference_sequence_repository(repo)
-                        .build_from_path(path)
+                    let mut reader = rust_htslib::bam::IndexedReader::from_path(path)
                         .with_context(|| {
                             format!("Failed to open indexed CRAM: {}", path.display())
                         })?;
-                    let header = reader.read_header().with_context(|| header_context(path))?;
-                    Ok(Self { inner: IndexedInner::Cram { reader, index }, header })
+                    reader.set_reference(ref_path).with_context(|| {
+                        format!(
+                            "Failed to set CRAM reference {} on {}",
+                            ref_path.display(),
+                            path.display()
+                        )
+                    })?;
+                    let header = parse_htslib_header(reader.header().as_bytes())
+                        .with_context(|| header_context(path))?;
+                    Ok(Self { inner: IndexedInner::Cram(Box::new(reader)), header })
                 }
                 None => {
                     bail!("CRAM files require a reference FASTA (--reference): {}", path.display())
@@ -308,16 +313,10 @@ impl IndexedAlignmentReader {
     }
 
     /// Stream records overlapping `region` to the callback `f`,
-    /// applying `requirements` per record on the BAM fast path. CRAM
-    /// records arrive as [`RikerRecord::Fallback`] with everything
-    /// decoded.
-    ///
-    /// On BAM, a single scratch [`BamRec`] is reused across the whole
-    /// region — only the inner `bam::Record` allocations come from
-    /// noodles' query iterator, while the cigar / quality / aux mirror
-    /// buffers are recycled. CRAM still allocates one
-    /// [`FallbackRec`] per record because noodles owns the CRAM
-    /// decoder's output.
+    /// applying `requirements` per record. A single scratch
+    /// [`RikerRecord`] is reused across the whole region — the cigar /
+    /// quality / aux Vecs and (for CRAM) the htslib `bam1_t` buffer are
+    /// recycled.
     ///
     /// Callbacks return `Result<()>` so the caller can propagate
     /// errors and abort the scan early.
@@ -355,15 +354,24 @@ impl IndexedAlignmentReader {
                     f(&record)?;
                 }
             }
-            IndexedInner::Cram { reader, index } => {
-                let query = reader
-                    .query(header, index, region)
-                    .with_context(|| format!("Failed to query CRAM for region: {region}"))?;
-                for result in query {
-                    let cram_rec = result.context("Failed to read CRAM record during query")?;
-                    let buf = RecordBuf::try_from_alignment_record(header, &cram_rec)
-                        .context("Failed to convert CRAM record to RecordBuf")?;
-                    let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
+            IndexedInner::Cram(reader) => {
+                fetch_htslib_region(reader.as_mut(), region)?;
+                let mut record = RikerRecord::Htslib(HtslibRec::new());
+                // The let-else inside the loop body looks redundant
+                // (scratch is always `Htslib`), but pulling the binding
+                // outside the loop would extend the `&mut hts_rec`
+                // borrow across `f(&record)` at the bottom and conflict
+                // with the immutable borrow there. Re-binding per
+                // iteration keeps each borrow scoped tightly enough
+                // that both can coexist.
+                loop {
+                    let RikerRecord::Htslib(ref mut hts_rec) = record else {
+                        unreachable!("scratch was constructed as RikerRecord::Htslib");
+                    };
+                    if !hts_rec.read_from(reader.as_mut())? {
+                        break;
+                    }
+                    apply_requirements_htslib(hts_rec, requirements)?;
                     f(&record)?;
                 }
             }
@@ -390,6 +398,30 @@ impl<R: Read> Iterator for BamRikerRecordIter<'_, R> {
             Ok(0) => None,
             Ok(_) => match apply_requirements(&mut bam_rec, self.requirements) {
                 Ok(()) => Some(Ok(RikerRecord::Bam(bam_rec))),
+                Err(e) => Some(Err(e)),
+            },
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// CRAM-side iterator yielding [`RikerRecord::Htslib`] entries from a
+/// rust-htslib reader. Allocates one [`HtslibRec`] per yield; for hot
+/// paths use [`AlignmentReader::fill_record`] which reuses a single slot.
+struct HtslibRikerRecordIter<'a> {
+    reader: &'a mut rust_htslib::bam::Reader,
+    requirements: &'a RikerRecordRequirements,
+}
+
+impl Iterator for HtslibRikerRecordIter<'_> {
+    type Item = Result<RikerRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut hts_rec = HtslibRec::new();
+        match hts_rec.read_from(self.reader) {
+            Ok(false) => None,
+            Ok(true) => match apply_requirements_htslib(&mut hts_rec, self.requirements) {
+                Ok(()) => Some(Ok(RikerRecord::Htslib(hts_rec))),
                 Err(e) => Some(Err(e)),
             },
             Err(e) => Some(Err(e)),
@@ -458,13 +490,93 @@ fn apply_requirements(bam_rec: &mut BamRec, requirements: &RikerRecordRequiremen
     Ok(())
 }
 
-/// Build a `fasta::Repository` from an indexed FASTA path for CRAM decoding.
-pub(crate) fn build_repository(ref_path: &Path) -> Result<fasta::Repository> {
-    let reader = fasta::io::indexed_reader::Builder::default()
-        .build_from_path(ref_path)
-        .with_context(|| format!("Failed to open reference FASTA: {}", ref_path.display()))?;
+/// Read one CRAM record into `hts_rec` and apply `requirements`. Used
+/// by the sequential [`AlignmentReader::fill_record`] path. The
+/// generic bound makes it callable on either rust-htslib reader type;
+/// the indexed path inlines the same two-line body directly inside
+/// [`IndexedAlignmentReader::query_for_each`] because it has its own
+/// loop shape.
+fn fill_htslib_slot<R: HtsRead>(
+    reader: &mut R,
+    hts_rec: &mut HtslibRec,
+    requirements: &RikerRecordRequirements,
+) -> Result<bool> {
+    if !hts_rec.read_from(reader)? {
+        return Ok(false);
+    }
+    apply_requirements_htslib(hts_rec, requirements)?;
+    Ok(true)
+}
 
-    Ok(fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(reader)))
+/// CRAM analogue of [`apply_requirements`]: decode sequence bytes
+/// and/or scan the requested aux tags on a freshly-read [`HtslibRec`].
+fn apply_requirements_htslib(
+    hts_rec: &mut HtslibRec,
+    requirements: &RikerRecordRequirements,
+) -> Result<()> {
+    if requirements.needs_sequence() {
+        hts_rec.decode_sequence();
+    }
+    match requirements.aux_tags() {
+        AuxTagRequirements::None => {}
+        AuxTagRequirements::Specific { values, presence } => {
+            hts_rec.scan_aux_tags(values, presence)?;
+        }
+        AuxTagRequirements::All => {
+            hts_rec.decode_all_aux()?;
+        }
+    }
+    Ok(())
+}
+
+/// Translate a noodles `Region` into a fetch on a rust-htslib indexed
+/// reader. Uses the contig name (not a noodles-side tid lookup) so the
+/// htslib reader resolves the index against its own header view.
+fn fetch_htslib_region(
+    reader: &mut rust_htslib::bam::IndexedReader,
+    region: &Region,
+) -> Result<()> {
+    use noodles::core::region::Interval;
+    use rust_htslib::bam::FetchDefinition;
+
+    let name = region.name();
+    let interval: Interval = region.interval();
+    // htslib bounds are 0-based half-open `[start, stop)` as `i64`.
+    // The unbounded-interval branches use 0 / i64::MAX (start of contig
+    // / end of contig); the `try_from` failure branches `.expect()` the
+    // conversion because no real genomic position approaches i64::MAX
+    // (it would imply contigs >9.2 billion bases). Marking the
+    // unreachable case explicitly is clearer than the prior asymmetric
+    // `unwrap_or(0)` / `unwrap_or(i64::MAX)`.
+    let start: i64 = interval
+        .start()
+        .map_or(0, |p| i64::try_from(usize::from(p) - 1).expect("genomic position fits in i64"));
+    let stop: i64 = interval
+        .end()
+        .map_or(i64::MAX, |p| i64::try_from(usize::from(p)).expect("genomic position fits in i64"));
+
+    reader
+        .fetch(FetchDefinition::RegionString(name, start, stop))
+        .with_context(|| format!("Failed to fetch CRAM region: {region}"))
+}
+
+/// Parse htslib's textual SAM header bytes into a `noodles::sam::Header`.
+/// Done at open time so the rest of the pipeline can keep using the
+/// noodles `Header` type — every collector, helper, and `Region` query
+/// downstream is already parameterised on it.
+fn parse_htslib_header(header_bytes: &[u8]) -> Result<Header> {
+    // htslib's `HeaderView::as_bytes()` returns an empty slice when
+    // `sam_hdr_str()` returns NULL — i.e. when the CRAM has no parsed
+    // header at all. noodles' `read_header()` would silently produce
+    // an empty `Header` from those zero bytes; reject it explicitly so
+    // a malformed CRAM surfaces as an error instead of an empty
+    // reference list that silently mis-attributes records to whatever
+    // contig index 0 happens to mean elsewhere.
+    if header_bytes.is_empty() {
+        bail!("CRAM file has an empty SAM header — refusing to read records against it");
+    }
+    let mut parser = sam::io::Reader::new(Cursor::new(header_bytes));
+    parser.read_header().context("Failed to parse SAM header text from CRAM")
 }
 
 /// Detected alignment file format based on extension.
@@ -539,16 +651,28 @@ fn validate_bam_index_exists(path: &Path) -> Result<()> {
     );
 }
 
-/// Confirm that `path`.crai exists.
+/// Confirm that an index for the CRAM at `path` exists in either of
+/// the two layouts htslib auto-discovers:
+///
+/// - `<file>.cram.crai` (suffix appended) — `samtools index`'s default
+/// - `<file>.crai`      (extension replaced — sibling) — Picard's default
+///
+/// Mirrors [`validate_bam_index_exists`]'s two-form check; htslib will
+/// happily open either, so rejecting one would surface a confusing
+/// "CRAM index not found" error for an index htslib would have used.
+/// The pre-check exists to give a friendlier error than htslib's
+/// generic open failure.
 fn validate_cram_index_exists(path: &Path) -> Result<()> {
-    let crai = append_extension(path, ".crai");
-    if crai.exists() {
+    let crai_sibling = path.with_extension("crai");
+    let crai_suffix = append_extension(path, ".crai");
+    if crai_suffix.exists() || crai_sibling.exists() {
         return Ok(());
     }
     bail!(
-        "CRAM index not found. Expected: {}\n\
+        "CRAM index not found. Expected one of:\n  {}\n  {}\n\
          Run `samtools index {}` to create one.",
-        crai.display(),
+        crai_suffix.display(),
+        crai_sibling.display(),
         path.display(),
     );
 }
