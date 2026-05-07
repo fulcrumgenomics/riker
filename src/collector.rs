@@ -64,9 +64,8 @@ pub trait Collector: Send {
 
 /// Drive a single reader through a single collector's full lifecycle:
 /// `initialize(header)` → stream every record through `accept` → `finish()`.
-/// Uses [`AlignmentReader::fill_record`] for BAM/SAM (no per-record
-/// allocation) and falls back to [`AlignmentReader::riker_records`] for
-/// CRAM (which noodles does not let us read in place).
+/// Uses [`AlignmentReader::fill_record`] for every format (no per-record
+/// allocation).
 ///
 /// `progress.finish()` is called unconditionally before returning, so the
 /// "Processed N total" line appears on both the success and error paths.
@@ -113,18 +112,10 @@ fn drive_records(
     header: &Header,
 ) -> Result<()> {
     let requirements = collector.field_needs();
-    if reader.supports_in_place_reads() {
-        let mut record = reader.empty_record();
-        while reader.fill_record(&requirements, &mut record)? {
-            progress.record_with(&record, header);
-            collector.accept(&record, header)?;
-        }
-    } else {
-        for result in reader.riker_records(&requirements) {
-            let record = result?;
-            progress.record_with(&record, header);
-            collector.accept(&record, header)?;
-        }
+    let mut record = reader.empty_record();
+    while reader.fill_record(&requirements, &mut record)? {
+        progress.record_with(&record, header);
+        collector.accept(&record, header)?;
     }
     Ok(())
 }

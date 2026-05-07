@@ -13,9 +13,14 @@
 //!
 //! [`RikerRecord`] solves both problems:
 //!
-//! 1. It's an **enum** with one variant wrapping `bam::Record` (the BAM
-//!    fast path — lazy aux data) and one wrapping `RecordBuf` (the
-//!    fallback for SAM and CRAM, where noodles already decodes eagerly).
+//! 1. It's an **enum** with one variant per source format:
+//!    - [`RikerRecord::Bam`] wraps a noodles `bam::Record` (the BAM fast
+//!      path — lazy aux data).
+//!    - [`RikerRecord::Fallback`] wraps a noodles `RecordBuf` (used for
+//!      SAM, where noodles decodes eagerly anyway).
+//!    - [`RikerRecord::Htslib`] wraps a `rust_htslib::bam::Record` (used
+//!      for CRAM, where rust-htslib decodes ~3.8× faster than
+//!      noodles-cram on real-world inputs; SAM and BAM stay on noodles).
 //! 2. **Scalars are validated once at construction** and cached, so the
 //!    downstream accessors return `Flags`, `Option<usize>`, `Option<Position>`
 //!    etc. directly — never `Result<_>`. Malformed records surface as an
@@ -23,9 +28,9 @@
 //!
 //! ## Enum vs. trait dispatch
 //!
-//! For two variants with small, frequently-called accessors, a `match` is
-//! typically faster than a vtable indirection: each arm inlines at its
-//! call site and the branch predictor pins the dominant variant in
+//! For three variants with small, frequently-called accessors, a `match`
+//! is typically faster than a vtable indirection: each arm inlines at
+//! its call site and the branch predictor pins the dominant variant in
 //! homogeneous inputs (which is what riker sees — one file type per run).
 //! Generics / monomorphisation would work too but would force every
 //! downstream function to become generic.
@@ -34,18 +39,21 @@
 //!
 //! [`BamRec::read_from`] reads the next BAM record directly into an
 //! existing [`BamRec`], reusing the underlying `bam::Record`'s byte
-//! buffer. Cached scalars are refreshed in the same call. The
-//! [`RikerRecord::Fallback`] variant reuses a `RecordBuf` the same way.
+//! buffer. Cached scalars are refreshed in the same call.
+//! [`RikerRecord::Fallback`] reuses a `RecordBuf` the same way, and
+//! [`RikerRecord::Htslib`] reuses htslib's C-allocated `bam1_t` via
+//! [`HtslibRec::read_from`].
 //!
 //! ## Expensive fields are opt-in
 //!
-//! The BAM fast path supports three decoder-driven fields — sequence
-//! bases, aux tags (targeted), and aux tags (full). Consumers opt into
-//! each via their [`RikerRecordRequirements`]; the reader
+//! The BAM and CRAM fast paths support three decoder-driven fields —
+//! sequence bases, aux tags (targeted), and aux tags (full). Consumers
+//! opt into each via their [`RikerRecordRequirements`]; the reader
 //! ([`crate::sam::alignment_reader::AlignmentReader::fill_record`] and
 //! friends) consults the requirements and calls the matching fillers on
-//! [`BamRec`] ([`BamRec::decode_sequence`],
-//! [`BamRec::scan_aux_tags`], [`BamRec::decode_all_aux`]).
+//! [`BamRec`] / [`HtslibRec`] ([`BamRec::decode_sequence`],
+//! [`BamRec::scan_aux_tags`], [`BamRec::decode_all_aux`] and the
+//! identically-named methods on [`HtslibRec`]).
 
 use std::collections::BTreeSet;
 
@@ -58,6 +66,7 @@ use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::cigar::Op;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::{Flags, MappingQuality};
+use rust_htslib::bam::record::{Aux as HtsAux, Record as HtsRecord};
 use smallvec::SmallVec;
 
 /// BAM aux tag — two ASCII bytes, e.g. `*b"NM"` for the edit-distance tag.
@@ -65,30 +74,35 @@ pub type TagKey = [u8; 2];
 
 // ─── RikerRecord ─────────────────────────────────────────────────────────────
 
-/// Alignment record that can come from either a BAM fast path
-/// ([`BamRec`], with lazy aux data) or a generic fallback ([`FallbackRec`])
-/// used for SAM and CRAM. See the module-level docs for why this is an
-/// enum and not a trait.
+/// Alignment record. One variant per source format: [`BamRec`] for the
+/// BAM fast path (lazy aux data), [`FallbackRec`] for SAM
+/// (noodles' `RecordBuf` — eager decode), and [`HtslibRec`] for CRAM
+/// (rust-htslib, ~3.8× faster than noodles-cram). See the module-level
+/// docs for why this is an enum and not a trait.
 ///
-/// `BamRec` is intentionally larger than `FallbackRec` (cigar / quality
-/// mirror buffers, aux store, etc) — boxing it would force a per-record
-/// heap allocation and defeat the in-place fill loop the entire design
-/// is built around. The size delta is a deliberate trade.
+/// `BamRec` and `HtslibRec` are intentionally larger than `FallbackRec`
+/// — they own cigar / quality / aux mirror buffers and decode caches
+/// that the in-place fill loop reuses across records. Boxing either
+/// would force a per-record heap allocation and defeat that design.
+/// The size delta is a deliberate trade.
 #[allow(clippy::large_enum_variant, reason = "see docstring above")]
 #[derive(Clone)]
 pub enum RikerRecord {
     /// BAM records: the underlying `bam::Record` holds raw bytes and
     /// defers aux-tag decoding until a filler is invoked.
     Bam(BamRec),
-    /// SAM/CRAM records: a fully-decoded `RecordBuf`. No decode savings
-    /// here, but the type-level split lets `Bam` stay fast in the common
-    /// case.
+    /// SAM records: a fully-decoded `RecordBuf`. No decode savings here,
+    /// but the type-level split lets `Bam` stay fast in the common case.
     Fallback(FallbackRec),
+    /// CRAM records: a `rust_htslib::bam::Record` (htslib decodes
+    /// CRAM ~3.8× faster than noodles-cram on real-world inputs).
+    Htslib(HtslibRec),
 }
 
 impl RikerRecord {
-    /// Build a [`RikerRecord::Fallback`] from any `sam::alignment::Record`
-    /// (used for CRAM, where noodles reads records as trait objects).
+    /// Build a [`RikerRecord::Fallback`] from any `sam::alignment::Record`.
+    /// Used by tests that want a generic conversion path; production
+    /// CRAM goes through [`RikerRecord::Htslib`] instead.
     ///
     /// # Errors
     /// Returns an error if the source record can't be converted to a
@@ -111,6 +125,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.flags,
             Self::Fallback(r) => r.inner.flags(),
+            Self::Htslib(r) => r.flags(),
         }
     }
 
@@ -121,6 +136,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.ref_id,
             Self::Fallback(r) => r.inner.reference_sequence_id(),
+            Self::Htslib(r) => r.reference_sequence_id(),
         }
     }
 
@@ -131,6 +147,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.pos,
             Self::Fallback(r) => r.inner.alignment_start(),
+            Self::Htslib(r) => r.alignment_start(),
         }
     }
 
@@ -146,6 +163,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.alignment_end,
             Self::Fallback(r) => r.alignment_end,
+            Self::Htslib(r) => r.alignment_end(),
         }
     }
 
@@ -156,6 +174,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.mapq,
             Self::Fallback(r) => r.inner.mapping_quality(),
+            Self::Htslib(r) => r.mapping_quality(),
         }
     }
 
@@ -167,6 +186,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.mate_ref_id,
             Self::Fallback(r) => r.inner.mate_reference_sequence_id(),
+            Self::Htslib(r) => r.mate_reference_sequence_id(),
         }
     }
 
@@ -177,6 +197,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.mate_pos,
             Self::Fallback(r) => r.inner.mate_alignment_start(),
+            Self::Htslib(r) => r.mate_alignment_start(),
         }
     }
 
@@ -187,6 +208,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.tlen,
             Self::Fallback(r) => r.inner.template_length(),
+            Self::Htslib(r) => r.template_length(),
         }
     }
 
@@ -204,6 +226,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.inner.name(),
             Self::Fallback(r) => r.inner.name(),
+            Self::Htslib(r) => r.name(),
         }
     }
 
@@ -214,6 +237,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => &r.quality_bytes,
             Self::Fallback(r) => r.inner.quality_scores().as_ref(),
+            Self::Htslib(r) => r.quality_scores(),
         }
     }
 
@@ -227,6 +251,10 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => CigarOps::Bam(r.cigar_bytes.chunks_exact(4)),
             Self::Fallback(r) => CigarOps::Fallback(r.inner.cigar().as_ref().iter()),
+            // htslib stores CIGAR as native-endian `u32`s with the same
+            // packing as BAM; on LE targets (enforced at file scope) the
+            // bytes are identical and reuse `CigarOps::Bam`'s decoder.
+            Self::Htslib(r) => CigarOps::Bam(r.cigar_bytes().chunks_exact(4)),
         }
     }
 
@@ -236,6 +264,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.cigar_bytes.len() / 4,
             Self::Fallback(r) => r.inner.cigar().as_ref().len(),
+            Self::Htslib(r) => r.cigar_len(),
         }
     }
 
@@ -248,6 +277,7 @@ impl RikerRecord {
         match self {
             Self::Bam(r) => r.inner.sequence().len(),
             Self::Fallback(r) => r.inner.sequence().len(),
+            Self::Htslib(r) => r.sequence_len(),
         }
     }
 
@@ -281,6 +311,7 @@ impl RikerRecord {
                 if r.sequence_populated { r.sequence_buf.as_slice() } else { &[] }
             }
             Self::Fallback(r) => r.inner.sequence().as_ref(),
+            Self::Htslib(r) => r.sequence(),
         }
     }
 
@@ -320,6 +351,7 @@ impl RikerRecord {
                 let value = r.inner.data().get(&tag_obj)?;
                 record_buf_value_to_aux(value)
             }
+            Self::Htslib(r) => r.aux_tag(tag),
         }
     }
 
@@ -342,6 +374,7 @@ impl RikerRecord {
                 let tag_obj = sam::alignment::record::data::field::Tag::from(tag);
                 r.inner.data().get(&tag_obj).is_some()
             }
+            Self::Htslib(r) => r.has_aux_tag(tag),
         }
     }
 }
@@ -577,9 +610,8 @@ impl BamRec {
 
 // ─── FallbackRec ────────────────────────────────────────────────────────────
 
-/// SAM/CRAM-backed record. Wraps a fully-decoded `RecordBuf` — the
-/// decode cost is already paid by noodles for these formats, so we
-/// don't pretend there's a fast path here.
+/// SAM-backed record. Wraps a fully-decoded `RecordBuf` — noodles
+/// decodes SAM eagerly, so there's no fast path to chase here.
 ///
 /// `RecordBuf`'s own accessors are all infallible (`Option<usize>`,
 /// `Option<Position>`, etc.), so the enum arm just delegates straight
@@ -635,6 +667,350 @@ impl FallbackRec {
 
 // No public `Default` for `FallbackRec`: same reasoning as `BamRec`
 // above — `empty()` is `pub(crate)` so external callers can't fill it.
+
+// ─── HtslibRec ──────────────────────────────────────────────────────────────
+
+/// CRAM-backed record. Wraps `rust_htslib::bam::Record` (a thin Rust
+/// wrapper around htslib's C `bam1_t`).
+///
+/// Unlike `BamRec`, almost no scalar caching is needed. `BamRec` mirrors
+/// scalars because noodles exposes them as `Option<io::Result<…>>`, which
+/// is too awkward to bubble through every accessor. htslib's getters
+/// return plain values directly, so each `RikerRecord` accessor delegates
+/// to a single htslib call. The only cached field is `alignment_end`,
+/// which the mate-buffer hot path expects in O(1).
+///
+/// Sequence and aux tags follow the same opt-in decoder pattern as
+/// `BamRec` — `decode_sequence` / `scan_aux_tags` / `decode_all_aux`
+/// populate them on demand based on `RikerRecordRequirements`.
+///
+/// Endianness: htslib stores the CIGAR as native-endian `u32`s with the
+/// same `(len << 4) | op` packing as BAM. On little-endian targets that's
+/// byte-identical to BAM's on-wire encoding, so we reuse the existing
+/// `CigarOps::Bam` (LE-bytes) decoder via a `bytemuck` cast. A compile-time
+/// check guards against ever building this on a big-endian target.
+#[cfg(target_endian = "little")]
+const _: () = ();
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "HtslibRec assumes a little-endian target (htslib raw_cigar() is native-endian u32)"
+);
+
+#[derive(Clone)]
+pub struct HtslibRec {
+    /// Underlying htslib record. Owns the C-allocated `bam1_t` buffer.
+    inner: HtsRecord,
+
+    /// 1-based inclusive alignment end, computed from `pos` + cigar
+    /// reference span. `None` when unmapped or the cigar has no
+    /// reference-consuming ops. Cached because the mate buffer reads
+    /// this per record and `RecordBuf::alignment_end()` would walk the
+    /// CIGAR every call.
+    alignment_end: Option<Position>,
+
+    // ── Optional, filler-driven fields ──────────────────────────────────────
+    // Same shape as BamRec — populated on demand by `decode_sequence`,
+    // `scan_aux_tags`, `decode_all_aux`. Reset to "not populated" inside
+    // `refresh_cache` so accessors can distinguish "not populated this
+    // record" from a stale hit.
+    /// Decoded ASCII sequence bases. Backing `Vec` is reused across reads.
+    sequence_buf: Vec<u8>,
+    sequence_populated: bool,
+    /// Store for decoded aux tag values. Cleared on each read.
+    aux_store: AuxTagStore,
+    aux_populated: bool,
+    /// Tags observed for presence-only requests. Same `SmallVec` rationale
+    /// as `BamRec`.
+    aux_present: SmallVec<[TagKey; 4]>,
+}
+
+impl HtslibRec {
+    /// Build an empty, default-initialised record. Intended to be
+    /// populated via [`Self::read_from`] in a reuse loop.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: HtsRecord::new(),
+            alignment_end: None,
+            sequence_buf: Vec::new(),
+            sequence_populated: false,
+            aux_store: AuxTagStore::new(),
+            aux_populated: false,
+            aux_present: SmallVec::new(),
+        }
+    }
+
+    /// Read the next record directly from any rust-htslib reader (sequential
+    /// `Reader` or `IndexedReader`) into `self`, reusing this struct's
+    /// allocations. Returns `Ok(true)` on success, `Ok(false)` at EOF.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying read fails or the record's
+    /// scalars can't be validated.
+    pub(crate) fn read_from<R: rust_htslib::bam::Read>(&mut self, reader: &mut R) -> Result<bool> {
+        match reader.read(&mut self.inner) {
+            None => Ok(false),
+            Some(result) => {
+                result.context("Failed to read CRAM record")?;
+                self.refresh_cache()?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Decode the sequence bases into `self.sequence_buf` using the SIMD
+    /// nibble decoder. htslib's `seq().encoded` is the same packed-nibble
+    /// layout as BAM, so the noodles-side decoder works unmodified.
+    pub(crate) fn decode_sequence(&mut self) {
+        let seq = self.inner.seq();
+        super::simd_seq::decode_packed_sequence_into(
+            seq.encoded,
+            seq.len(),
+            &mut self.sequence_buf,
+        );
+        self.sequence_populated = true;
+    }
+
+    /// Scan the aux block once. Tags in `values` are decoded into
+    /// `self.aux_store`; tags in `presence` are recorded in
+    /// `self.aux_present` without their payloads being parsed.
+    ///
+    /// # Errors
+    /// Returns an error if the aux block is malformed.
+    pub(crate) fn scan_aux_tags(
+        &mut self,
+        values: &BTreeSet<TagKey>,
+        presence: &BTreeSet<TagKey>,
+    ) -> Result<()> {
+        for result in self.inner.aux_iter() {
+            let (tag_slice, aux) = result.context("Failed to parse aux field on CRAM record")?;
+            let tag: TagKey = tag_slice.try_into().context("aux tag was not exactly 2 bytes")?;
+            if values.contains(&tag) {
+                if let Some(value) = htslib_aux_to_value(&aux) {
+                    self.aux_store.insert(tag, value);
+                }
+            } else if presence.contains(&tag) && !self.aux_present.contains(&tag) {
+                self.aux_present.push(tag);
+            }
+        }
+        self.aux_populated = true;
+        Ok(())
+    }
+
+    /// Decode every aux tag in the record into `self.aux_store`.
+    ///
+    /// # Errors
+    /// Returns an error if any aux field can't be decoded.
+    pub(crate) fn decode_all_aux(&mut self) -> Result<()> {
+        for result in self.inner.aux_iter() {
+            let (tag_slice, aux) = result.context("Failed to parse aux field on CRAM record")?;
+            let tag: TagKey = tag_slice.try_into().context("aux tag was not exactly 2 bytes")?;
+            if let Some(value) = htslib_aux_to_value(&aux) {
+                self.aux_store.insert(tag, value);
+            }
+        }
+        self.aux_populated = true;
+        Ok(())
+    }
+
+    /// Re-read the cached `alignment_end` and validate the CIGAR codes.
+    /// Called by [`Self::read_from`] after each successful read.
+    fn refresh_cache(&mut self) -> Result<()> {
+        let cigar_bytes = self.cigar_bytes();
+        validate_cigar_codes(cigar_bytes)?;
+        self.alignment_end = compute_alignment_end(self.alignment_start(), cigar_bytes)?;
+
+        // Invalidate decoder-driven caches so accessors see "not
+        // populated for this record" until a filler is called.
+        self.sequence_populated = false;
+        self.aux_populated = false;
+        self.aux_store.clear();
+        self.aux_present.clear();
+
+        Ok(())
+    }
+
+    // ── Internal accessor helpers (no caching — direct htslib delegation) ──
+    // These are called from the `RikerRecord::Htslib(_)` match arms in
+    // `impl RikerRecord`. Keeping them here lets each `RikerRecord` arm be
+    // a one-liner.
+
+    pub(crate) fn flags(&self) -> Flags {
+        // `from_bits_truncate` drops bits outside the SAM-defined set,
+        // matching what noodles does on the BAM path (so `BamRec::flags`
+        // and `HtslibRec::flags` are observationally identical for any
+        // standards-conformant input). All standard SAM flag bits are
+        // already defined, so this only differs from `from_bits_retain`
+        // for malformed records.
+        Flags::from_bits_truncate(self.inner.flags())
+    }
+
+    pub(crate) fn reference_sequence_id(&self) -> Option<usize> {
+        // htslib stores -1 as the "no reference sequence" / unmapped
+        // sentinel (BAM spec convention); everything else is a 0-based
+        // index into the reference list.
+        let tid = self.inner.tid();
+        if tid < 0 { None } else { usize::try_from(tid).ok() }
+    }
+
+    pub(crate) fn alignment_start(&self) -> Option<Position> {
+        let pos = self.inner.pos();
+        if pos < 0 {
+            return None;
+        }
+        // pos is 0-based; Position is 1-based.
+        usize::try_from(pos).ok().and_then(|p| p.checked_add(1)).and_then(Position::new)
+    }
+
+    pub(crate) fn alignment_end(&self) -> Option<Position> {
+        self.alignment_end
+    }
+
+    pub(crate) fn mapping_quality(&self) -> Option<MappingQuality> {
+        MappingQuality::new(self.inner.mapq())
+    }
+
+    pub(crate) fn mate_reference_sequence_id(&self) -> Option<usize> {
+        // -1 sentinel: see `reference_sequence_id`.
+        let tid = self.inner.mtid();
+        if tid < 0 { None } else { usize::try_from(tid).ok() }
+    }
+
+    pub(crate) fn mate_alignment_start(&self) -> Option<Position> {
+        let pos = self.inner.mpos();
+        if pos < 0 {
+            return None;
+        }
+        usize::try_from(pos).ok().and_then(|p| p.checked_add(1)).and_then(Position::new)
+    }
+
+    pub(crate) fn template_length(&self) -> i32 {
+        // BAM stores TLEN as i32; htslib widens to i64. Clamp to the
+        // i32 range — `try_from(_).unwrap_or(i32::MAX)` would silently
+        // sign-flip very-negative values to `+i32::MAX`. Out-of-range
+        // values would already be malformed at the BAM/CRAM source;
+        // clamping just preserves sign on the failure path. The
+        // post-clamp `try_from` cannot fail.
+        let clamped = self.inner.insert_size().clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        i32::try_from(clamped).expect("value clamped to i32 range")
+    }
+
+    pub(crate) fn name(&self) -> Option<&BStr> {
+        // htslib's `qname()` strips the trailing NUL but does NOT strip
+        // the BAM "no-name" sentinel: a record with no read name stores
+        // a literal `*` (followed by NUL) in BAM, which surfaces as
+        // `b"*"` here. noodles maps both `*` and the empty case to
+        // `None` for `BamRec`; mirror that behaviour. The empty arm is
+        // defensive: htslib should never produce one in a valid record.
+        let q = self.inner.qname();
+        if q.is_empty() || q == b"*" { None } else { Some(BStr::new(q)) }
+    }
+
+    pub(crate) fn quality_scores(&self) -> &[u8] {
+        // BAM uses `0xFF * l_seq` to mean "quality scores absent". noodles
+        // BAM detects that and surfaces an empty slice; mirror that here
+        // so collectors that gate on `quality_scores().is_empty()` (or
+        // apply `min_bq` filters) treat absent quality consistently
+        // across BAM and CRAM. Linear scan is bounded by `seq_len` and
+        // only matters for records that actually have qualities; the
+        // common case short-circuits on the first non-`0xFF` byte.
+        let q = self.inner.qual();
+        if !q.is_empty() && q.iter().all(|&b| b == 0xFF) { &[] } else { q }
+    }
+
+    /// CIGAR bytes in BAM-packed LE-`u32` form, viewed over htslib's
+    /// native `&[u32]`. Safe to feed directly into the existing
+    /// `CigarOps::Bam` iterator (the file-level cfg above guarantees
+    /// little-endian).
+    ///
+    /// Long-CIGAR records (>65,535 ops) are handled by htslib transparently:
+    /// `sam_read1` calls `bam_tag2cigar`, which moves the real CIGAR out of
+    /// the `CG:B:I` aux tag and into the record's CIGAR slot, then strips
+    /// the placeholder. By the time the record reaches us, `raw_cigar()`
+    /// already returns the resolved CIGAR. The mechanism has been in
+    /// htslib since the long-CIGAR support landed (htslib >= 1.7); the
+    /// bundled `hts-sys` we link against is well past that.
+    pub(crate) fn cigar_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(self.inner.raw_cigar())
+    }
+
+    /// Number of CIGAR operations. Delegates to htslib's `n_cigar`
+    /// (its native op count) rather than computing from the byte view —
+    /// avoids the visual ambiguity of `cigar_bytes().len() / 4`. See
+    /// [`Self::cigar_bytes`] for the long-CIGAR resolution note.
+    pub(crate) fn cigar_len(&self) -> usize {
+        self.inner.cigar_len()
+    }
+
+    pub(crate) fn sequence_len(&self) -> usize {
+        self.inner.seq_len()
+    }
+
+    pub(crate) fn sequence(&self) -> &[u8] {
+        // Same load-bearing `if` as BamRec: the buffer is reused across
+        // records, so without this we'd surface the previous record's
+        // bases when the consumer didn't request sequence.
+        if self.sequence_populated { self.sequence_buf.as_slice() } else { &[] }
+    }
+
+    pub(crate) fn aux_tag(&self, tag: TagKey) -> Option<AuxValue> {
+        if self.aux_populated { self.aux_store.get(tag).cloned() } else { None }
+    }
+
+    pub(crate) fn has_aux_tag(&self, tag: TagKey) -> bool {
+        self.aux_populated && (self.aux_store.get(tag).is_some() || self.aux_present.contains(&tag))
+    }
+}
+
+// No public `Default` for `HtslibRec`: same reasoning as `BamRec` and
+// `FallbackRec` — `new()` is `pub(crate)` so external callers can't fill
+// it.
+
+/// Map a `rust_htslib::bam::record::Aux` to our `AuxValue`. Integer
+/// widths collapse into a single `Int(i64)` (matching the BAM scanner
+/// and `record_buf_value_to_aux`). Returns `None` for `B:`-typed array
+/// values, which `AuxValue` doesn't model — same fall-through that
+/// `record_buf_value_to_aux` gives `Value::Array`.
+///
+/// `Double` (BAM `d:` — non-standard, only emitted by some htslib
+/// writers) is collapsed into `Float` for parity with `AuxValue`'s
+/// existing model. The truncation is acceptable: no riker collector
+/// reads a `d:`-typed tag, and the value would already be unrepresentable
+/// in a SAM-spec-conformant tool's output.
+///
+/// Known divergence from the BAM/SAM paths: `H:`-typed (hex byte array)
+/// tags surface as `AuxValue::String` rather than `AuxValue::Hex`.
+/// rust-htslib's `read_aux_field` collapses both `Z` and `H` type bytes
+/// into `Aux::String(&str)` (see rust-htslib `bam/record.rs`,
+/// `read_aux_field`). The `HtsAux::HexByteArray` arm below is therefore
+/// unreachable on the read path; it exists for completeness only. No
+/// riker collector currently reads `H:` tags, so the inconsistency is
+/// theoretical — flagged here so a future caller doesn't trust
+/// `AuxValue::Hex` distinguishability across formats.
+fn htslib_aux_to_value(aux: &HtsAux<'_>) -> Option<AuxValue> {
+    Some(match *aux {
+        HtsAux::Char(c) => AuxValue::Character(c),
+        HtsAux::I8(n) => AuxValue::Int(i64::from(n)),
+        HtsAux::U8(n) => AuxValue::Int(i64::from(n)),
+        HtsAux::I16(n) => AuxValue::Int(i64::from(n)),
+        HtsAux::U16(n) => AuxValue::Int(i64::from(n)),
+        HtsAux::I32(n) => AuxValue::Int(i64::from(n)),
+        HtsAux::U32(n) => AuxValue::Int(i64::from(n)),
+        HtsAux::Float(f) => AuxValue::Float(f),
+        #[allow(clippy::cast_possible_truncation, reason = "see fn doc")]
+        HtsAux::Double(f) => AuxValue::Float(f as f32),
+        HtsAux::String(s) => AuxValue::String(s.as_bytes().to_vec()),
+        HtsAux::HexByteArray(s) => AuxValue::Hex(s.as_bytes().to_vec()),
+        // Array-typed values aren't modelled in `AuxValue`.
+        HtsAux::ArrayI8(_)
+        | HtsAux::ArrayU8(_)
+        | HtsAux::ArrayI16(_)
+        | HtsAux::ArrayU16(_)
+        | HtsAux::ArrayI32(_)
+        | HtsAux::ArrayU32(_)
+        | HtsAux::ArrayFloat(_) => return None,
+    })
+}
 
 // ─── CigarOps iterator ──────────────────────────────────────────────────────
 

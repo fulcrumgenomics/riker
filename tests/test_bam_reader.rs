@@ -102,17 +102,13 @@ fn test_bamrec_alignment_end_matches_cigar_span() -> Result<()> {
     Ok(())
 }
 
-/// CRAM round-trip: write a small CRAM via `SamBuilder::to_temp_cram`,
-/// open it with `AlignmentReader::open`, iterate records via
-/// `riker_records`, and check that the records survive the encode /
-/// decode and surface as `RikerRecord::Fallback` with their
-/// flags/positions/cigar intact.
-///
-/// CRAM lacks an in-place reader path, so this test exercises the
-/// allocate-per-record `riker_records` iterator instead of
-/// `fill_record`.
+/// CRAM round-trip via `fill_record`: write a small CRAM via
+/// `SamBuilder::to_temp_cram`, open it with `AlignmentReader::open`,
+/// fill records in place into a `RikerRecord::Htslib` slot, and check
+/// they survive the encode/decode with their flags/positions/cigar
+/// intact. Exercises the rust-htslib backend.
 #[test]
-fn test_cram_roundtrip_via_riker_records() -> Result<()> {
+fn test_cram_roundtrip_via_fill_record() -> Result<()> {
     use helpers::{FastaBuilder, coord_builder};
 
     let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
@@ -122,15 +118,19 @@ fn test_cram_roundtrip_via_riker_records() -> Result<()> {
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
-    assert!(!reader.supports_in_place_reads(), "CRAM should not advertise in-place reads");
 
     let requirements = RikerRecordRequirements::NONE;
+    let mut record = reader.empty_record();
+    // Variant check runs before the first `fill_record`, so what we're
+    // locking in is that `empty_record()` allocated the right variant
+    // for this format — not the type of the filled records (those reuse
+    // this same slot).
+    let RikerRecord::Htslib(_) = &record else {
+        panic!("expected RikerRecord::Htslib for CRAM input");
+    };
+
     let mut count = 0;
-    for result in reader.riker_records(&requirements) {
-        let record = result?;
-        let RikerRecord::Fallback(_) = &record else {
-            panic!("expected RikerRecord::Fallback for CRAM input");
-        };
+    while reader.fill_record(&requirements, &mut record)? {
         assert!(record.alignment_start().is_some(), "alignment_start should be Some");
         assert!(record.cigar_len() > 0, "cigar should be non-empty");
         count += 1;
@@ -140,12 +140,9 @@ fn test_cram_roundtrip_via_riker_records() -> Result<()> {
     Ok(())
 }
 
-/// CRAM via `multi`: covers the parallel reader's CRAM path
-/// (`run_iterator_reader` + one-way `RecyclableBatch`s with
-/// `return_tx: None`). We don't run multi end-to-end here — that
-/// pipeline is exercised by `test_multi.rs` for BAM. This test
-/// confirms the CRAM single-collector flow round-trips through
-/// `drive_collector_single_threaded`.
+/// CRAM via `drive_collector_single_threaded`: confirms the CRAM
+/// single-collector flow round-trips through the
+/// `fill_record`-driven loop in [`drive_records`].
 #[test]
 fn test_cram_drives_through_collector() -> Result<()> {
     use helpers::{FastaBuilder, coord_builder};
@@ -191,6 +188,77 @@ fn test_cram_drives_through_collector() -> Result<()> {
     Ok(())
 }
 
+/// CRAM round-trip exercising the opt-in decoder paths: with `with_sequence()`
+/// the SIMD nibble decoder runs against htslib's packed `seq().encoded`,
+/// and with `with_aux_tag(NM)` the htslib aux walker populates the store.
+#[test]
+fn test_cram_fill_record_decodes_sequence_and_aux() -> Result<()> {
+    use helpers::{FastaBuilder, coord_builder};
+
+    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
+    let mut builder = coord_builder(&[("chr1", 1_000)]);
+    // Fragment with NM:i:3 — the only record carrying an aux tag.
+    builder.add_unpaired("frag1", 0, 100, 60, 50, false, false, false, Some(3));
+    builder.add_pair("pair1", 0, 200, 400, 200, 60, 50, false, false);
+    let cram = builder.to_temp_cram(refa.path())?;
+
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+    let mut record = reader.empty_record();
+
+    let mut count = 0;
+    let mut frag_seen = false;
+    while reader.fill_record(&requirements, &mut record)? {
+        count += 1;
+        assert!(!record.sequence().is_empty(), "sequence should be populated when requested");
+        assert_eq!(record.sequence().len(), record.sequence_len(), "decoded len matches l_seq");
+        for &b in record.sequence() {
+            assert!(b.is_ascii(), "decoded base should be ASCII (got {b:#x})");
+        }
+
+        if let Some(name) = record.name()
+            && &**name == b"frag1"
+        {
+            frag_seen = true;
+            let nm = record.aux_tag(*b"NM").and_then(|v| v.as_int()).unwrap();
+            assert_eq!(nm, 3, "NM tag value should round-trip via htslib aux walker");
+            assert!(record.has_aux_tag(*b"NM"));
+        }
+    }
+    assert_eq!(count, 3, "expected 1 fragment + 1 pair = 3 records");
+    assert!(frag_seen, "fragment with NM tag should be present");
+    Ok(())
+}
+
+/// Sanity-check that the CRAM path's cached `alignment_end` matches
+/// what the cigar reference span implies. Mirrors the BAM equivalent
+/// at [`test_bamrec_alignment_end_matches_cigar_span`].
+#[test]
+fn test_htslibrec_alignment_end_matches_cigar_span() -> Result<()> {
+    use helpers::{FastaBuilder, coord_builder};
+
+    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
+    let mut builder = coord_builder(&[("chr1", 1_000)]);
+    builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
+    let cram = builder.to_temp_cram(refa.path())?;
+
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut record = reader.empty_record();
+    assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
+
+    let RikerRecord::Htslib(_) = &record else {
+        panic!("expected RikerRecord::Htslib variant for CRAM input");
+    };
+    let start = record.alignment_start().unwrap().get();
+    let end = record.alignment_end().unwrap().get();
+    assert_eq!(start, 100);
+    assert_eq!(end, 149, "alignment_end = start + cigar reference span - 1");
+    // A 50bp single-match read has exactly one CIGAR op. Catches a regression
+    // where `cigar_len` could drift between op count and byte count.
+    assert_eq!(record.cigar_len(), 1, "cigar_len must report op count, not bytes");
+    Ok(())
+}
+
 /// SAM round-trip via `fill_record`. Mirrors the BAM scalar-roundtrip
 /// test but exercises the plain-text SAM in-place fill path
 /// (`fill_sam_slot`) which the BAM and CRAM tests don't cover.
@@ -202,7 +270,6 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
     let sam = builder.to_temp_sam()?;
 
     let mut reader = AlignmentReader::open(sam.path(), None)?;
-    assert!(reader.supports_in_place_reads(), "SAM should support in-place reads");
 
     let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
     let mut record = reader.empty_record();
