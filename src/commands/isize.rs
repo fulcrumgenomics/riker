@@ -5,6 +5,7 @@ use clap::Args;
 use kuva::plot::LinePlot;
 use kuva::render::layout::Layout;
 use kuva::render::plots::Plot;
+use kuva::render::render_utils::compute_tick_step;
 use noodles::sam::Header;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,7 @@ impl InsertSizeCollector {
         ];
 
         let mut plots: Vec<Plot> = Vec::new();
+        let mut data_x_max: f64 = 0.0;
         for (name, color, hist) in &orientations {
             let count = hist.total();
             if count == 0 || (total > 0 && below_min_frac(count, total, self.min_frac)) {
@@ -184,6 +186,9 @@ impl InsertSizeCollector {
                 .take_while(|&(k, _)| k as f64 <= trim_max)
                 .map(|(x, y)| (x as f64, y as f64))
                 .collect();
+            if let Some(&(x, _)) = xy.last() {
+                data_x_max = data_x_max.max(x);
+            }
             plots.push(Plot::Line(
                 LinePlot::new()
                     .with_data(xy)
@@ -198,12 +203,22 @@ impl InsertSizeCollector {
             return Ok(());
         }
 
+        // Snap the x-axis max up to a clean multiple of kuva's chosen tick step
+        // so the last major gridline lands on the axis edge. Without this, kuva's
+        // tick generator floors `axis_max` to the nearest step and the gap
+        // between the last labeled tick and the axis is ungridded.
+        let x_tick_step = compute_tick_step(0.0, data_x_max, 10);
+        let x_axis_max = (data_x_max / x_tick_step).ceil() * x_tick_step;
+
         let layout = Layout::auto_from_plots(&plots)
             .with_width(PLOT_WIDTH)
             .with_height(PLOT_HEIGHT)
             .with_title(&self.plot_title)
             .with_x_label("Insert Size (bp)")
             .with_y_label("Read Pairs")
+            .with_x_axis_min(0.0)
+            .with_x_axis_max(x_axis_max)
+            .with_x_tick_step(x_tick_step)
             .with_minor_ticks(5)
             .with_show_minor_grid(true);
 
