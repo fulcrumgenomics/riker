@@ -11,6 +11,18 @@
 import shlex
 
 
+def _riker_needs_ref(profile: dict) -> bool:
+    """Whether this riker invocation requires --reference. Standalone wgs
+    sets `needs_ref` directly; multi profiles need it when their tool
+    list pulls in a reference-using collector. Single source of truth so
+    `_riker_argv` and `_riker_inputs` can't drift."""
+    if profile["needs_ref"]:
+        return True
+    if profile["riker_args"][0] == "multi":
+        return any(t in profile["riker_args"] for t in ("wgs", "gcbias", "error"))
+    return False
+
+
 def _riker_argv(wildcards) -> list[str]:
     """Build the riker argv. Returned as a list so we can shlex.join it
     upstream of the shell block.
@@ -33,10 +45,7 @@ def _riker_argv(wildcards) -> list[str]:
     if is_multi:
         argv += ["--threads", str(thread_count(wildcards.profile))]
 
-    needs_ref = profile["needs_ref"] or (is_multi and (
-        "wgs" in profile["riker_args"] or "gcbias" in profile["riker_args"]
-    ))
-    if needs_ref:
+    if _riker_needs_ref(profile):
         argv += ["--reference", ref_for_sample(sample)]
 
     if is_multi and "hybcap" in profile["riker_args"]:
@@ -61,8 +70,7 @@ def _riker_inputs(wildcards):
         "bam": f"{STAGE_DIR}/{sample}/input.bam",
         "bai": f"{STAGE_DIR}/{sample}/input.bam.bai",
     }
-    needs_ref = profile["needs_ref"] or "wgs" in profile["riker_args"] or "gcbias" in profile["riker_args"]
-    if needs_ref:
+    if _riker_needs_ref(profile):
         inputs["ref"] = ref_for_sample(sample)
         inputs["fai"] = ref_for_sample(sample) + ".fai"
     if "hybcap" in profile["riker_args"]:
@@ -75,6 +83,12 @@ rule run_riker:
     input: unpack(_riker_inputs)
     output:
         time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/riker/rep{{rep}}/time.txt",
+    log:
+        # `cmdline` and `tool_log` are declared as `log:` rather than
+        # `output:` so they survive Snakemake's auto-cleanup on rule
+        # failure. When a tool errors out, the GNU-time-recorded wall
+        # may be missing or wrong, but the tool's own stderr is the
+        # most useful artefact for the on-call to debug — keep it.
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/riker/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/riker/rep{{rep}}/tool.log",
     params:
@@ -86,8 +100,8 @@ rule run_riker:
         r"""
         set -euo pipefail
         mkdir -p "$(dirname {output.time:q})"
-        printf '%s\n' {params.argv_str:q} > {output.cmdline:q}
+        printf '%s\n' {params.argv_str:q} > {log.cmdline:q}
         # `command time` bypasses the bash builtin so we get the conda-forge
         # GNU time binary (which supports -v / -o).
-        command time -v -o {output.time:q} {params.argv_str} > {output.tool_log:q} 2>&1
+        command time -v -o {output.time:q} {params.argv_str} > {log.tool_log:q} 2>&1
         """

@@ -30,6 +30,9 @@ rule run_picard_cwm:
         fai = lambda w: ref_for_sample(w.sample) + ".fai",
     output:
         time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cwm/rep{{rep}}/time.txt",
+    log:
+        # See note on log: vs output: in run_riker.smk — these survive
+        # Snakemake's auto-cleanup on failure so we keep the JVM stderr.
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cwm/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cwm/rep{{rep}}/tool.log",
     wildcard_constraints:
@@ -47,9 +50,9 @@ rule run_picard_cwm:
              "I={input.bam}"
              "R={input.ref}"
              "O=$outdir/picard.wgs_metrics.txt")
-        printf '%s ' "${{cmd[@]}}" > {output.cmdline:q}; echo >> {output.cmdline:q}
+        printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
         _JAVA_OPTIONS="-Xmx{params.xmx}g" command time -v -o {output.time:q} \
-            "${{cmd[@]}}" > {output.tool_log:q} 2>&1
+            "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """
 
 
@@ -66,6 +69,7 @@ rule run_picard_chsm:
         ref       = lambda w: ref_for_sample(w.sample),
     output:
         time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-chsm/rep{{rep}}/time.txt",
+    log:
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-chsm/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-chsm/rep{{rep}}/tool.log",
     wildcard_constraints:
@@ -86,9 +90,9 @@ rule run_picard_chsm:
              "BAIT_INTERVALS={input.intervals}"
              "TARGET_INTERVALS={input.intervals}"
              "O=$outdir/picard.hs_metrics.txt")
-        printf '%s ' "${{cmd[@]}}" > {output.cmdline:q}; echo >> {output.cmdline:q}
+        printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
         _JAVA_OPTIONS="-Xmx{params.xmx}g" command time -v -o {output.time:q} \
-            "${{cmd[@]}}" > {output.tool_log:q} 2>&1
+            "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """
 
 
@@ -127,6 +131,7 @@ rule run_picard_cmm:
         fai = lambda w: ref_for_sample(w.sample) + ".fai",
     output:
         time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cmm/rep{{rep}}/time.txt",
+    log:
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cmm/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cmm/rep{{rep}}/tool.log",
     wildcard_constraints:
@@ -148,11 +153,11 @@ rule run_picard_cmm:
              "O=$outdir/picard.cmm")
         # Append PROGRAM= entries (already shell-quoted by params.programs).
         eval "cmd+=( {params.programs} )"
-        printf '%s ' "${{cmd[@]}}" > {output.cmdline:q}; echo >> {output.cmdline:q}
+        printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
         # Async-IO is a JVM system property in picard 3.x, not a CLI flag.
         # Enable it so picard's BAM read/write threads at least somewhat
         # match riker --threads 4 in the bundle profiles.
         _JAVA_OPTIONS="-Xmx{params.xmx}g -Dsamjdk.async_io_read_samtools=true -Dsamjdk.async_io_write_samtools=true" \
             command time -v -o {output.time:q} \
-                "${{cmd[@]}}" > {output.tool_log:q} 2>&1
+                "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """

@@ -61,7 +61,7 @@ rule plots:
     resources: bench=1
     shell:
         r"""
-        mkdir -p $(dirname {output.leaderboard:q})
+        mkdir -p "$(dirname {output.leaderboard:q})"
         Rscript {WORKDIR}/workflow/scripts/plot.R \
             {input.bench:q} {input.summary:q} {RESULTS_DIR}/plots
         """

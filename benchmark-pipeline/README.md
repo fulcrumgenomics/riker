@@ -80,14 +80,65 @@ re-run staging.
 
 ## Setup
 
+### Pre-`./install.sh` checklist (fresh EC2 / Linux box)
+
+These steps aren't done by `install.sh` itself:
+
+1. **Mount the local NVMe instance store** (c5d / i4i / m6id / r8id-class
+   instances ship with an unmounted ephemeral disk):
+
+   ```bash
+   sudo mkfs.xfs /dev/nvme1n1                 # check `lsblk` for the device
+   sudo mkdir -p /mnt/scratch
+   sudo mount /dev/nvme1n1 /mnt/scratch
+   sudo chown $(whoami):$(whoami) /mnt/scratch
+   ```
+
+2. **Install `git` and clone the repo** (AL2023-minimal does not ship
+   git):
+
+   ```bash
+   sudo dnf install -y -q git
+   git clone https://github.com/fulcrumgenomics/riker.git
+   cd riker/benchmark-pipeline
+   ```
+
+3. **`sudo` access**: `install.sh` shells out to `sudo dnf` / `sudo
+   apt-get` to install the C/C++ toolchain if missing. The script will
+   hang on a password prompt if your user lacks passwordless sudo.
+
+4. **Clean AWS environment**: the staging rules use `aws s3 cp
+   --no-sign-request` to read public 1KG bucket objects. If you have
+   stale or expired AWS credentials in your shell environment
+   (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, etc.), some `aws-cli` versions
+   ignore `--no-sign-request` and try to sign with the broken creds.
+   `unset AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+   AWS_SESSION_TOKEN` before running the pipeline if you suspect this.
+
+### `./install.sh`
+
 ```bash
-cd benchmark-pipeline
 ./install.sh              # idempotent; fetches pixi, builds isolated rust, builds riker
 ```
 
 Flags:
 - `--system-rust`: use the cargo on PATH instead of installing rustup into `.rust/`.
 - `--skip-build`: set up envs but don't (re)build riker.
+
+### Pointing `stage_dir` at the NVMe
+
+The default `stage_dir` in `config/performance.config.yaml` is the
+relative path `stage/` (i.e. inside the repo). To stage on the NVMe
+instead, override the value at runtime — Snakemake's `--config` flag is
+forwarded after `--`:
+
+```bash
+./run.sh config/performance.config.yaml --cores 4 -- \
+    --config stage_dir=/mnt/scratch/riker-bench/stage
+```
+
+Don't edit `performance.config.yaml` in place — that change tracks back
+into your fork's git history.
 
 ## Smoke test (validates the pipeline on the smallest fixture)
 
@@ -126,6 +177,38 @@ With ~45 timed cells × ~2-50 minutes each, expect ~12-20 hours of
 wall-clock on a 4-vCPU host. Bump `replicates:` in the config to 3
 once you have a multi-day window and want min/max variance bars.
 
+### Resuming after a failure
+
+`./run.sh` already passes `--rerun-incomplete`. Re-running the same
+command will resume — Snakemake skips rules whose declared `output:`
+files already exist. Per-tool diagnostics (`cmdline.txt` and
+`tool.log`) are now declared as `log:` rather than `output:` so they
+survive Snakemake's auto-cleanup on rule failure: when a tool errors
+out, look at
+`results/run/<sample>/<profile>/<tool>/rep<N>/tool.log`.
+
+If you rebuild riker or edit a rule's shell text and want Snakemake to
+re-fire only the file-mtime-affected rules (rather than everything
+whose params hash changed), pass `--rerun-triggers mtime` after `--`:
+
+```bash
+./run.sh config/performance.config.yaml --cores 4 -- \
+    --config stage_dir=/mnt/scratch/riker-bench/stage \
+    --rerun-triggers mtime
+```
+
+### Kit interval-list `@SQ` rewrite
+
+Picard `CollectHsMetrics` strictly requires the bait/target
+interval_list's `@SQ` headers to match the BAM's exactly (any size
+mismatch is a fatal error). Real-world kit interval-lists are often
+shipped with a slightly different `@SQ` set than the BAM's reference.
+The `fetch_kit_intervals` rule (`workflow/rules/stage_inputs.smk`)
+strips the upstream `@SQ` headers and concatenates the kit's data rows
+under the reference's full `.dict`. Riker's `hybcap` is permissive
+about this and would work with the original headers — only Picard
+needs the rewrite.
+
 ## Output schema
 
 `results/bench.tsv` — wide TSV, one row per `(sample, profile, tool, rep)`:
@@ -150,7 +233,11 @@ once you have a multi-day window and want min/max variance bars.
 (median + min + max per numeric column; `rep_count` records how many
 replicates contributed to each row).
 
-`results/plots/`:
+`results/plots/` — what to look at first:
+**`01_wall_time_leaderboard.pdf`** is the canonical "who's fastest"
+bar chart and is the recommended starting point. **`04_riker_bundle_vs_picard.pdf`**
+is the comparative claim of the project (riker single-pass vs sum of
+Picard parts). The full list:
 
 1. `01_wall_time_leaderboard.pdf` — bars per `(tool, sample)` faceted by profile (headline)
 2. `02_throughput_vs_size.pdf` — log-scale x = sample_size_gb (carried by the depth series)

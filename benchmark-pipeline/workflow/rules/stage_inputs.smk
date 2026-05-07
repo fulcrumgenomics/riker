@@ -110,6 +110,15 @@ rule fetch_kit_intervals:
             http*|ftp://*) curl -sSfL --retry 10 --retry-all-errors --retry-delay 10 "$url" -o "$raw" ;;
             *) echo "ERROR: unsupported intervals URL scheme: $url" >&2; exit 1 ;;
         esac
+        # Reject empty / @-only files: process substitution swallows
+        # grep's exit-1 ("no match") so a malformed upstream that has no
+        # data rows would otherwise produce a silent header-only
+        # intervals.list and downstream tools would benchmark zero
+        # capture regions.
+        if [[ ! -s "$raw" ]] || ! grep -v '^@' "$raw" | grep -q .; then
+            echo "ERROR: kit intervals file empty or header-only: $raw" >&2
+            exit 1
+        fi
         # Concatenate the reference's .dict (provides @HD + matching @SQ
         # headers) with the data rows from the upstream interval_list.
         cat {input.ref_dict} <(grep -v '^@' "$raw") > {output.intervals:q}

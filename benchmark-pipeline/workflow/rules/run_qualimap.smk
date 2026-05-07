@@ -25,6 +25,7 @@ rule run_qualimap:
     input: unpack(_qualimap_inputs)
     output:
         time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/qualimap/rep{{rep}}/time.txt",
+    log:
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/qualimap/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/qualimap/rep{{rep}}/tool.log",
     threads: lambda w: thread_count(w.profile)
@@ -39,7 +40,7 @@ rule run_qualimap:
         # initial heap by `attempt` and cap at `qualimap_xmx_gb_max`.
         qualimap_xmx = lambda w, attempt: min(
             int(config["qualimap_xmx_gb"]) * attempt,
-            int(config.get("qualimap_xmx_gb_max", config["qualimap_xmx_gb"] * 2)),
+            int(config.get("qualimap_xmx_gb_max", int(config["qualimap_xmx_gb"]) * 2)),
         ),
     params:
         # Always a string — empty for wgs profiles, so the shell `if`
@@ -59,9 +60,9 @@ rule run_qualimap:
         if [[ "{wildcards.profile}" == hybcap-* ]]; then
             cmd+=(-gff {params.target_bed:q})
         fi
-        printf '%s ' "${{cmd[@]}}" > {output.cmdline:q}; echo >> {output.cmdline:q}
+        printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
         # qualimap's wrapper would otherwise try to use an X display;
         # force headless explicitly.
         JAVA_OPTS="-Djava.awt.headless=true" \
-            command time -v -o {output.time:q} "${{cmd[@]}}" > {output.tool_log:q} 2>&1
+            command time -v -o {output.time:q} "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """

@@ -23,7 +23,7 @@ from parse_gnu_time import parse as parse_time
 
 # results/run/{sample}/{profile}/{tool}/rep{rep}/time.txt
 PATH_RE = re.compile(
-    r"results?/run/"
+    r"results/run/"
     r"(?P<sample>[^/]+)/"
     r"(?P<profile>[^/]+)/"
     r"(?P<tool>[^/]+)/"
@@ -101,7 +101,7 @@ def _qualimap_version() -> str:
     try:
         out = subprocess.check_output(["qualimap", "--help"], text=True,
                                       timeout=15, stderr=subprocess.STDOUT)
-        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
         # Look for a line containing "QualiMap" with a version-y word.
         for line in lines:
             if "qualimap" in line.lower() and any(c.isdigit() for c in line):

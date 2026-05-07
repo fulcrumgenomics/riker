@@ -31,6 +31,7 @@ rule run_mosdepth:
     input: unpack(_mosdepth_inputs)
     output:
         time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/time.txt",
+    log:
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/tool.log",
     wildcard_constraints:
@@ -52,6 +53,6 @@ rule run_mosdepth:
             cmd=(mosdepth -x --no-per-base \
                           "$outdir/mosdepth" {input.bam})
         fi
-        printf '%s ' "${{cmd[@]}}" > {output.cmdline:q}; echo >> {output.cmdline:q}
-        command time -v -o {output.time:q} "${{cmd[@]}}" > {output.tool_log:q} 2>&1
+        printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
+        command time -v -o {output.time:q} "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """

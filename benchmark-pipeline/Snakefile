@@ -242,7 +242,6 @@ rule all:
 # upstream for stage/{sample}/input.bam. All sample-name constraints use
 # the same set of names so any rule can match by sample.
 _PROFILE_REGEX = "|".join(PROFILES.keys())
-_RIKER_PROFILE_REGEX = _PROFILE_REGEX
 _REP_REGEX = r"\d+"
 _TOOL_REGEX = "riker|picard-cmm|picard-cwm|picard-chsm|mosdepth|qualimap"
 
