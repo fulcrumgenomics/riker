@@ -34,7 +34,7 @@ enum_dispatch = "0.3"
 env_logger = "0.11"
 fgoxide = "0.6"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
-kuva = { version = "0.1.6", features = ["pdf"] }
+kuva = { version = "0.2.0", features = ["pdf"] }
 log = "0"
 noodles = { version = "0.109", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
 noodles-bgzf = { version = "0.46", features = ["libdeflate"] }
