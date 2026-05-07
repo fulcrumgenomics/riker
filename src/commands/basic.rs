@@ -5,7 +5,7 @@ use clap::Args;
 use kuva::plot::legend::LegendPosition;
 use kuva::plot::{Histogram, LinePlot};
 use kuva::render::annotations::{Orientation, ShadedRegion};
-use kuva::render::layout::Layout;
+use kuva::render::layout::{Layout, TickFormat};
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
 use riker_derive::MetricDocs;
@@ -478,7 +478,10 @@ impl BasicCollector {
             .with_x_label("Quality Score")
             .with_y_label("Fraction of Bases")
             .with_x_axis_min(0.0)
-            .with_x_axis_max(x_axis_max);
+            .with_x_axis_max(x_axis_max)
+            .with_x_tick_step(5.0)
+            .with_minor_ticks(5)
+            .with_x_tick_format(TickFormat::Integer);
 
         write_plot_pdf(plots, layout, &self.qual_dist_plot_path)
     }
