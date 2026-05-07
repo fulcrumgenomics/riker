@@ -1,0 +1,43 @@
+# Default config for the riker benchmark pipeline.
+#
+# Override the samples or stage_dir on the CLI:
+#   ./run.sh --config samples_wgs_tsv=path/to/alt.tsv stage_dir=/mnt/big/stage
+
+samples_wgs_tsv:    config/samples.wgs.tsv
+samples_hybcap_tsv: config/samples.hybcap.tsv
+references_yaml:    config/references.yaml
+kits_yaml:          config/kits.yaml
+
+# Where staged BAMs, references, and per-run outputs live. Should be a
+# local NVMe path on the benchmark host (instance-store volume on EC2).
+# Default: relative to the pipeline dir.
+stage_dir:          stage
+results_dir:        results
+
+# Riker binary. install.sh symlinks this to either target/dist/riker (the
+# multivers launcher on x86_64) or target/release/riker on aarch64.
+riker_bin:          ../target/dist/riker
+
+# Heap caps. _JAVA_OPTIONS is honored by both picard's and qualimap's JVM
+# wrappers; we set it inline per-rule.
+picard_xmx_gb:      16
+# qualimap_xmx_gb is the initial heap. On a Java OOM the rule retries
+# once with the heap doubled up to qualimap_xmx_gb_max. If the max heap
+# still OOMs the rule fails and aborts the pipeline — qualimap is the
+# OOM-prone comparator and getting past it on 32 GB hosts is best-effort.
+qualimap_xmx_gb:        16
+qualimap_xmx_gb_max:    24
+
+# Replicates per (sample, profile, tool). v1 runs with 1 rep to keep
+# the first full perf run under ~30 hours of wall-clock; bump to 3 if
+# we want min/max variance bars and have a multi-day window.
+replicates:         1
+
+# Profiles to run. Trim this list to skip costly profiles during
+# iteration. Trimming a profile silently drops all rows for it from
+# bench.tsv — no warning. Re-add to recover.
+profiles_enabled: [wgs-only, wgs-bundle, hybcap-only, hybcap-bundle]
+
+# samtools threads for staging (CRAM transcoding, downsample, indexing).
+# Not the riker thread count.
+staging_threads:    8

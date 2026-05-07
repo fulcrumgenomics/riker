@@ -1,0 +1,39 @@
+[workspace]
+name = "riker-bench"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64"]
+description = "Benchmarking pipeline for riker vs picard / mosdepth / qualimap"
+
+[dependencies]
+python = ">=3.11"
+snakemake-minimal = ">=8.0"
+pyyaml = ">=6"
+pandas = ">=2.0"
+# GNU time gives us wall/user/sys/RSS via `-v`. macOS BSD time lacks `-v`,
+# so we always use the conda-forge package's binary explicitly.
+time = "*"
+# samtools is the workhorse for staging: CRAM->BAM transcoding,
+# `view --subsample` for the depth series, indexing, and faidx.
+samtools = ">=1.20"
+# Picard from bioconda (pulls openjdk). `picard <Tool> ...` is the entry
+# point; heap is set via _JAVA_OPTIONS=-Xmx<N>g.
+picard = ">=3.3"
+# Coverage comparator (and the speed-of-light baseline for the wgs-only
+# / hybcap-only profiles).
+mosdepth = ">=0.3"
+# All-in-one comparator. Heavy java; tune heap via --java-mem-size.
+qualimap = ">=2.3"
+# awscli is needed for `aws s3 cp --no-sign-request` from the public
+# 1000 Genomes bucket. curl handles HTTPS / FTP for everything else.
+awscli = "*"
+curl = "*"
+
+# R + plotting. Same env so plotting is just `Rscript` from the running
+# pixi shell — no `pixi run -e plot` indirection like chelae's pipeline,
+# since the riker bench is small enough not to need feature gating.
+r-base = ">=4.3"
+r-tidyverse = "*"
+r-scales = "*"
+
+[environments]
+default = { solve-group = "main" }

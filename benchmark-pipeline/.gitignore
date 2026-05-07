@@ -1,0 +1,12 @@
+# Pipeline working directories. Everything here is generated.
+.pixi/
+.rust/
+results/
+stage/
+
+# Snakemake state.
+.snakemake/
+
+# Python.
+__pycache__/
+*.pyc

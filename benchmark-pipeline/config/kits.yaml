@@ -1,0 +1,21 @@
+# Capture-kit metadata. Each entry is keyed by the value of the `kit`
+# column in samples.hybcap.tsv.
+#
+# Bait and target BEDs are fetched from public mirrors during staging.
+# Coordinates must match the BAM's reference build — for the GIAB Oslo
+# Agilent v5 BAMs (b37), use the b37-coordinate Agilent BED.
+
+agilent_av5:
+  # Agilent SureSelect Human All Exon V5 (S04380110), b37 coordinates,
+  # baits with 50 bp slop merged. Sourced from the same GIAB Oslo
+  # project that produced the BAMs — used by Oslo for their joint
+  # variant calling, so coverage matches what the BAMs were
+  # capture-enriched against.
+  intervals_url: "https://ftp.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/analysis/OsloUniversityHospital_Exome_GATK_jointVC_11242015/wex_Agilent_SureSelect_v05_b37.baits.slop50.merged.list"
+  reference: hs37d5
+  notes: |
+    Single Picard interval_list used for both --baits and --targets.
+    For runtime benchmarking that's fine; on-target metrics will
+    report ~100% bait-target overlap because they're the same regions.
+    A BED copy is derived at staging time for mosdepth (which only
+    accepts BED via --by).

@@ -1,0 +1,23 @@
+# Reference FASTAs fetched from public mirrors at first run, gunzip-ed if
+# .gz, then `samtools faidx`-ed (faidx is idempotent and cheap; we re-run
+# even if the upstream provides a .fai sidecar so the timestamps line up).
+#
+# Cached in stage_dir/refs/{name}.fa with .fai sidecar; reused across runs.
+# md5 verification is optional in v1 — populate after first download via:
+#     md5sum stage/refs/grch38_decoyhla.fa
+#     # paste into md5: below; future runs will fail loudly on mismatch.
+
+grch38_decoyhla:
+  # 1KG NYGC alt-aware reference (BWA-MEM ALT-aware layout).
+  # 3.26 GB unzipped; .fai sidecar at the same S3 path can be skipped — we
+  # re-faidx locally for self-consistency.
+  fasta_url: "s3://1000genomes/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+  md5: ""
+
+hs37d5:
+  # b37 + decoy + hs37d5 contig. Verified as the alignment target for
+  # the GIAB Oslo Agilent v5 BAMs (2015) by inspecting the BAM header:
+  # 86 @SQ lines including SN:hs37d5 LN:35477943, and @PG ID:bwa records
+  # the FASTA path as human_g1k_v37_decoy.fasta (== hs37d5 layout).
+  fasta_url: "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/phase2_reference_assembly_sequence/hs37d5.fa.gz"
+  md5: ""
