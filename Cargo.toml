@@ -22,7 +22,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-bgzf = "0.3"
 bitvec = "1"
 bstr = "1"
 bytemuck = "1.25"
@@ -36,8 +35,8 @@ fgoxide = "0.6"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 kuva = { version = "0.2.0", features = ["pdf"] }
 log = "0"
-noodles = { version = "0.109", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
-noodles-bgzf = { version = "0.46", features = ["libdeflate"] }
+noodles = { version = "0.110", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
+noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
 num-traits = "0.2"
 riker_derive = { package = "riker-ngs-derive", version = "0.1.0", path = "riker_derive" }
 rpmalloc = "0.2"

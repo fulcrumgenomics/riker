@@ -89,7 +89,7 @@ pub struct AlignmentReader {
 enum Inner {
     Sam(sam::io::Reader<BufReader<File>>),
     GzippedSam(Box<sam::io::Reader<BufReader<MultiGzDecoder<File>>>>),
-    Bam(bam::io::Reader<bgzf::Reader<BufReader<File>>>),
+    Bam(bam::io::Reader<noodles_bgzf::io::Reader<BufReader<File>>>),
     Cram(Box<rust_htslib::bam::Reader>),
 }
 
@@ -116,14 +116,9 @@ impl AlignmentReader {
                 Ok(Self { inner: Inner::GzippedSam(Box::new(reader)), header })
             }
             AlignmentFormat::Bam => {
-                // TODO: noodles PR https://github.com/zaeleus/noodles/pull/389 lands
-                // libdeflater-backed CRC32 inside noodles-bgzf. Once it ships to
-                // crates.io, re-bench `fulcrumgenomics/bgzf` against
-                // `noodles_bgzf + BufReader` and drop the extra dep if there's no
-                // remaining win.
                 let file = File::open(path).with_context(|| open_context(path))?;
                 let buf = BufReader::with_capacity(BAM_READ_BUFFER_BYTES, file);
-                let bgzf_reader = bgzf::Reader::new(buf);
+                let bgzf_reader = noodles_bgzf::io::Reader::new(buf);
                 let mut reader = bam::io::Reader::from(bgzf_reader);
                 let header = reader.read_header().with_context(|| header_context(path))?;
                 Ok(Self { inner: Inner::Bam(reader), header })
