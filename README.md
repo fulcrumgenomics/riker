@@ -50,6 +50,68 @@ The obvious question is: why not just fix up Picard?  Riker exists for a number 
 * **Lightweight Distribution**: Picard carries a lot of baggage. It needs a JVM. It needs R and much of the tidyverse in order to produce plots.  The bioconda distribution requires a python interpreter to run it's wrapper script.  Running `pixi init && pixi add picard` results in a 1.2GB environment!  In contrast Riker is distributed as a single executable of < 10MB with no external dependencies.
 * **Maintenance**: Maintenance of Picard has been [minimal for some time](https://github.com/broadinstitute/picard/commits/master/), with what little activity there is coming mostly from the community.  Picard is owned by, but no longer actively led by, the Broad Institute, making its path forward unclear.  Picard also suffers from some now-unnecessary complexity and years of less-than-necessary maintenance.  All of this makes a fresh start more appealing.
 
+## Performance
+
+Numbers below are from a [reproducible benchmark pipeline](benchmark-pipeline/) run on a single AWS `r8id.xlarge` instance (4 vCPU, 32 GB RAM, local NVMe), against publicly-available 1000 Genomes 30× WGS BAMs (transcoded from CRAM) and the GIAB Ashkenazi exome trio.
+
+### WGS — Riker wgs vs. Picard CollectWgsMetrics
+
+| Sample    | BAM    | Cov | Riker Wall | Picard Wall | Speedup   | Riker RSS | Picard RSS |
+|---        |---     |--- |---         |---          |---        |---        |---         |
+| HG02675   | 7.1 GB | 4×  | 0:56       | 12:24       | **13.2×** | 0.74 GB   | 1.56 GB    |
+| HG02675   | 21.7 GB| 15× | 2:56       | 32:20       | **11.0×** | 0.74 GB   | 5.97 GB    |
+| HG02675   | 28.1 GB| 20× | 3:47       | 40:24       | **10.7×** | 0.74 GB   | 5.58 GB    |
+| HG00188   | 37.5 GB| 30× | 5:13       | 1:02:30     | **12.0×** | 0.74 GB   | 5.24 GB    |
+| HG02675   | 41.1 GB| 30× | 5:32       | 1:01:20     | **11.1×** | 0.74 GB   | 5.20 GB    |
+
+### WGS — Riker multi vs. Picard Collect*Metrics
+
+| Sample    | BAM    | Cov | Riker Wall | Picard Wall (CMM + CWM) | Speedup   | Riker RSS | Picard peak RSS |
+|---        |---     |--- |---         |---                      |---        |---        |---              |
+| HG02675   | 7.1 GB | 4×  | 1:25       | 21:16   (8:44 + 12:32)  | **15.1×** | 1.44 GB   | 1.60 GB         |
+| HG02675   | 21.7 GB| 15× | 4:34       | 58:38   (26:32 + 32:06) | **12.8×** | 1.47 GB   | 5.97 GB         |
+| HG02675   | 28.1 GB| 20× | 5:58       | 1:15:12 (34:21 + 40:51) | **12.6×** | 1.48 GB   | 5.58 GB         |
+| HG00188   | 37.5 GB| 30× | 8:14       | 1:46:16 (46:36 + 59:40) | **12.9×** | 1.48 GB   | 5.24 GB         |
+| HG02675   | 41.1 GB| 30× | 8:45       | 1:51:55 (51:13 + 60:42) | **12.8×** | 1.47 GB   | 5.20 GB         |
+
+Riker was tested with a single invocation of `riker multi --tools wgs gcbias alignment basic isize --threads 4`.
+Picard was run twice, once for `CollectWgsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
+
+"Picard peak RSS" is the larger of the two sequential JVM runs — typically dominated by `CollectWgsMetrics`, which scales with genome size + coverage.
+
+### WGS — Riker wgs vs. mosdepth
+
+| Sample        | BAM    | Cov | Riker Wall | mosdepth Wall | Δ                    | Riker RSS | mosdepth RSS |
+|---            |---     |--- |---         |---            |---                   |---        |---           |
+| HG02675_4x    | 7.1 GB | 4×  | 0:56       | 1:13          | Riker 23 % faster    | 0.74 GB   | 3.07 GB      |
+| HG02675_15x   | 21.7 GB| 15× | 2:56       | 2:29          | mosdepth 15 % faster | 0.74 GB   | 2.42 GB      |
+| HG02675_20x   | 28.1 GB| 20× | 3:47       | 2:59          | mosdepth 21 % faster | 0.74 GB   | 2.48 GB      |
+| HG00188_30x   | 37.5 GB| 30× | 5:13       | 3:48          | mosdepth 27 % faster | 0.74 GB   | 2.52 GB      |
+| HG02675_30x   | 41.1 GB| 30× | 5:32       | 4:05          | mosdepth 26 % faster | 0.74 GB   | 2.59 GB      |
+
+Both tools running pure single-thread. `mosdepth` was run with its default `-t 0` for zero _extra_ decompression threads, and with `--no-per-base`.
+
+Surprisingly Riker outperforms mosdepth on the low-coverage (4×) sample, while mosdepth wins at higher depths.  The 15-27% delta is largely explainable by the fact that Riker is performing per-base quality score filtering, and quality-score aware mate-overlap computations whereas mosdepth does not examine quality scores.
+
+### Hybcap — Riker hybcap vs. Picard CollectHsMetrics
+
+Hybcap measurements are the mean of three GIAB Ashkenazi trio samples (HG002, HG003, HG004), each a ~9.8 GB exome BAM aligned to hs37d5 with the Agilent SureSelect Human All Exon V5 capture kit.
+
+| Sample          | BAM     | Kit         | Riker Wall | Picard Wall | Speedup   | Riker RSS | Picard RSS |
+|---              |---      |---          |---         |---          |---        |---        |---         |
+| AJ trio (mean)  | ~9.8 GB | Agilent v5  | 1:26       | 14:12       | **9.9×**  | 0.98 GB   | 2.45 GB    |
+
+### Hybcap — Riker multi vs. Picard Collect*Metrics
+
+| Sample          | BAM     | Kit         | Riker Wall | Picard Wall (CMM + CHsM) | Speedup   | Riker RSS | Picard peak RSS |
+|---              |---      |---          |---         |---                       |---        |---        |---              |
+| AJ trio (mean)  | ~9.8 GB | Agilent v5  | 1:45       | 22:07 (7:57 + 14:09)     | **12.6×** | 0.99 GB   | 3.23 GB         |
+
+Riker was tested with a single invocation of `riker multi --tools hybcap alignment basic isize --threads 4`.
+Picard was run twice, once for `CollectHsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
+
+"Picard peak RSS" is the larger of the two sequential JVM runs — dominated by `CollectHsMetrics` on the hybcap trio.
+
 ## Installation
 
 ### Install from bioconda
