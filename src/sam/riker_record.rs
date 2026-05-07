@@ -235,7 +235,7 @@ impl RikerRecord {
     #[must_use]
     pub fn quality_scores(&self) -> &[u8] {
         match self {
-            Self::Bam(r) => &r.quality_bytes,
+            Self::Bam(r) => r.inner.quality_scores().as_bytes(),
             Self::Fallback(r) => r.inner.quality_scores().as_ref(),
             Self::Htslib(r) => r.quality_scores(),
         }
@@ -249,7 +249,7 @@ impl RikerRecord {
     #[must_use]
     pub fn cigar_ops(&self) -> CigarOps<'_> {
         match self {
-            Self::Bam(r) => CigarOps::Bam(r.cigar_bytes.chunks_exact(4)),
+            Self::Bam(r) => CigarOps::Bam(r.inner.cigar().as_bytes().chunks_exact(4)),
             Self::Fallback(r) => CigarOps::Fallback(r.inner.cigar().as_ref().iter()),
             // htslib stores CIGAR as native-endian `u32`s with the same
             // packing as BAM; on LE targets (enforced at file scope) the
@@ -262,7 +262,7 @@ impl RikerRecord {
     #[must_use]
     pub fn cigar_len(&self) -> usize {
         match self {
-            Self::Bam(r) => r.cigar_bytes.len() / 4,
+            Self::Bam(r) => r.inner.cigar().len(),
             Self::Fallback(r) => r.inner.cigar().as_ref().len(),
             Self::Htslib(r) => r.cigar_len(),
         }
@@ -384,18 +384,11 @@ impl RikerRecord {
 /// BAM-backed record. Wraps [`noodles::bam::Record`] and caches the fixed
 /// scalar fields so that our accessors can be infallible and plain.
 ///
-/// The cigar and quality bytes are mirrored into reusable `Vec`s owned by
-/// this struct. noodles' `bam::record::Cigar` / `QualityScores` view
-/// types go through `AsRef<[u8]>` which erases the inner `'a` lifetime,
-/// so we can't return a slice into the BAM buffer with a lifetime tied
-/// to `&BamRec`. The per-record memcpy is bounded — a few hundred bytes
-/// per record, reused allocations — and still orders of magnitude
-/// cheaper than the aux-tag parse we're avoiding.
-///
-/// The read *name* is NOT mirrored: `bam::Record::name()` returns
-/// `Option<&BStr>` whose lifetime does flow through correctly via
-/// dereference, so we pass it through zero-copy (and `BStr` has a
-/// human-readable `Display` impl, which `&[u8]` doesn't).
+/// CIGAR / quality / sequence-packed bytes and the read name are passed
+/// through zero-copy from the underlying `bam::Record` buffer. The
+/// `as_bytes()` accessors on noodles' view types (added in
+/// noodles-bam 0.89) return `&'a [u8]` tied to the record buffer, so a
+/// slice with a lifetime tied to `&BamRec` falls out for free.
 #[derive(Clone)]
 pub struct BamRec {
     /// Underlying noodles record. Owns the raw BAM bytes.
@@ -416,12 +409,6 @@ pub struct BamRec {
     /// reference span. `None` when `pos` is `None` or the span can't be
     /// computed.
     alignment_end: Option<Position>,
-
-    // ── Reusable byte buffers ───────────────────────────────────────────────
-    /// Raw CIGAR bytes, 4 bytes per op.
-    cigar_bytes: Vec<u8>,
-    /// Raw Phred base-quality bytes (0-based, not ASCII+33).
-    quality_bytes: Vec<u8>,
 
     // ── Optional, filler-driven fields ──────────────────────────────────────
     // These are populated on demand by `decode_sequence`,
@@ -461,8 +448,6 @@ impl BamRec {
             mate_pos: None,
             tlen: 0,
             alignment_end: None,
-            cigar_bytes: Vec::new(),
-            quality_bytes: Vec::new(),
             sequence_buf: Vec::new(),
             sequence_populated: false,
             aux_store: AuxTagStore::new(),
@@ -575,24 +560,14 @@ impl BamRec {
         };
         self.tlen = self.inner.template_length();
 
-        // Mirror the variable-length byte fields into our own owned
-        // buffers so accessors can hand out slices with a lifetime tied
-        // to `&BamRec`. `name` is NOT mirrored — `bam::Record::name()`
-        // returns `Option<&BStr>` whose lifetime does flow through via
-        // dereference.
-        self.cigar_bytes.clear();
-        self.cigar_bytes.extend_from_slice(self.inner.cigar().as_ref());
-
-        self.quality_bytes.clear();
-        self.quality_bytes.extend_from_slice(self.inner.quality_scores().as_ref());
-
         // Validate the packed CIGAR codes once at read time; downstream
         // consumers (the `CigarOps` iterator) then call `code_to_kind`
         // infallibly. This is what stops a corrupted BAM from silently
         // producing wrong span/coverage numbers.
-        validate_cigar_codes(&self.cigar_bytes)?;
+        let cigar_bytes = self.inner.cigar().as_bytes();
+        validate_cigar_codes(cigar_bytes)?;
 
-        self.alignment_end = compute_alignment_end(self.pos, &self.cigar_bytes)?;
+        self.alignment_end = compute_alignment_end(self.pos, cigar_bytes)?;
 
         // Invalidate decoder-driven caches so accessors see "not
         // populated for this record" until a filler is called.
