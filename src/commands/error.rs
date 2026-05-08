@@ -54,17 +54,17 @@ const INLINE_STRATIFIERS: usize = 5;
 #[command()]
 pub struct ErrorOptions {
     /// Reference FASTA file (must be indexed with .fai). Required.
-    #[arg(short = 'r', long, value_name = "FASTA")]
+    #[arg(short = 'r', long, value_name = "FASTA", value_parser = crate::commands::common::parse_existing_file)]
     pub reference: PathBuf,
 
     /// VCF or BCF file of known variant sites to exclude. VCF files must be
     /// bgzip-compressed and indexed (.tbi or .csi). BCF files must be indexed (.csi).
-    #[arg(long, value_name = "VCF/BCF")]
+    #[arg(long, value_name = "VCF/BCF", value_parser = crate::commands::common::parse_existing_file)]
     pub vcf: Option<PathBuf>,
 
     /// Interval list or BED file to restrict analysis to specific regions.
     /// If not specified, analyzes all contigs in the sequence dictionary.
-    #[arg(long, value_name = "INTERVALS")]
+    #[arg(long, value_name = "INTERVALS", value_parser = crate::commands::common::parse_existing_file)]
     pub intervals: Option<PathBuf>,
 
     /// Minimum mapping quality for a read to be included.

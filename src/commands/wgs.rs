@@ -47,7 +47,7 @@ pub const PLOT_SUFFIX: &str = ".wgs-coverage.pdf";
 #[command()]
 pub struct WgsOptions {
     /// Interval file (IntervalList or BED) to restrict analysis.
-    #[arg(short = 'L', long, value_name = "FILE")]
+    #[arg(short = 'L', long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
     pub intervals: Option<PathBuf>,
 
     /// Include duplicate reads in metric calculations.
