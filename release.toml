@@ -5,7 +5,8 @@
 #
 # Cut a release:
 #   cargo release 0.3.0            # dry run — shows what would happen
-#   cargo release 0.3.0 --execute  # bumps versions, commits, tags, pushes
+#   cargo release 0.3.0 --execute  # bumps versions, commits, tags, pushes,
+#                                  # and publishes to crates.io
 #
 # See CONTRIBUTING.md "Releasing" for the full flow (incl. GitHub release
 # object + bioconda recipe update).
@@ -16,9 +17,12 @@
 # riker-ngs-derive package version and `cargo build` fails.
 shared-version = true
 
-# We don't publish to crates.io today. Flip to true (or pass --publish on
-# the command line) once we decide to start.
-publish = false
+# Publish each workspace crate to crates.io. cargo-release publishes in
+# dependency order — riker-ngs-derive first, then riker-ngs once the
+# index has caught up — and waits between publishes so the second crate
+# can resolve its dependency on the first. Requires a crates.io token
+# configured on the maintainer's machine (`cargo login`).
+publish = true
 
 # Match our existing `v<version>` tag convention (v0.2.0 etc.). Without
 # this, cargo-release defaults to a `<crate>-v<version>` form that breaks

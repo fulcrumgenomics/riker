@@ -42,10 +42,10 @@ The `ci-*` aliases are defined in `.cargo/config.toml`.
 
 ## Crate Structure
 
-| Crate | Purpose |
-|-------|---------|
-| `riker` | Binary and library (published as `riker_lib`) |
-| `riker_derive` | Proc-macro crate: `#[derive(MetricDocs)]` and `#[multi_options]` |
+| Package | Purpose |
+|---------|---------|
+| `riker-ngs` | Main package — exposes the `riker_lib` library and the `riker` binary |
+| `riker-ngs-derive` | Proc-macro crate (lives at `riker_derive/`): `#[derive(MetricDocs)]` and `#[multi_options]` |
 
 ## Architecture
 
@@ -377,18 +377,20 @@ style your files use.
 ## Releasing
 
 Releases are cut with [cargo-release]. Install it once with
-`cargo install cargo-release`. The configuration in `release.toml` at the
-repo root keeps every workspace crate (`riker-ngs` + `riker-ngs-derive`) on
-the same version, matches our existing `v<version>` tag convention, and
-skips crates.io publishing (we don't publish there yet — flip the
-`publish` flag in `release.toml` if/when that changes).
+`cargo install cargo-release`, and run `cargo login` once with a crates.io
+API token so the publish step works. The configuration in `release.toml`
+at the repo root keeps every workspace crate (`riker-ngs` and
+`riker-ngs-derive`) on the same version and matches our existing
+`v<version>` tag convention.
 
 ```bash
 # Dry run — review what would change.
 cargo release 0.3.0
 
 # Real release — bumps every Cargo.toml, updates Cargo.lock, commits with
-# message "Bump version to 0.3.0", tags `v0.3.0`, and pushes to origin.
+# message "Bump version to 0.3.0", tags `v0.3.0`, pushes to origin, and
+# publishes both crates to crates.io in dependency order
+# (riker-ngs-derive first, then riker-ngs).
 cargo release 0.3.0 --execute
 ```
 
