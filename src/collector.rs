@@ -67,13 +67,17 @@ pub trait Collector: Send {
 /// Uses [`AlignmentReader::fill_record`] for every format (no per-record
 /// allocation).
 ///
-/// `progress.finish()` is called unconditionally before returning, so the
-/// "Processed N total" line appears on both the success and error paths.
+/// If `initialize` fails the function returns immediately — no records
+/// have been read, so neither `progress.finish()` nor `Collector::finish`
+/// runs. Real collectors populate fields in `initialize` that `finish`
+/// then unwraps, so calling finish on a partially-constructed collector
+/// would turn an honest error into a panic.
 ///
-/// `Collector::finish` always runs — even when initialize or the read
-/// loop errored — so collectors can release resources and flush partial
-/// output. If both the read loop and `finish` error, the read-loop
-/// error wins (it's the upstream cause).
+/// Once `initialize` succeeds, `progress.finish()` is always called
+/// before return (so the "Processed N total" line appears on both the
+/// success and read-loop-error paths) and `Collector::finish` is always
+/// called so it can flush partial output. If both the read loop and
+/// `finish` error, the read-loop error wins (it's the upstream cause).
 ///
 /// # Errors
 /// Returns an error if the underlying reader, decoder, or any of
@@ -87,13 +91,7 @@ pub fn drive_collector_single_threaded(
     // held by the per-record iterator. Header clone is one shot at startup.
     let header = reader.header().clone();
 
-    if let Err(e) = collector.initialize(&header) {
-        // Initialize failed before any records were processed; still call
-        // finish in case it has cleanup to do, then propagate the
-        // initialize error.
-        let _ = collector.finish();
-        return Err(e);
-    }
+    collector.initialize(&header)?;
 
     let read_result = drive_records(reader, collector, progress, &header);
     progress.finish();

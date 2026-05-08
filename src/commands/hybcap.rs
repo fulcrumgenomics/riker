@@ -61,11 +61,11 @@ pub enum PerBaseCoverageFormat {
 #[allow(clippy::struct_excessive_bools)]
 pub struct HybCapOptions {
     /// Bait (probe) interval file (IntervalList or BED).
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
     pub baits: PathBuf,
 
     /// Target interval file (IntervalList or BED).
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
     pub targets: PathBuf,
 
     /// Include duplicate reads in metric calculations.

@@ -188,6 +188,55 @@ fn test_cram_drives_through_collector() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: when a collector's `initialize` fails, `finish` must not
+/// be called. Real collectors populate `Option` fields (e.g. a sequence
+/// dictionary) in `initialize` and unwrap them in `finish`; calling finish
+/// on a partially-constructed collector turns an honest error into a panic.
+#[test]
+fn test_drive_collector_does_not_finish_after_failed_initialize() -> Result<()> {
+    use anyhow::anyhow;
+    use riker_lib::collector::{Collector, drive_collector_single_threaded};
+    use riker_lib::progress::ProgressLogger;
+
+    struct FailingInit {
+        finish_called: bool,
+    }
+    impl Collector for FailingInit {
+        fn initialize(&mut self, _h: &noodles::sam::Header) -> Result<()> {
+            Err(anyhow!("synthetic initialize failure"))
+        }
+        fn accept(&mut self, _r: &RikerRecord, _h: &noodles::sam::Header) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            self.finish_called = true;
+            panic!("finish must not be called when initialize failed");
+        }
+        fn name(&self) -> &'static str {
+            "failing_init"
+        }
+        fn field_needs(&self) -> RikerRecordRequirements {
+            RikerRecordRequirements::NONE
+        }
+    }
+
+    let mut builder = SamBuilder::new();
+    builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
+    let bam = builder.to_temp_bam()?;
+    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut collector = FailingInit { finish_called: false };
+    let mut progress = ProgressLogger::new("test", "reads", 1_000_000);
+
+    let result = drive_collector_single_threaded(&mut reader, &mut collector, &mut progress);
+    let err = result.expect_err("expected initialize error to propagate");
+    assert!(
+        err.to_string().contains("synthetic initialize failure"),
+        "expected init error to surface, got: {err}"
+    );
+    assert!(!collector.finish_called, "finish must be skipped after init failure");
+    Ok(())
+}
+
 /// CRAM round-trip exercising the opt-in decoder paths: with `with_sequence()`
 /// the SIMD nibble decoder runs against htslib's packed `seq().encoded`,
 /// and with `with_aux_tag(NM)` the htslib aux walker populates the store.
