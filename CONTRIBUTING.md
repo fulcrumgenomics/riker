@@ -373,3 +373,34 @@ style your files use.
   cargo-flamegraph to identify actual hot paths
 - Verify correctness after any optimization (diff outputs against a baseline and
   run the full test suite)
+
+## Releasing
+
+Releases are cut with [cargo-release]. Install it once with
+`cargo install cargo-release`. The configuration in `release.toml` at the
+repo root keeps every workspace crate (`riker-ngs` + `riker-ngs-derive`) on
+the same version, matches our existing `v<version>` tag convention, and
+skips crates.io publishing (we don't publish there yet — flip the
+`publish` flag in `release.toml` if/when that changes).
+
+```bash
+# Dry run — review what would change.
+cargo release 0.3.0
+
+# Real release — bumps every Cargo.toml, updates Cargo.lock, commits with
+# message "Bump version to 0.3.0", tags `v0.3.0`, and pushes to origin.
+cargo release 0.3.0 --execute
+```
+
+After the push, create the GitHub release object pointing at the new tag
+(e.g. `gh release create v0.3.0 --generate-notes`), then update any
+downstream consumer recipes — at minimum the
+[bioconda riker-ngs recipe](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/riker-ngs)
+needs the new version + the new tarball SHA256:
+
+```bash
+curl -sL https://github.com/fulcrumgenomics/riker/archive/refs/tags/v0.3.0.tar.gz \
+    | shasum -a 256
+```
+
+[cargo-release]: https://github.com/crate-ci/cargo-release

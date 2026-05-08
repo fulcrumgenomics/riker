@@ -1,0 +1,29 @@
+# Configuration for cargo-release (https://github.com/crate-ci/cargo-release).
+#
+# One-time setup:
+#   cargo install cargo-release
+#
+# Cut a release:
+#   cargo release 0.3.0            # dry run — shows what would happen
+#   cargo release 0.3.0 --execute  # bumps versions, commits, tags, pushes
+#
+# See CONTRIBUTING.md "Releasing" for the full flow (incl. GitHub release
+# object + bioconda recipe update).
+
+# Bump every workspace member (riker-ngs + riker-ngs-derive) to the same
+# version with a single commit. Without this, the path-dep version
+# constraint in the root Cargo.toml falls out of sync with the bumped
+# riker-ngs-derive package version and `cargo build` fails.
+shared-version = true
+
+# We don't publish to crates.io today. Flip to true (or pass --publish on
+# the command line) once we decide to start.
+publish = false
+
+# Match our existing `v<version>` tag convention (v0.2.0 etc.). Without
+# this, cargo-release defaults to a `<crate>-v<version>` form that breaks
+# the bioconda recipe URL and any tooling that greps for `v[0-9]+\.`.
+tag-name = "v{{version}}"
+
+# Match the commit-message style used for past version bumps.
+pre-release-commit-message = "Bump version to {{version}}"
