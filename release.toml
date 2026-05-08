@@ -3,10 +3,12 @@
 # One-time setup:
 #   cargo install cargo-release
 #
-# Cut a release:
-#   cargo release 0.3.0            # dry run — shows what would happen
-#   cargo release 0.3.0 --execute  # bumps versions, commits, tags, pushes,
-#                                  # and publishes to crates.io
+# Cut a release (the `--workspace` flag is essential — without it
+# cargo-release operates on the root crate only, leaving riker-ngs-derive
+# at the old version and breaking the path-dep version constraint):
+#   cargo release 0.3.0 --workspace            # dry run — shows what would happen
+#   cargo release 0.3.0 --workspace --execute  # bumps versions, commits, tags,
+#                                              # pushes, and publishes to crates.io
 #
 # See CONTRIBUTING.md "Releasing" for the full flow (incl. GitHub release
 # object + bioconda recipe update).

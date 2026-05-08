@@ -383,15 +383,19 @@ at the repo root keeps every workspace crate (`riker-ngs` and
 `riker-ngs-derive`) on the same version and matches our existing
 `v<version>` tag convention.
 
+The `--workspace` flag is essential — without it, cargo-release operates
+on the root crate only and leaves `riker-ngs-derive` at the old version,
+which breaks the path-dep version constraint and fails the build.
+
 ```bash
 # Dry run — review what would change.
-cargo release 0.3.0
+cargo release 0.3.0 --workspace
 
 # Real release — bumps every Cargo.toml, updates Cargo.lock, commits with
 # message "Bump version to 0.3.0", tags `v0.3.0`, pushes to origin, and
 # publishes both crates to crates.io in dependency order
 # (riker-ngs-derive first, then riker-ngs).
-cargo release 0.3.0 --execute
+cargo release 0.3.0 --workspace --execute
 ```
 
 After the push, create the GitHub release object pointing at the new tag
