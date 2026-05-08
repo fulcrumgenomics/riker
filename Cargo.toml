@@ -3,7 +3,7 @@ members = [".", "riker_derive"]
 
 [package]
 name = "riker-ngs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "Fast Rust CLI toolkit for sequencing QC metrics"
 repository = "https://github.com/fulcrumgenomics/riker"
@@ -38,7 +38,7 @@ log = "0"
 noodles = { version = "0.110", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
 noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
 num-traits = "0.2"
-riker_derive = { package = "riker-ngs-derive", version = "0.1.0", path = "riker_derive" }
+riker_derive = { package = "riker-ngs-derive", version = "0.2.0", path = "riker_derive" }
 rpmalloc = "0.2"
 rust-htslib = { version = "1", default-features = false, features = ["bzip2", "lzma", "libdeflate", "static"] }
 rust-lapper = "1"
