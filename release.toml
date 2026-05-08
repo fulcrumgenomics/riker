@@ -27,6 +27,13 @@ publish = true
 # Match our existing `v<version>` tag convention (v0.2.0 etc.). Without
 # this, cargo-release defaults to a `<crate>-v<version>` form that breaks
 # the bioconda recipe URL and any tooling that greps for `v[0-9]+\.`.
+#
+# Note: this template doesn't include `{{crate_name}}`, so both workspace
+# crates would otherwise try to create the same tag and the second
+# attempt would abort with "tag already exists". `riker_derive/Cargo.toml`
+# sets `tag = false` under `[package.metadata.release]` to suppress
+# tagging on the proc-macro crate; only `riker-ngs` creates the
+# `vX.Y.Z` tag.
 tag-name = "v{{version}}"
 
 # Match the commit-message style used for past version bumps.
