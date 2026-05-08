@@ -67,14 +67,17 @@ pub trait Collector: Send {
 /// Uses [`AlignmentReader::fill_record`] for every format (no per-record
 /// allocation).
 ///
-/// `progress.finish()` is called unconditionally before returning, so the
-/// "Processed N total" line appears on both the success and error paths.
+/// If `initialize` fails the function returns immediately — no records
+/// have been read, so neither `progress.finish()` nor `Collector::finish`
+/// runs. Real collectors populate fields in `initialize` that `finish`
+/// then unwraps, so calling finish on a partially-constructed collector
+/// would turn an honest error into a panic.
 ///
-/// `Collector::finish` runs only when `initialize` succeeded — collectors
-/// rely on initialize to populate fields that finish reads, and calling
-/// finish on a partially-constructed collector tends to panic on `unwrap`.
-/// If the read loop errors, finish still runs so partial output can flush;
-/// the read-loop error wins over any finish error in that case.
+/// Once `initialize` succeeds, `progress.finish()` is always called
+/// before return (so the "Processed N total" line appears on both the
+/// success and read-loop-error paths) and `Collector::finish` is always
+/// called so it can flush partial output. If both the read loop and
+/// `finish` error, the read-loop error wins (it's the upstream cause).
 ///
 /// # Errors
 /// Returns an error if the underlying reader, decoder, or any of
