@@ -42,10 +42,10 @@ The `ci-*` aliases are defined in `.cargo/config.toml`.
 
 ## Crate Structure
 
-| Crate | Purpose |
-|-------|---------|
-| `riker` | Binary and library (published as `riker_lib`) |
-| `riker_derive` | Proc-macro crate: `#[derive(MetricDocs)]` and `#[multi_options]` |
+| Package | Purpose |
+|---------|---------|
+| `riker-ngs` | Main package — exposes the `riker_lib` library and the `riker` binary |
+| `riker-ngs-derive` | Proc-macro crate (lives at `riker_derive/`): `#[derive(MetricDocs)]` and `#[multi_options]` |
 
 ## Architecture
 
@@ -373,3 +373,40 @@ style your files use.
   cargo-flamegraph to identify actual hot paths
 - Verify correctness after any optimization (diff outputs against a baseline and
   run the full test suite)
+
+## Releasing
+
+Releases are cut with [cargo-release]. Install it once with
+`cargo install cargo-release`, and run `cargo login` once with a crates.io
+API token so the publish step works. The configuration in `release.toml`
+at the repo root keeps every workspace crate (`riker-ngs` and
+`riker-ngs-derive`) on the same version and matches our existing
+`v<version>` tag convention.
+
+The `--workspace` flag is essential — without it, cargo-release operates
+on the root crate only and leaves `riker-ngs-derive` at the old version,
+which breaks the path-dep version constraint and fails the build.
+
+```bash
+# Dry run — review what would change.
+cargo release 0.3.0 --workspace
+
+# Real release — bumps every Cargo.toml, updates Cargo.lock, commits with
+# message "Bump version to 0.3.0", tags `v0.3.0`, pushes to origin, and
+# publishes both crates to crates.io in dependency order
+# (riker-ngs-derive first, then riker-ngs).
+cargo release 0.3.0 --workspace --execute
+```
+
+After the push, create the GitHub release object pointing at the new tag
+(e.g. `gh release create v0.3.0 --generate-notes`), then update any
+downstream consumer recipes — at minimum the
+[bioconda riker-ngs recipe](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/riker-ngs)
+needs the new version + the new tarball SHA256:
+
+```bash
+curl -sL https://github.com/fulcrumgenomics/riker/archive/refs/tags/v0.3.0.tar.gz \
+    | shasum -a 256
+```
+
+[cargo-release]: https://github.com/crate-ci/cargo-release

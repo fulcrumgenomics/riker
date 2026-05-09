@@ -16,3 +16,11 @@ proc-macro = true
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+
+# cargo-release: don't tag from this crate. The workspace `release.toml`
+# sets `shared-version = true` + `tag-name = "v{{version}}"`, so the
+# main `riker-ngs` crate creates a single `vX.Y.Z` tag for the release;
+# without this override, cargo-release would also try to create the same
+# tag from this crate and abort with "tag already exists".
+[package.metadata.release]
+tag = false

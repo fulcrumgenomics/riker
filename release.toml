@@ -1,0 +1,42 @@
+# Configuration for cargo-release (https://github.com/crate-ci/cargo-release).
+#
+# One-time setup:
+#   cargo install cargo-release
+#
+# Cut a release (the `--workspace` flag is essential — without it
+# cargo-release operates on the root crate only, leaving riker-ngs-derive
+# at the old version and breaking the path-dep version constraint):
+#   cargo release 0.3.0 --workspace            # dry run — shows what would happen
+#   cargo release 0.3.0 --workspace --execute  # bumps versions, commits, tags,
+#                                              # pushes, and publishes to crates.io
+#
+# See CONTRIBUTING.md "Releasing" for the full flow (incl. GitHub release
+# object + bioconda recipe update).
+
+# Bump every workspace member (riker-ngs + riker-ngs-derive) to the same
+# version with a single commit. Without this, the path-dep version
+# constraint in the root Cargo.toml falls out of sync with the bumped
+# riker-ngs-derive package version and `cargo build` fails.
+shared-version = true
+
+# Publish each workspace crate to crates.io. cargo-release publishes in
+# dependency order — riker-ngs-derive first, then riker-ngs once the
+# index has caught up — and waits between publishes so the second crate
+# can resolve its dependency on the first. Requires a crates.io token
+# configured on the maintainer's machine (`cargo login`).
+publish = true
+
+# Match our existing `v<version>` tag convention (v0.2.0 etc.). Without
+# this, cargo-release defaults to a `<crate>-v<version>` form that breaks
+# the bioconda recipe URL and any tooling that greps for `v[0-9]+\.`.
+#
+# Note: this template doesn't include `{{crate_name}}`, so both workspace
+# crates would otherwise try to create the same tag and the second
+# attempt would abort with "tag already exists". `riker_derive/Cargo.toml`
+# sets `tag = false` under `[package.metadata.release]` to suppress
+# tagging on the proc-macro crate; only `riker-ngs` creates the
+# `vX.Y.Z` tag.
+tag-name = "v{{version}}"
+
+# Match the commit-message style used for past version bumps.
+pre-release-commit-message = "Bump version to {{version}}"
