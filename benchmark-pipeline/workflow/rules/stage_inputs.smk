@@ -64,11 +64,18 @@ rule fetch_reference:
         # skipped. To pin, edit references.yaml manually with the value of
         # `md5sum stage_dir/refs/<ref>.fa` after a successful first fetch;
         # subsequent runs will then fail loudly on any mismatch.
-        if [[ -n {params.md5:q} ]]; then
+        #
+        # Bind to a bash variable first: Snakemake's :q formatter renders
+        # an empty string as nothing at all (not as ''), so inlining
+        # {{params.md5:q}} into a [[ ... ]] test would yield a bash syntax
+        # error when md5 is unset. Assigning to a quoted variable avoids
+        # the trap and lets us test cleanly.
+        md5_expected={params.md5:q}
+        if [[ -n "$md5_expected" ]]; then
             actual=$(md5sum "$out_fa" | awk '{{print $1}}')
-            if [[ "$actual" != {params.md5:q} ]]; then
+            if [[ "$actual" != "$md5_expected" ]]; then
                 echo "ERROR: md5 mismatch on reference {wildcards.ref}" >&2
-                echo "  expected: {params.md5}" >&2
+                echo "  expected: $md5_expected" >&2
                 echo "  actual:   $actual" >&2
                 exit 1
             fi
