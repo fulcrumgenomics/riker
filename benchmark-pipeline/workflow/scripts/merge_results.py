@@ -65,6 +65,7 @@ def effective_threads(tool: str, requested: int) -> int:
 def tool_family(tool: str) -> str:
     if tool == "riker": return "riker"
     if tool.startswith("picard-"): return "picard"
+    if tool.startswith("mosdepth"): return "mosdepth"
     return tool
 
 

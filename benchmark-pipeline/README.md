@@ -9,14 +9,24 @@ access only — no laptop-local files required.
 
 ## Profiles benchmarked
 
-Four riker invocations, each with its corresponding fair comparators:
+Five riker invocations, each with its corresponding fair comparators:
 
 | Profile | Riker | Picard | mosdepth |
 |---|---|---|---|
 | `wgs-only` | `riker wgs` | `CollectWgsMetrics` | `mosdepth -x` |
 | `wgs-bundle` | `riker multi --tools wgs alignment basic isize gcbias` | `CollectMultipleMetrics+CollectGcBiasMetrics` + `CollectWgsMetrics` | — |
+| `wgs-mosdepth` | `riker wgs` | — | `mosdepth -x` **and** `mosdepth` (no `-x`) |
 | `hybcap-only` | `riker hybcap` | `CollectHsMetrics` | `mosdepth --by targets.bed` |
 | `hybcap-bundle` | `riker multi --tools hybcap alignment basic isize` | `CollectMultipleMetrics` + `CollectHsMetrics` | — |
+
+`wgs-mosdepth` is the **fair** mosdepth comparison. The `wgs-only`
+profile runs mosdepth with `-x` (no CIGAR walk, no mate-overlap
+deduplication) — fast, but not accuracy-equivalent to riker. The
+`wgs-mosdepth` profile runs mosdepth both with and without `-x` so we
+can quote both numbers honestly. See
+[`config/mosdepth-compare.config.yaml`](config/mosdepth-compare.config.yaml)
+for the focused config that pins this to a single 30× sample over 3
+replicates.
 
 Threading: single-tool profiles run **1 thread** for every tool. Bundle
 profiles run **riker `--threads 4`**; Picard `CollectMultipleMetrics`
@@ -156,6 +166,52 @@ After the smoke run:
 - `results/bench_summary.tsv` — replicates collapsed
 - `results/plots/0[1-6]*.pdf` — six diagnostic plots
 - `results/host.json` — host metadata (CPU, mem, EC2 instance type, etc.)
+
+## Fair mosdepth comparison (focused, ~2 hours per host)
+
+```bash
+./run.sh config/mosdepth-compare.config.yaml --cores $(nproc)
+```
+
+Runs the `wgs-mosdepth` profile against a single 30× sample
+(`HG00188_30x`, chosen because it had the largest mosdepth `-x`
+advantage in v1) over **3 replicates**, producing a three-way
+wall-time comparison:
+
+- `riker wgs`
+- `mosdepth -x` (the published "fast" setting; skips CIGAR + mate-overlap)
+- `mosdepth` (no `-x`; CIGAR walk + mate-overlap correction, matches
+  riker's accuracy)
+
+Outputs land in `results-mosdepth-compare/` (separate from the main
+`results/` so it doesn't collide with a full perf run).
+
+### Cross-architecture: x86_64 + Graviton in parallel
+
+Run the same config on two instances simultaneously. Without Picard or
+Qualimap in the comparator set we don't need the JVM headroom that
+forced the v1 run onto memory-optimized hardware — riker peaks under
+1 GB and mosdepth under 3 GB, so a **compute-optimized** pair is the
+right shape this time:
+
+| Host | Instance type |
+|---|---|
+| x86_64 | `c8id.xlarge` (4 vCPU, 16 GB, NVMe) — Intel Sierra Forest |
+| Graviton | `c8gd.xlarge` (4 vCPU, 8 GB, NVMe) — Graviton 4 |
+
+On each host:
+
+```bash
+git clone https://github.com/fulcrumgenomics/riker.git
+cd riker/benchmark-pipeline
+./install.sh
+./run.sh config/mosdepth-compare.config.yaml --cores $(nproc)
+```
+
+When both finish, copy each host's `results-mosdepth-compare/bench.tsv`
++ `host.json` off the instance. The `host.json` records arch / CPU /
+instance type, so concatenating the two `bench.tsv`s with a host-id
+column is enough to produce a side-by-side x86 vs aarch64 table.
 
 ## Full performance run
 

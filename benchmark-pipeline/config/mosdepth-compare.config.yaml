@@ -1,0 +1,41 @@
+# Focused config: 3-way wall-time comparison of
+#   riker wgs   vs.   mosdepth -x (fast)   vs.   mosdepth (accurate)
+#
+# Motivation: the headline `wgs-only` profile runs mosdepth with `-x`,
+# which disables CIGAR walking and mate-overlap correction. That gives
+# mosdepth an unfair speed advantage vs. riker (which always does both)
+# in the published numbers. This config repeats the comparison with
+# accuracy-matched mosdepth so we can quote both honestly.
+#
+# Scope: ONE sample (HG00188_30x — the 30x BAM where mosdepth had the
+# biggest `-x` advantage in v1, picked deliberately to avoid biasing
+# toward riker). Three reps for min/max bars on a tight wall-clock
+# budget (~75 minutes of timed work per host plus ~20 min initial CRAM
+# staging).
+#
+# Cross-architecture: run this same config on one x86_64 instance and
+# one Graviton (aarch64) instance in parallel. Each produces its own
+# results/bench.tsv; combine them after the fact with the host info
+# already recorded in results/host.json.
+
+samples_wgs_tsv:    config/samples.mosdepth-compare.tsv
+samples_hybcap_tsv: config/samples.hybcap.tsv
+references_yaml:    config/references.yaml
+kits_yaml:          config/kits.yaml
+
+stage_dir:          stage
+results_dir:        results-mosdepth-compare
+
+riker_bin:          ../target/dist/riker
+
+# JVM heaps are unused (no Picard / qualimap in this profile) but the
+# config schema still requires them.
+picard_xmx_gb:      16
+qualimap_xmx_gb:        16
+qualimap_xmx_gb_max:    24
+
+replicates:         3
+
+profiles_enabled:   [wgs-mosdepth]
+
+staging_threads:    8

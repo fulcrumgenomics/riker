@@ -127,6 +127,17 @@ PROFILES = {
         "riker_args": ["multi", "--tools", "hybcap", "alignment", "basic", "isize"],
         "needs_ref": False,
     },
+    # Focused profile for a fair-apples-to-apples mosdepth comparison: the
+    # default wgs-only profile runs mosdepth with `-x` (no CIGAR walk, no
+    # mate-overlap correction), which makes mosdepth look ~20-30% faster
+    # than it would in an accuracy-matched configuration. This profile
+    # runs riker wgs alongside BOTH mosdepth variants so we can quote the
+    # three-way comparison honestly.
+    "wgs-mosdepth": {
+        "input_type": "wgs",
+        "riker_args": ["wgs"],
+        "needs_ref": True,
+    },
 }
 
 # Comparator coverage matrix — which tools run against which profile.
@@ -158,6 +169,11 @@ COMPARATORS = {
         ("riker",          "main"),
         ("picard-cmm",     "base"),    # CollectMultipleMetrics (default 5 programs)
         ("picard-chsm",    "supp"),
+    ],
+    "wgs-mosdepth": [
+        ("riker",             "main"),
+        ("mosdepth",          "main"),   # mosdepth -x (fast mode, no CIGAR/mate-overlap)
+        ("mosdepth-accurate", "main"),   # mosdepth without -x (matches riker's accuracy)
     ],
 }
 
@@ -243,7 +259,7 @@ rule all:
 # the same set of names so any rule can match by sample.
 _PROFILE_REGEX = "|".join(PROFILES.keys())
 _REP_REGEX = r"\d+"
-_TOOL_REGEX = "riker|picard-cmm|picard-cwm|picard-chsm|mosdepth|qualimap"
+_TOOL_REGEX = "riker|picard-cmm|picard-cwm|picard-chsm|mosdepth|mosdepth-accurate|qualimap"
 
 
 wildcard_constraints:

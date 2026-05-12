@@ -1,17 +1,26 @@
-# mosdepth benchmark rule. Mosdepth is a single-purpose coverage tool; it
-# only makes sense as a comparator for the wgs-only and hybcap-only
-# profiles. Bundle profiles don't include mosdepth (no analog of riker
-# multi).
+# mosdepth benchmark rule. Mosdepth is a single-purpose coverage tool;
+# it only makes sense as a comparator for the wgs-only / wgs-mosdepth /
+# hybcap-only profiles. Bundle profiles don't include mosdepth (no
+# analog of `riker multi`).
 #
-# Both branches use `--no-per-base` to skip the heavy per-base output
-# riker doesn't produce either. The wgs branch additionally passes
-# `-x` (mosdepth fast-mode: skip CIGAR walk, count entire fragment as
-# one contiguous block); we deliberately omit `-x` from the hybcap
-# branch because riker `hybcap` and Picard `CollectHsMetrics` both
-# walk CIGARs to apportion bases across capture-region boundaries, and
-# we want mosdepth's accuracy comparable to theirs on capture data.
-# Hybcap's `--by <target.bed>` then constrains coverage to the kit
-# regions.
+# Two tool tokens, mapping to two invocations:
+#
+#   * `mosdepth`           runs with `-x` in the wgs profiles, without
+#                          `-x` in hybcap-only. `-x` is mosdepth's
+#                          documented "fast mode": skip the per-record
+#                          CIGAR walk (each fragment counts as one
+#                          contiguous block) AND skip mate-overlap
+#                          deduplication. That is faster but does NOT
+#                          match riker's accuracy.
+#   * `mosdepth-accurate`  always runs WITHOUT `-x`, so per-record
+#                          CIGAR walking and mate-overlap correction
+#                          are enabled. This is the apples-to-apples
+#                          comparator against riker's wgs.
+#
+# Both invocations also pass `--no-per-base`, since neither riker `wgs`
+# nor Picard `CollectWgsMetrics` writes a per-base output file. The
+# hybcap-only branch passes `--by <target.bed>` to constrain mosdepth
+# to the capture regions.
 #
 # Threading: deliberately omit `-t` so mosdepth uses its default
 # (`-t 0` = no extra decompression threads, htslib runs single-threaded).
@@ -33,20 +42,35 @@ def _mosdepth_inputs(wildcards):
     return inputs
 
 
+def _mosdepth_use_fast_mode(profile: str, tool: str) -> bool:
+    """`-x` (fast mode) selection:
+    - `mosdepth-accurate` token: never (the whole point of the token).
+    - hybcap-only profile:       never (accuracy parity with Picard CHsM).
+    - everything else (wgs-only, wgs-mosdepth + mosdepth token): yes.
+    """
+    if tool == "mosdepth-accurate":
+        return False
+    if profile == "hybcap-only":
+        return False
+    return True
+
+
 rule run_mosdepth:
     input: unpack(_mosdepth_inputs)
     output:
-        time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/time.txt",
+        time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/{{tool}}/rep{{rep}}/time.txt",
     log:
-        cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/cmdline.txt",
-        tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/tool.log",
+        cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/{{tool}}/rep{{rep}}/cmdline.txt",
+        tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/{{tool}}/rep{{rep}}/tool.log",
     wildcard_constraints:
         # mosdepth doesn't run for bundle profiles.
-        profile = "wgs-only|hybcap-only",
+        profile = "wgs-only|wgs-mosdepth|hybcap-only",
+        tool    = "mosdepth|mosdepth-accurate",
     threads: 1
     resources: bench=100
     params:
         target_bed = lambda w: kit_bed_for_sample(w.sample) if w.profile == "hybcap-only" else "",
+        fast_mode  = lambda w: _mosdepth_use_fast_mode(w.profile, w.tool),
     shell:
         r"""
         set -euo pipefail
@@ -56,8 +80,13 @@ rule run_mosdepth:
             cmd=(mosdepth --by {params.target_bed:q} --no-per-base \
                           "$outdir/mosdepth" {input.bam})
         else
-            cmd=(mosdepth -x --no-per-base \
-                          "$outdir/mosdepth" {input.bam})
+            if [[ "{params.fast_mode}" == "True" ]]; then
+                cmd=(mosdepth -x --no-per-base \
+                              "$outdir/mosdepth" {input.bam})
+            else
+                cmd=(mosdepth --no-per-base \
+                              "$outdir/mosdepth" {input.bam})
+            fi
         fi
         printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
         command time -v -o {output.time:q} "${{cmd[@]}}" > {log.tool_log:q} 2>&1

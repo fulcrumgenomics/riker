@@ -1,0 +1,2 @@
+name	source_url	reference	downsample_from	downsample_frac	downsample_seed	approx_bam_gb	benchmark	notes
+HG00188_30x	s3://1000genomes/1000G_2504_high_coverage/data/ERR3240174/HG00188.final.cram	grch38_decoyhla	-	-	-	22	Y	chosen for the riker-vs-mosdepth fair comparison: in the v1 perf run this 30x sample had the largest mosdepth -x advantage over riker (mosdepth 27% faster), so picking it deliberately avoids bias toward riker.
