@@ -21,9 +21,11 @@ import pandas as pd
 from parse_gnu_time import parse as parse_time
 
 
-# results/run/{sample}/{profile}/{tool}/rep{rep}/time.txt
+# <results_dir>/run/{sample}/{profile}/{tool}/rep{rep}/time.txt
+# Anchor on /run/ so we work for any results_dir name (the default config
+# uses results/, focused configs may use results-<scenario>/).
 PATH_RE = re.compile(
-    r"results/run/"
+    r"/run/"
     r"(?P<sample>[^/]+)/"
     r"(?P<profile>[^/]+)/"
     r"(?P<tool>[^/]+)/"
