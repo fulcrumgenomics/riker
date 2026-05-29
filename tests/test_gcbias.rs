@@ -557,6 +557,7 @@ fn test_exclude_intervals_drops_reads_and_windows() {
     // Both reads are aligned; the excluded one shows up as filtered.
     assert_eq!(summary[0].aligned_reads, 2);
     assert_eq!(summary[0].filtered_reads, 1);
+    assert_float_eq!(summary[0].frac_filtered_reads, 0.5, 1e-5);
 }
 
 /// The same exclusion expressed as an IntervalList (1-based, inclusive) drops
@@ -578,6 +579,46 @@ fn test_exclude_intervals_accepts_interval_list() {
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     assert_eq!(detail[100].windows, 21, "IntervalList exclusion drops the same 10 windows");
+}
+
+/// Exclusion is keyed on a reverse-strand read's *computed* start position
+/// (`alignment_end - window_size`), not on whether its span overlaps the
+/// interval. This is the distinguishing behavior vs. an overlap-based filter.
+#[test]
+fn test_exclude_intervals_reverse_strand_uses_computed_start() {
+    // All-G reference, length 40, window_size 10 → 31 windows, all gc=100.
+    let ref_seq = vec![b'G'; 40];
+    let refa = FastaBuilder::new().add_contig("chr1", &ref_seq).to_temp_fasta().unwrap();
+
+    let mut bld = coord_builder(&[("chr1", 40)]);
+    // Reverse read, 20M at 1-based pos 1 → spans 0-based [0,20), which OVERLAPS
+    // the excluded region [0,10). But its computed start is
+    // alignment_end(20) - window_size(10) = 0-based 10, which is NOT excluded →
+    // an overlap filter would drop it; start-position keying KEEPS it.
+    bld.add_unpaired("rev_kept", 0, 1, 60, 20, true, false, false, None);
+    // Reverse read, 5M at 1-based pos 11 → spans 0-based [10,15), which does NOT
+    // overlap [0,10). But its computed start is end(15) - 10 = 0-based 5, which
+    // IS excluded → an overlap filter would keep it; start-position keying DROPS
+    // it.
+    bld.add_unpaired("rev_dropped", 0, 11, 60, 5, true, false, false, None);
+    let bam = bld.to_temp_bam().unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let bed = dir.path().join("exclude.bed");
+    std::fs::write(&bed, "chr1\t0\t10\n").unwrap();
+    let prefix = dir.path().join("out");
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute().unwrap();
+
+    let detail: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+    let summary: Vec<GcBiasSummaryMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
+
+    // Only rev_kept is binned; rev_dropped is filtered. Both are aligned.
+    assert_eq!(reads_used(&detail), 1, "only the read whose computed start is unexcluded is used");
+    assert_eq!(detail[100].read_starts, 1);
+    assert_eq!(summary[0].aligned_reads, 2);
+    assert_eq!(summary[0].filtered_reads, 1);
 }
 
 /// Unmapped reads are counted in total_reads / total_clusters but not in

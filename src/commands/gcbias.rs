@@ -116,6 +116,13 @@ pub struct GcBiasOptions {
     /// constructs — that produce spurious spikes in the GC bias signal. Both
     /// the read (numerator) and the reference window (denominator) at an
     /// excluded position are dropped, keeping the normalization consistent.
+    ///
+    /// The "computed start position" is the read's alignment start for
+    /// forward-strand reads and `alignment_end - window_size` for reverse-strand
+    /// reads (matching how each read is binned). A read is excluded based on
+    /// that single position, not on whether its span overlaps the interval, so
+    /// pad intervals if you need to catch reads whose body — but not start —
+    /// touches an artifact locus.
     #[arg(long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
     pub exclude_intervals: Option<PathBuf>,
 }
@@ -321,7 +328,7 @@ impl GcBiasCollector {
         if Some(ref_id) != self.current_contig_id {
             let name = self.dict.as_ref().unwrap().get_by_index(ref_id).map_or("", |m| m.name());
             let seq = self.reference.load_contig(name, false)?;
-            let mask = self.exclude_intervals.as_ref().map(|ivs| ivs.contig_bitvec(ref_id));
+            let mask = self.contig_exclusion_mask(ref_id);
             let (gc_at_pos, window_counts) = scan_contig_gc(&seq, self.window_size, mask.as_ref());
             self.current_gc_at_pos = gc_at_pos;
             for (bin, count) in window_counts.iter().enumerate() {
@@ -380,6 +387,17 @@ impl GcBiasCollector {
         Ok(())
     }
 
+    /// Build the per-contig exclusion mask for `ref_id`, or `None` if there are
+    /// no exclusion intervals on this contig.
+    ///
+    /// Returning `None` (rather than an empty bitvec) for an unmasked contig
+    /// lets [`scan_contig_gc`] take its no-mask fast path, avoiding a
+    /// bounds-checked bit lookup at every window position.
+    fn contig_exclusion_mask(&self, ref_id: usize) -> Option<BitVec> {
+        let mask = self.exclude_intervals.as_ref()?.contig_bitvec(ref_id);
+        if mask.is_empty() { None } else { Some(mask) }
+    }
+
     /// Finalize metrics computation and write outputs.
     fn finish_metrics(&self) -> Result<()> {
         let reads_used: u64 = self.reads_by_gc.iter().sum();
@@ -391,7 +409,10 @@ impl GcBiasCollector {
 
         // Filtered reads are aligned reads that never landed in a GC bin, for any
         // reason (duplicate/supplementary when excluded, low MAPQ, excluded
-        // interval, or no valid GC window). Derived rather than counted.
+        // interval, or no valid GC window). Derived rather than counted: each
+        // aligned read bins at most once, so `reads_used <= aligned_reads` always
+        // holds and the subtraction cannot underflow (saturating_sub is belt-and-
+        // suspenders for that invariant).
         let filtered_reads = self.aligned_reads.saturating_sub(reads_used);
         let frac_filtered_reads = if self.aligned_reads > 0 {
             filtered_reads as f64 / self.aligned_reads as f64
@@ -624,7 +645,7 @@ impl Collector for GcBiasCollector {
             if !self.visited_contigs.contains(&ref_id) {
                 let name = dict[ref_id].name();
                 let seq = self.reference.load_contig(name, false)?;
-                let mask = self.exclude_intervals.as_ref().map(|ivs| ivs.contig_bitvec(ref_id));
+                let mask = self.contig_exclusion_mask(ref_id);
                 let (_, window_counts) = scan_contig_gc(&seq, self.window_size, mask.as_ref());
                 for (bin, count) in window_counts.iter().enumerate() {
                     self.windows_by_gc[bin] += count;
