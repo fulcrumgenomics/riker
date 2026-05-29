@@ -215,6 +215,7 @@ Collect GC bias metrics:
 
 ```bash
 riker gcbias -i sample.bam -r ref.fa -o out_prefix
+riker gcbias -i sample.bam -r ref.fa -o out_prefix --exclude-intervals artifacts.bed
 ```
 
 Collect hybrid capture metrics:

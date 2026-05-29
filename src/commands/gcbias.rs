@@ -223,6 +223,10 @@ pub struct GcBiasCollector {
     quality_sum_by_gc: [u64; NUM_GC_BINS],
     quality_bases_by_gc: [u64; NUM_GC_BINS],
 
+    // Read-accounting funnel (see GcBiasSummaryMetric): every record except
+    // secondary/QC-fail counts in total_reads; the mapped subset counts in
+    // aligned_reads; reads actually binned are `sum(reads_by_gc)`. The filtered
+    // count is derived as `aligned_reads - sum(reads_by_gc)` at finish.
     total_reads: u64,
     total_clusters: u64,
     aligned_reads: u64,
@@ -346,7 +350,9 @@ impl GcBiasCollector {
             return Ok(());
         }
 
-        // GC lookup
+        // GC lookup. A sentinel value > 100 marks an invalid window start —
+        // either too many Ns or an excluded interval — so the read is dropped
+        // (and counted as filtered via the funnel) here.
         let gc = self.current_gc_at_pos[pos];
         if gc > 100 {
             return Ok(());
@@ -609,7 +615,10 @@ impl Collector for GcBiasCollector {
     }
 
     fn finish(&mut self) -> Result<()> {
-        // Scan any BAM header contigs not visited during record traversal
+        // Scan any BAM header contigs not visited during record traversal so
+        // their windows still contribute to the denominator. The exclusion mask
+        // is applied here too, keeping the denominator consistent on contigs
+        // that had no reads.
         let dict = self.dict.as_ref().unwrap();
         for ref_id in 0..dict.len() {
             if !self.visited_contigs.contains(&ref_id) {
