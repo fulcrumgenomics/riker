@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Missing input files and other invalid inputs now produce a clear error
   instead of a panic. ([#29](https://github.com/fulcrumgenomics/riker/pull/29))
+- The x86_64 multivers launcher exited 255 under Docker amd64 emulation (e.g.
+  the biocontainer on Apple Silicon). Pinned `cargo-multivers >=0.12.0`, which
+  carries the fexecve/memfd fix, in CI and the benchmark install script.
+  ([#32](https://github.com/fulcrumgenomics/riker/issues/32),
+  [#33](https://github.com/fulcrumgenomics/riker/pull/33))
 
 ### Internal
 
