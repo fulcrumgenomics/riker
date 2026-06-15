@@ -17,10 +17,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when passed, counts unpaired reads toward coverage. This is a breaking change
   to the CLI, but the removed flag had no working behavior to preserve.
   ([#34](https://github.com/fulcrumgenomics/riker/issues/34),
-  [#35](https://github.com/fulcrumgenomics/riker/issues/35))
+  [#35](https://github.com/fulcrumgenomics/riker/issues/35),
+  [#36](https://github.com/fulcrumgenomics/riker/pull/36))
 
-## [0.2.0]
+### Fixed
 
-Initial documented release. See the
-[GitHub release notes](https://github.com/fulcrumgenomics/riker/releases) for
-the history prior to this changelog.
+- Missing input files and other invalid inputs now produce a clear error
+  instead of a panic. ([#29](https://github.com/fulcrumgenomics/riker/pull/29))
+
+### Internal
+
+- Added `cargo release` configuration for cutting workspace releases, plus this
+  changelog and automated `[Unreleased]` → version stamping at release time.
+  ([#30](https://github.com/fulcrumgenomics/riker/pull/30))
+
+## [0.2.0] - 2026-05-08
+
+A performance-focused release: several tools got substantially faster and CRAM
+processing is now several times quicker than in 0.1.0.
+
+### Performance
+
+- `riker basic` is ~2.4× faster.
+  ([#18](https://github.com/fulcrumgenomics/riker/pull/18))
+- `riker wgs` is ~2× faster; the depth pipeline was restructured around a shared
+  mate buffer. ([#10](https://github.com/fulcrumgenomics/riker/pull/10))
+- CRAM decoding is several times faster, now via rust-htslib.
+  ([#24](https://github.com/fulcrumgenomics/riker/pull/24))
+- Added reusable byte-level SIMD kernels, adopted in `alignment`, `hybcap`, and
+  `error`. ([#9](https://github.com/fulcrumgenomics/riker/pull/9))
+- BAM/SAM reads reuse `RecordBuf` allocations; `multi` was rewritten around a new
+  `RikerRecord` with pooled records and a crossbeam work queue.
+  ([#4](https://github.com/fulcrumgenomics/riker/pull/4),
+  [#12](https://github.com/fulcrumgenomics/riker/pull/12),
+  [#13](https://github.com/fulcrumgenomics/riker/pull/13),
+  [#15](https://github.com/fulcrumgenomics/riker/pull/15))
+- Switched the flate2 backend to zlib-ng.
+  ([#2](https://github.com/fulcrumgenomics/riker/pull/2))
+
+### Added
+
+- A `sample` column on all per-row metric outputs; `hybcap` per-base output is
+  now gzipped. ([#21](https://github.com/fulcrumgenomics/riker/pull/21))
+- `cargo-multivers` x86_64 release artifacts that dispatch to the best CPU
+  variant at startup. ([#19](https://github.com/fulcrumgenomics/riker/pull/19))
+- A Snakemake performance benchmark pipeline.
+  ([#26](https://github.com/fulcrumgenomics/riker/pull/26))
+
+### Changed
+
+- `riker isize` trims the histogram TSV to the median ± `DEVIATIONS` × MAD.
+  ([#22](https://github.com/fulcrumgenomics/riker/pull/22))
+- Upgraded kuva to 0.2.0 and tightened plot tick/label layout.
+  ([#25](https://github.com/fulcrumgenomics/riker/pull/25))
+- Dropped the release `overflow-checks` override after a WGS-scale audit.
+  ([#17](https://github.com/fulcrumgenomics/riker/pull/17))
+- Bumped noodles (0.107 → 0.110), strum (0.27 → 0.28), and other dependencies.
+  ([#3](https://github.com/fulcrumgenomics/riker/pull/3),
+  [#27](https://github.com/fulcrumgenomics/riker/pull/27))
+
+### Fixed
+
+- Plot text failed to render when running in a bioconda biocontainer.
+  ([#18](https://github.com/fulcrumgenomics/riker/pull/18))
+- Some CRAM files triggered errors or panics.
+  ([#24](https://github.com/fulcrumgenomics/riker/pull/24))
+- Fixed cross-contig orphan processing in `riker error`.
+  ([#11](https://github.com/fulcrumgenomics/riker/pull/11))
+- Read `.sam.gz` files with `MultiGzDecoder` so multi-member streams decode
+  fully. ([#2](https://github.com/fulcrumgenomics/riker/pull/2))
+
+## [0.1.0] - 2026-04-08
+
+First (alpha) release. A fast Rust CLI toolkit that ports key QC-metrics tools
+from Picard/fgbio, processing SAM/BAM/CRAM files and emitting clean TSV.
+
+### Added
+
+- `alignment` — alignment summary metrics (cf. Picard CollectAlignmentSummaryMetrics).
+- `basic` — base distribution, mean quality, and quality score distribution
+  (cf. Picard CollectBaseDistributionByCycle / MeanQualityByCycle /
+  QualityScoreDistribution).
+- `error` — base-level error metrics: mismatch, overlap, indel
+  (cf. Picard CollectSamErrorMetrics).
+- `isize` — insert size distribution metrics (cf. Picard CollectInsertSizeMetrics).
+- `wgs` — whole-genome coverage metrics (cf. Picard CollectWgsMetrics).
+- `gcbias` — GC bias metrics (cf. Picard CollectGcBiasMetrics).
+- `hybcap` — hybrid capture (bait/target) metrics (cf. Picard CollectHsMetrics).
+- `multi` — run multiple collectors in a single BAM pass
+  (cf. Picard CollectMultipleMetrics).
+- `docs` — print metric field documentation.

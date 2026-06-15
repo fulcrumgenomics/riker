@@ -99,6 +99,24 @@ incremental = false
 [package.metadata.multivers.x86_64]
 cpus = ["x86-64", "x86-64-v2", "x86-64-v4"]
 
+# Changelog stamping for `cargo release`. Lives here on the root `riker-ngs`
+# crate (not in the shared `release.toml`) on purpose: pre-release-replacements
+# run once per workspace member, and there is a single CHANGELOG.md at the repo
+# root. Putting it in `release.toml` would run it for `riker-ngs-derive` too and
+# the second pass would fail to find `## [Unreleased]` (already rewritten). This
+# is the same per-crate-runs-twice hazard that `tag = false` guards against in
+# `riker_derive/Cargo.toml`.
+#
+# On `cargo release X.Y.Z`, the lone `## [Unreleased]` heading becomes
+# `## [Unreleased]` (kept, now empty) followed by `## [X.Y.Z] - <date>`, so the
+# accumulated notes drop under the released version and a fresh Unreleased
+# section is ready for the next cycle. `exactly = 1` makes the release abort
+# loudly if the heading is ever missing or renamed rather than silently no-op.
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+]
+
 # Profile that matches release perf closely but keeps symbol + line info for
 # samply/perf. Use via `cargo build --profile bench-prof`.
 #

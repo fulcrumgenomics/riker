@@ -40,3 +40,9 @@ tag-name = "v{{version}}"
 
 # Match the commit-message style used for past version bumps.
 pre-release-commit-message = "Bump version to {{version}}"
+
+# Note: CHANGELOG.md stamping (the `[Unreleased]` -> `[X.Y.Z] - <date>`
+# rewrite) is configured as `pre-release-replacements` under
+# `[package.metadata.release]` in the root `Cargo.toml`, not here. It must be
+# scoped to the single root crate so it doesn't run twice over the one shared
+# changelog -- see the comment there for the full rationale.
