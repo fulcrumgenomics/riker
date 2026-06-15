@@ -328,6 +328,8 @@ riker supports a `--min-mapq` threshold and an `--exclude-intervals` mask (BED o
 - **Exclusion fixes the denominator.** The PR removes excluded reads from the numerator but leaves the reference-window distribution (the denominator) untouched, creating a numerator/denominator asymmetry. riker drops both the read *and* the reference window at an excluded position, keeping normalization consistent.
 - **Exclusion is keyed on the read's computed start position**, not full-read overlap. This matches how reads are binned (by start position), is simpler, and lets users pad intervals when they want span semantics. (The PR uses `overlapsAny`.)
 
+Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per template**: each mate is evaluated independently, mirroring gcbias's per-read-start accounting, so one mate of a pair may be filtered while the other is still counted. riker does not drop a pair as a unit when only one mate fails a filter; widen the intervals to cover both mates, or pre-filter the BAM, if you need pair-level semantics.
+
 **Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema and read-filtering differences above).
 
 ### Differences in error vs. CollectSamErrorMetrics

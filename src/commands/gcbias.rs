@@ -78,8 +78,13 @@ static BASE_FLAGS: [u8; 256] = {
 ///
 /// GC bias measures library-prep bias via read-start positions, so the
 /// defaults are deliberately permissive: duplicates and supplementary
-/// reads are included, MAPQ threshold is 0.  This matches Picard's
-/// CollectGcBiasMetrics behaviour.
+/// reads are included and the MAPQ threshold is 0.
+///
+/// All counting and filtering is per read (read start), not per template:
+/// each read or mate is evaluated and binned independently. A pair is never
+/// dropped as a unit, so any filter (MAPQ, duplicate/supplementary, or
+/// interval exclusion) can drop one mate while keeping the other — they
+/// occupy different start positions and are accounted for separately.
 #[riker_derive::multi_options("gcbias", "GC Bias Options")]
 #[derive(Args, Debug, Clone)]
 #[command()]
@@ -123,6 +128,12 @@ pub struct GcBiasOptions {
     /// that single position, not on whether its span overlaps the interval, so
     /// pad intervals if you need to catch reads whose body — but not start —
     /// touches an artifact locus.
+    ///
+    /// Exclusion is per read, not per template: each mate is tested
+    /// independently, so one mate of a pair may be excluded while the other is
+    /// still counted (the two mates have different start positions). If you
+    /// need both mates dropped together, widen the intervals to cover both or
+    /// pre-filter the BAM.
     #[arg(long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
     pub exclude_intervals: Option<PathBuf>,
 }
