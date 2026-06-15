@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the fexecve/memfd fix, in CI and the benchmark install script.
   ([#32](https://github.com/fulcrumgenomics/riker/issues/32),
   [#33](https://github.com/fulcrumgenomics/riker/pull/33))
+- The usage line could read `Usage: 11 [OPTIONS] <COMMAND>` instead of
+  `Usage: riker ...`. clap derives its displayed program name from `argv[0]`,
+  and under the multivers fexecve/memfd launcher `argv[0]` is the descriptor
+  path (`/proc/self/fd/11`), whose basename is the fd number. Pinned the
+  displayed name with an explicit `bin_name = "riker"`.
+  ([#38](https://github.com/fulcrumgenomics/riker/pull/38))
 
 ### Internal
 
