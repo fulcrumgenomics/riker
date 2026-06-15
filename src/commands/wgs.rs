@@ -54,12 +54,11 @@ pub struct WgsOptions {
     #[arg(long, default_value_t = false)]
     pub include_duplicates: bool,
 
-    /// Exclude unpaired reads from coverage.
+    /// Include unpaired reads (and reads with an unmapped mate) in coverage.
     ///
-    /// Reads without a mapped mate are excluded by default to match
-    /// Picard's behavior.
-    #[arg(long, default_value_t = WgsOptions::DEFAULT_EXCLUDE_UNPAIRED)]
-    pub exclude_unpaired_reads: bool,
+    /// Such reads are excluded by default; pass this flag to count them.
+    #[arg(long, default_value_t = WgsOptions::DEFAULT_INCLUDE_UNPAIRED)]
+    pub include_unpaired_reads: bool,
 
     /// Minimum mapping quality for a base to be counted toward coverage.
     #[arg(long, default_value_t = WgsOptions::DEFAULT_MIN_MAPQ)]
@@ -80,7 +79,7 @@ pub struct WgsOptions {
 }
 
 impl WgsOptions {
-    const DEFAULT_EXCLUDE_UNPAIRED: bool = true;
+    const DEFAULT_INCLUDE_UNPAIRED: bool = false;
     const DEFAULT_MIN_MAPQ: u8 = 20;
     const DEFAULT_MIN_BQ: u8 = 20;
     const DEFAULT_COVERAGE_CAP: u16 = 250;
@@ -91,7 +90,7 @@ impl Default for WgsOptions {
         Self {
             intervals: None,
             include_duplicates: false,
-            exclude_unpaired_reads: Self::DEFAULT_EXCLUDE_UNPAIRED,
+            include_unpaired_reads: Self::DEFAULT_INCLUDE_UNPAIRED,
             min_mapq: Self::DEFAULT_MIN_MAPQ,
             min_bq: Self::DEFAULT_MIN_BQ,
             coverage_cap: Self::DEFAULT_COVERAGE_CAP,
@@ -232,7 +231,7 @@ impl WgsCollector {
             reference,
             intervals,
             include_duplicates: options.include_duplicates,
-            include_unpaired: !options.exclude_unpaired_reads,
+            include_unpaired: options.include_unpaired_reads,
             min_mapq: options.min_mapq,
             min_bq: options.min_bq,
             coverage_cap: options.coverage_cap,
