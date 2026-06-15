@@ -387,20 +387,34 @@ The `--workspace` flag is essential — without it, cargo-release operates
 on the root crate only and leaves `riker-ngs-derive` at the old version,
 which breaks the path-dep version constraint and fails the build.
 
+**Before releasing, make sure `CHANGELOG.md` is up to date.** Land every
+user-facing change with an entry under the `## [Unreleased]` heading as
+part of its own PR (the change and its changelog line travel together).
+At release time, cargo-release rewrites that heading in the version-bump
+commit: `## [Unreleased]` stays (now empty) and a new
+`## [X.Y.Z] - <date>` section appears below it holding the accumulated
+notes. This is wired via `pre-release-replacements` under
+`[package.metadata.release]` in the root `Cargo.toml`. The dry run shows
+the exact rewrite, so review it before executing.
+
 ```bash
-# Dry run — review what would change.
+# Dry run — review what would change (incl. the CHANGELOG.md rewrite).
 cargo release 0.3.0 --workspace
 
-# Real release — bumps every Cargo.toml, updates Cargo.lock, commits with
-# message "Bump version to 0.3.0", tags `v0.3.0`, pushes to origin, and
-# publishes both crates to crates.io in dependency order
+# Real release — bumps every Cargo.toml, updates Cargo.lock, stamps the
+# CHANGELOG.md `[Unreleased]` section as `[0.3.0] - <date>`, commits all of
+# it with message "Bump version to 0.3.0", tags `v0.3.0`, pushes to origin,
+# and publishes both crates to crates.io in dependency order
 # (riker-ngs-derive first, then riker-ngs).
 cargo release 0.3.0 --workspace --execute
 ```
 
-After the push, create the GitHub release object pointing at the new tag
-(e.g. `gh release create v0.3.0 --generate-notes`), then update any
-downstream consumer recipes — at minimum the
+After the push, create the GitHub release object pointing at the new tag.
+Use the freshly stamped `## [0.3.0]` section of `CHANGELOG.md` as the
+release body (e.g. `gh release create v0.3.0 --notes-file <(...)`, or paste
+it in the web UI); `--generate-notes` remains a fallback if the changelog
+section is thin. Then update any downstream consumer recipes — at minimum
+the
 [bioconda riker-ngs recipe](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/riker-ngs)
 needs the new version + the new tarball SHA256:
 
