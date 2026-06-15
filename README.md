@@ -215,6 +215,7 @@ Collect GC bias metrics:
 
 ```bash
 riker gcbias -i sample.bam -r ref.fa -o out_prefix
+riker gcbias -i sample.bam -r ref.fa -o out_prefix --exclude-intervals artifacts.bed
 ```
 
 Collect hybrid capture metrics:
@@ -292,6 +293,44 @@ riker and Picard compute per-target GC fraction differently when a target's refe
 Neither approach is fully correct — the true GC content of N bases is unknown — but riker's treatment avoids the bias toward low GC that Picard introduces. In practice the difference is only visible for targets where N bases make up a meaningful fraction of the reference sequence.
 
 **Impact:** Per-target GC values can differ for N-containing targets, which in turn affects the GC bias curve and the `at_dropout` and `gc_dropout` summary metrics. All other per-target and summary metrics are unaffected.
+
+### Differences in gcbias vs. CollectGcBiasMetrics
+
+#### Summary metrics schema and read accounting
+
+riker reworks the summary schema to make read accounting explicit and auditable. Picard's `GcBiasSummaryMetrics` exposes `ACCUMULATION_LEVEL`, `READS_USED`, `WINDOW_SIZE`, `TOTAL_CLUSTERS`, `ALIGNED_READS`, `AT_DROPOUT`, `GC_DROPOUT`, and `GC_NC_0_19 … GC_NC_80_100`, with `SAMPLE`/`LIBRARY`/`READ_GROUP` columns.
+
+**Dropped fields.** riker emits a single summary row for the whole file, so `ACCUMULATION_LEVEL`, `LIBRARY`, and `READ_GROUP` are omitted (consistent with riker's no-per-read-group convention). `READS_USED` is also dropped: where Picard emits *two* rows — `READS_USED=ALL` and `READS_USED=UNIQUE` — when handling duplicates, riker selects duplicate inclusion with `--exclude-duplicates` and emits one row.
+
+**Added fields.** riker adds an explicit read-accounting funnel:
+
+- `total_reads` — every record except secondary and QC-fail (includes unmapped, duplicate, supplementary, and low-MAPQ reads).
+- `aligned_reads` — the mapped subset of `total_reads`.
+- `filtered_reads` — aligned reads not used in the GC computation (excluded as duplicate/supplementary, low MAPQ, in an excluded interval, or lacking a valid GC window), derived as `aligned_reads` minus the total binned read starts.
+- `frac_filtered_reads` — `filtered_reads / aligned_reads`.
+
+So `total_reads ≥ aligned_reads ≥ (aligned_reads − filtered_reads)`, the last being the reads actually binned. Note Picard's `ALIGNED_READS` in its `UNIQUE` row *excludes* duplicates, whereas riker's `aligned_reads` always counts all mapped reads and reports the excluded portion via `filtered_reads`.
+
+**Renames** follow riker's global conventions: `GC_NC_x_y` → `gc_x_y_normcov`, and lowercase `frac_`-prefixed headers throughout.
+
+#### Read filtering
+
+**Picard** processes every record (`SinglePassSamProgram` applies no record filter), so `TOTAL_CLUSTERS` and `ALIGNED_READS` include secondary, supplementary, and QC-fail reads.
+
+**riker** discards secondary and QC-fail records entirely (counted nowhere), which avoids double-counting molecules represented by secondary alignments. Supplementary reads are included by default — they are real molecules — but can be dropped from the GC bins with `--exclude-supplementary`. Both tools count unmapped reads toward `total_clusters`/`TOTAL_CLUSTERS`, so riker matches Picard there.
+
+**Impact:** for files containing secondary or QC-fail reads, riker's `total_clusters` and `aligned_reads` are lower than Picard's by the count of those reads.
+
+#### `--min-mapq` and `--exclude-intervals` (vs. Picard PR #2030)
+
+riker supports a `--min-mapq` threshold and an `--exclude-intervals` mask (BED or IntervalList) for skipping artifact regions such as poly-G stretches and adapter constructs. Released Picard's `CollectGcBiasMetrics` has neither; both correspond to the unreleased Picard PR [#2030](https://github.com/broadinstitute/picard/pull/2030), with two deliberate improvements over that PR:
+
+- **Exclusion fixes the denominator.** The PR removes excluded reads from the numerator but leaves the reference-window distribution (the denominator) untouched, creating a numerator/denominator asymmetry. riker drops both the read *and* the reference window at an excluded position, keeping normalization consistent.
+- **Exclusion is keyed on the read's computed start position**, not full-read overlap. This matches how reads are binned (by start position), is simpler, and lets users pad intervals when they want span semantics. (The PR uses `overlapsAny`.)
+
+Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per template**: each mate is evaluated independently, mirroring gcbias's per-read-start accounting, so one mate of a pair may be filtered while the other is still counted. riker does not drop a pair as a unit when only one mate fails a filter; widen the intervals to cover both mates, or pre-filter the BAM, if you need pair-level semantics.
+
+**Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema and read-filtering differences above).
 
 ### Differences in error vs. CollectSamErrorMetrics
 

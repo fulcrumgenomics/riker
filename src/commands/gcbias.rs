@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use bitvec::vec::BitVec;
 use clap::Args;
 use kuva::plot::LinePlot;
 use kuva::plot::legend::LegendPosition;
@@ -17,6 +18,7 @@ use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::fasta::Fasta;
+use crate::intervals::Intervals;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{
     FG_BLUE, FG_GRAY, FG_GREEN, FG_SKY, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_twin_y_plot_pdf,
@@ -76,8 +78,13 @@ static BASE_FLAGS: [u8; 256] = {
 ///
 /// GC bias measures library-prep bias via read-start positions, so the
 /// defaults are deliberately permissive: duplicates and supplementary
-/// reads are included, MAPQ threshold is 0.  This matches Picard's
-/// CollectGcBiasMetrics behaviour.
+/// reads are included and the MAPQ threshold is 0.
+///
+/// All counting and filtering is per read (read start), not per template:
+/// each read or mate is evaluated and binned independently. A pair is never
+/// dropped as a unit, so any filter (MAPQ, duplicate/supplementary, or
+/// interval exclusion) can drop one mate while keeping the other — they
+/// occupy different start positions and are accounted for separately.
 #[riker_derive::multi_options("gcbias", "GC Bias Options")]
 #[derive(Args, Debug, Clone)]
 #[command()]
@@ -106,6 +113,29 @@ pub struct GcBiasOptions {
     /// represent real molecules and contribute meaningful signal.
     #[arg(long, default_value_t = false)]
     pub exclude_supplementary: bool,
+
+    /// Exclude reads and reference windows whose computed start position falls
+    /// within these intervals (BED or IntervalList, format auto-detected).
+    ///
+    /// Useful for masking artifact regions — e.g. poly-G stretches or adapter
+    /// constructs — that produce spurious spikes in the GC bias signal. Both
+    /// the read (numerator) and the reference window (denominator) at an
+    /// excluded position are dropped, keeping the normalization consistent.
+    ///
+    /// The "computed start position" is the read's alignment start for
+    /// forward-strand reads and `alignment_end - window_size` for reverse-strand
+    /// reads (matching how each read is binned). A read is excluded based on
+    /// that single position, not on whether its span overlaps the interval, so
+    /// pad intervals if you need to catch reads whose body — but not start —
+    /// touches an artifact locus.
+    ///
+    /// Exclusion is per read, not per template: each mate is tested
+    /// independently, so one mate of a pair may be excluded while the other is
+    /// still counted (the two mates have different start positions). If you
+    /// need both mates dropped together, widen the intervals to cover both or
+    /// pre-filter the BAM.
+    #[arg(long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
+    pub exclude_intervals: Option<PathBuf>,
 }
 
 impl GcBiasOptions {
@@ -120,6 +150,7 @@ impl Default for GcBiasOptions {
             window_size: Self::DEFAULT_WINDOW_SIZE,
             min_mapq: Self::DEFAULT_MIN_MAPQ,
             exclude_supplementary: false,
+            exclude_intervals: None,
         }
     }
 }
@@ -189,9 +220,13 @@ pub struct GcBiasCollector {
     exclude_duplicates: bool,
     min_mapq: u8,
     exclude_supplementary: bool,
+    exclude_intervals_path: Option<PathBuf>,
 
     // BAM contig metadata (populated in initialize)
     dict: Option<SequenceDictionary>,
+
+    // Intervals to exclude (loaded in initialize, merged for correct masking)
+    exclude_intervals: Option<Intervals>,
 
     // Lazy per-contig GC lookup (recomputed on contig transition)
     current_contig_id: Option<usize>,
@@ -206,6 +241,11 @@ pub struct GcBiasCollector {
     quality_sum_by_gc: [u64; NUM_GC_BINS],
     quality_bases_by_gc: [u64; NUM_GC_BINS],
 
+    // Read-accounting funnel (see GcBiasSummaryMetric): every record except
+    // secondary/QC-fail counts in total_reads; the mapped subset counts in
+    // aligned_reads; reads actually binned are `sum(reads_by_gc)`. The filtered
+    // count is derived as `aligned_reads - sum(reads_by_gc)` at finish.
+    total_reads: u64,
     total_clusters: u64,
     aligned_reads: u64,
     sample: String,
@@ -229,7 +269,9 @@ impl GcBiasCollector {
             exclude_duplicates: options.exclude_duplicates,
             min_mapq: options.min_mapq,
             exclude_supplementary: options.exclude_supplementary,
+            exclude_intervals_path: options.exclude_intervals.clone(),
             dict: None,
+            exclude_intervals: None,
             current_contig_id: None,
             current_gc_at_pos: Vec::new(),
             visited_contigs: HashSet::new(),
@@ -239,6 +281,7 @@ impl GcBiasCollector {
             errors_by_gc: [0u64; NUM_GC_BINS],
             quality_sum_by_gc: [0u64; NUM_GC_BINS],
             quality_bases_by_gc: [0u64; NUM_GC_BINS],
+            total_reads: 0,
             total_clusters: 0,
             aligned_reads: 0,
             sample: String::new(),
@@ -249,32 +292,44 @@ impl GcBiasCollector {
     fn process_record(&mut self, record: &RikerRecord) -> Result<()> {
         let flags = record.flags();
 
-        // Filter: skip unmapped, secondary, QC-fail; supplementary only if excluded
-        if flags.is_unmapped()
-            || flags.is_secondary()
-            || flags.is_qc_fail()
-            || (self.exclude_supplementary && flags.is_supplementary())
-        {
+        // Secondary and QC-fail records are discarded outright: they are never
+        // candidates for GC binning and are counted nowhere in the funnel.
+        if flags.is_secondary() || flags.is_qc_fail() {
             return Ok(());
         }
 
-        // Filter: duplicates
-        if self.exclude_duplicates && flags.is_duplicate() {
-            return Ok(());
-        }
+        // total_reads counts every surviving record (incl. unmapped/dup/supp/low-mapq).
+        self.total_reads += 1;
 
-        // Filter: MAPQ
-        let mapq = record.mapping_quality().map_or(255u8, u8::from);
-        if mapq < self.min_mapq {
-            return Ok(());
-        }
-
-        // Cluster counting: first-of-pair or unpaired
+        // Cluster counting: first-of-pair or unpaired. Counted on the total_reads
+        // basis so it includes unmapped reads, mirroring total_reads.
         if !flags.is_segmented() || flags.is_first_segment() {
             self.total_clusters += 1;
         }
 
+        // Unmapped reads have no start position to bin: counted in total_reads
+        // but not in aligned_reads.
+        if flags.is_unmapped() {
+            return Ok(());
+        }
+
+        // aligned_reads counts every mapped record. It is the denominator for
+        // frac_filtered_reads, so all GC-use filters below must come after it;
+        // any read that exits past this point without binning is a "filtered"
+        // read, recovered as `aligned_reads - reads_used` at finish.
         self.aligned_reads += 1;
+
+        // GC-use filters: each is a bare return (the filtered count is derived).
+        if self.exclude_duplicates && flags.is_duplicate() {
+            return Ok(());
+        }
+        if self.exclude_supplementary && flags.is_supplementary() {
+            return Ok(());
+        }
+        let mapq = record.mapping_quality().map_or(255u8, u8::from);
+        if mapq < self.min_mapq {
+            return Ok(());
+        }
 
         // Contig transition: load GC array for the new contig
         let Some(ref_id) = record.reference_sequence_id() else {
@@ -284,7 +339,8 @@ impl GcBiasCollector {
         if Some(ref_id) != self.current_contig_id {
             let name = self.dict.as_ref().unwrap().get_by_index(ref_id).map_or("", |m| m.name());
             let seq = self.reference.load_contig(name, false)?;
-            let (gc_at_pos, window_counts) = scan_contig_gc(&seq, self.window_size);
+            let mask = self.contig_exclusion_mask(ref_id);
+            let (gc_at_pos, window_counts) = scan_contig_gc(&seq, self.window_size, mask.as_ref());
             self.current_gc_at_pos = gc_at_pos;
             for (bin, count) in window_counts.iter().enumerate() {
                 self.windows_by_gc[bin] += count;
@@ -312,7 +368,9 @@ impl GcBiasCollector {
             return Ok(());
         }
 
-        // GC lookup
+        // GC lookup. A sentinel value > 100 marks an invalid window start —
+        // either too many Ns or an excluded interval — so the read is dropped
+        // (and counted as filtered via the funnel) here.
         let gc = self.current_gc_at_pos[pos];
         if gc > 100 {
             return Ok(());
@@ -340,14 +398,38 @@ impl GcBiasCollector {
         Ok(())
     }
 
+    /// Build the per-contig exclusion mask for `ref_id`, or `None` if there are
+    /// no exclusion intervals on this contig.
+    ///
+    /// Returning `None` (rather than an empty bitvec) for an unmasked contig
+    /// lets [`scan_contig_gc`] take its no-mask fast path, avoiding a
+    /// bounds-checked bit lookup at every window position.
+    fn contig_exclusion_mask(&self, ref_id: usize) -> Option<BitVec> {
+        let mask = self.exclude_intervals.as_ref()?.contig_bitvec(ref_id);
+        if mask.is_empty() { None } else { Some(mask) }
+    }
+
     /// Finalize metrics computation and write outputs.
     fn finish_metrics(&self) -> Result<()> {
-        let total_reads: u64 = self.reads_by_gc.iter().sum();
+        let reads_used: u64 = self.reads_by_gc.iter().sum();
         let total_windows: u64 = self.windows_by_gc.iter().sum();
 
         // Compute mean reads per window
         let mean_reads_per_window =
-            if total_windows > 0 { total_reads as f64 / total_windows as f64 } else { 0.0 };
+            if total_windows > 0 { reads_used as f64 / total_windows as f64 } else { 0.0 };
+
+        // Filtered reads are aligned reads that never landed in a GC bin, for any
+        // reason (duplicate/supplementary when excluded, low MAPQ, excluded
+        // interval, or no valid GC window). Derived rather than counted: each
+        // aligned read bins at most once, so `reads_used <= aligned_reads` always
+        // holds and the subtraction cannot underflow (saturating_sub is belt-and-
+        // suspenders for that invariant).
+        let filtered_reads = self.aligned_reads.saturating_sub(reads_used);
+        let frac_filtered_reads = if self.aligned_reads > 0 {
+            filtered_reads as f64 / self.aligned_reads as f64
+        } else {
+            0.0
+        };
 
         // Build detail metrics (101 rows)
         let detail_rows: Vec<GcBiasDetailMetric> = (0..NUM_GC_BINS)
@@ -404,7 +486,10 @@ impl GcBiasCollector {
             sample: self.sample.clone(),
             window_size: u64::from(self.window_size),
             total_clusters: self.total_clusters,
+            total_reads: self.total_reads,
             aligned_reads: self.aligned_reads,
+            filtered_reads,
+            frac_filtered_reads,
             at_dropout,
             gc_dropout,
             gc_0_19_normcov: quintile_nc(0, 19),
@@ -422,10 +507,13 @@ impl GcBiasCollector {
         self.plot_chart(&detail_rows)?;
 
         log::info!(
-            "gcbias: total_clusters={}, aligned_reads={}, at_dropout={at_dropout:.3}, \
+            "gcbias: total_reads={}, total_clusters={}, aligned_reads={}, \
+             filtered_reads={filtered_reads} ({:.1}%), at_dropout={at_dropout:.3}, \
              gc_dropout={gc_dropout:.3}, detail={}, summary={}, plot={}",
+            self.total_reads,
             self.total_clusters,
             self.aligned_reads,
+            frac_filtered_reads * 100.0,
             self.detail_path.display(),
             self.summary_path.display(),
             self.plot_path.display(),
@@ -533,7 +621,21 @@ impl Collector for GcBiasCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
         self.reference.validate_bam_header(header)?;
 
-        self.dict = Some(SequenceDictionary::from(header));
+        let dict = SequenceDictionary::from(header);
+
+        // Load exclusion intervals (if any) and merge them so the per-contig
+        // bitvec mask is correct even when the input intervals overlap.
+        if let Some(path) = &self.exclude_intervals_path {
+            let intervals = Intervals::from_path(path, dict.clone())?.merged();
+            log::info!(
+                "gcbias: excluding {} interval(s) covering {} bases from GC bias",
+                intervals.count(),
+                intervals.territory(),
+            );
+            self.exclude_intervals = Some(intervals);
+        }
+
+        self.dict = Some(dict);
 
         self.sample = derive_sample(&self.input_path, header);
         self.plot_title = format!("GC Bias of {}", self.sample);
@@ -545,13 +647,17 @@ impl Collector for GcBiasCollector {
     }
 
     fn finish(&mut self) -> Result<()> {
-        // Scan any BAM header contigs not visited during record traversal
+        // Scan any BAM header contigs not visited during record traversal so
+        // their windows still contribute to the denominator. The exclusion mask
+        // is applied here too, keeping the denominator consistent on contigs
+        // that had no reads.
         let dict = self.dict.as_ref().unwrap();
         for ref_id in 0..dict.len() {
             if !self.visited_contigs.contains(&ref_id) {
                 let name = dict[ref_id].name();
                 let seq = self.reference.load_contig(name, false)?;
-                let (_, window_counts) = scan_contig_gc(&seq, self.window_size);
+                let mask = self.contig_exclusion_mask(ref_id);
+                let (_, window_counts) = scan_contig_gc(&seq, self.window_size, mask.as_ref());
                 for (bin, count) in window_counts.iter().enumerate() {
                     self.windows_by_gc[bin] += count;
                 }
@@ -606,10 +712,23 @@ pub struct GcBiasSummaryMetric {
     pub sample: String,
     /// Sliding window size used for GC content calculation.
     pub window_size: u64,
-    /// Total clusters (first-of-pair or unpaired mapped reads).
+    /// Total clusters: first-of-pair or unpaired reads among `total_reads`
+    /// (includes unmapped reads).
     pub total_clusters: u64,
-    /// Total aligned reads counted.
+    /// Total reads considered: every read except secondary and QC-fail
+    /// (includes unmapped, duplicate, supplementary, and low-MAPQ reads).
+    pub total_reads: u64,
+    /// Aligned reads: the mapped subset of `total_reads`.
     pub aligned_reads: u64,
+    /// Filtered reads: aligned reads not used in the GC bias computation
+    /// (excluded as duplicate/supplementary, low MAPQ, in an excluded interval,
+    /// or lacking a valid GC window). Equals `aligned_reads` minus the total
+    /// binned read starts.
+    pub filtered_reads: u64,
+    /// Fraction of aligned reads that were filtered out of the GC bias
+    /// computation (`filtered_reads / aligned_reads`).
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_filtered_reads: f64,
     /// AT dropout: deficit at GC 0-50%.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub at_dropout: f64,
@@ -697,7 +816,18 @@ fn gc_percentage(gc_count: u32, window_size: u32) -> u8 {
 /// which is significantly faster than per-base `match` comparisons for
 /// genome-scale contigs.  The lookup table is case-insensitive, so the input
 /// sequence does not need to be uppercased first.
-fn scan_contig_gc(seq: &[u8], window_size: u32) -> (Vec<u8>, [u64; NUM_GC_BINS]) {
+///
+/// If `excluded` is supplied (a per-contig bitvec where set bits mark excluded
+/// positions), any window whose start position is excluded is treated as
+/// invalid: it is left as `u8::MAX` in `gc_at_pos` and omitted from
+/// `window_counts`. Because reads are binned by their computed start position,
+/// this simultaneously drops the read (numerator, via the `u8::MAX` sentinel)
+/// and the reference window (denominator), keeping normalization consistent.
+fn scan_contig_gc(
+    seq: &[u8],
+    window_size: u32,
+    excluded: Option<&BitVec>,
+) -> (Vec<u8>, [u64; NUM_GC_BINS]) {
     let ws = window_size as usize;
     let mut gc_at_pos = vec![u8::MAX; seq.len()];
     let mut window_counts = [0u64; NUM_GC_BINS];
@@ -705,6 +835,10 @@ fn scan_contig_gc(seq: &[u8], window_size: u32) -> (Vec<u8>, [u64; NUM_GC_BINS])
     if seq.len() < ws {
         return (gc_at_pos, window_counts);
     }
+
+    // A window start position is excluded if its bit is set in the mask.
+    // `is_some_and` short-circuits to false (cheap) when no mask is supplied.
+    let is_excluded = |pos: usize| excluded.is_some_and(|bv| bv.get(pos).is_some_and(|b| *b));
 
     // Initialize counts for the first window using the lookup table
     let mut gc_count: u32 = 0;
@@ -716,7 +850,7 @@ fn scan_contig_gc(seq: &[u8], window_size: u32) -> (Vec<u8>, [u64; NUM_GC_BINS])
     }
 
     // Record the first window
-    if n_count <= MAX_N_IN_WINDOW {
+    if n_count <= MAX_N_IN_WINDOW && !is_excluded(0) {
         let gc_pct = gc_percentage(gc_count, window_size);
         gc_at_pos[0] = gc_pct;
         window_counts[gc_pct as usize] += 1;
@@ -732,7 +866,7 @@ fn scan_contig_gc(seq: &[u8], window_size: u32) -> (Vec<u8>, [u64; NUM_GC_BINS])
         n_count -= u32::from((leaving_flags & N_FLAG) >> 1);
         n_count += u32::from((entering_flags & N_FLAG) >> 1);
 
-        if n_count <= MAX_N_IN_WINDOW {
+        if n_count <= MAX_N_IN_WINDOW && !is_excluded(i) {
             let gc_pct = gc_percentage(gc_count, window_size);
             gc_at_pos[i] = gc_pct;
             window_counts[gc_pct as usize] += 1;
@@ -774,9 +908,9 @@ mod tests {
         let upper = b"GGGGAAAA";
         let lower = b"ggggaaaa";
         let mixed = b"GgGgAaAa";
-        let (gc_u, counts_u) = scan_contig_gc(upper, 4);
-        let (gc_l, counts_l) = scan_contig_gc(lower, 4);
-        let (gc_m, counts_m) = scan_contig_gc(mixed, 4);
+        let (gc_u, counts_u) = scan_contig_gc(upper, 4, None);
+        let (gc_l, counts_l) = scan_contig_gc(lower, 4, None);
+        let (gc_m, counts_m) = scan_contig_gc(mixed, 4, None);
         assert_eq!(gc_u, gc_l);
         assert_eq!(gc_u, gc_m);
         assert_eq!(counts_u, counts_l);
@@ -787,7 +921,7 @@ mod tests {
     fn test_scan_contig_gc_simple() {
         // All-A sequence with window_size=4 → GC% = 0 at every position
         let seq = b"AAAAAAAA";
-        let (gc, counts) = scan_contig_gc(seq, 4);
+        let (gc, counts) = scan_contig_gc(seq, 4, None);
         assert_eq!(gc.len(), 8);
         assert_eq!(gc[0], 0); // first window [0..4] = AAAA → 0% GC
         assert_eq!(gc[4], 0); // last window [4..8] = AAAA → 0% GC
@@ -804,7 +938,7 @@ mod tests {
         // pos 3: GAAA → 25% GC
         // pos 4: AAAA → 0% GC
         let seq = b"GGGGAAAA";
-        let (gc, counts) = scan_contig_gc(seq, 4);
+        let (gc, counts) = scan_contig_gc(seq, 4, None);
         assert_eq!(gc[0], 100);
         assert_eq!(gc[1], 75);
         assert_eq!(gc[2], 50);
@@ -821,7 +955,7 @@ mod tests {
     fn test_scan_contig_gc_with_ns() {
         // 5 N's then 4 A's, window_size=4
         let seq = b"NNNNNAAAA";
-        let (gc, _) = scan_contig_gc(seq, 4);
+        let (gc, _) = scan_contig_gc(seq, 4, None);
         // pos 0: NNNN → 4 Ns, valid (≤4)
         assert_eq!(gc[0], 0); // 0 GC out of 4 (Ns aren't GC)
         // pos 1: NNNA → 3 Ns, valid
@@ -834,7 +968,7 @@ mod tests {
     fn test_scan_contig_gc_too_many_ns() {
         // All N's with window_size=5 → each window has 5 Ns > 4 → invalid
         let seq = b"NNNNNNNNN";
-        let (gc, counts) = scan_contig_gc(seq, 5);
+        let (gc, counts) = scan_contig_gc(seq, 5, None);
         for &v in &gc[..5] {
             assert_eq!(v, u8::MAX, "window with >4 Ns should be invalid");
         }
@@ -846,7 +980,7 @@ mod tests {
     fn test_scan_contig_gc_short_seq() {
         // Sequence shorter than window_size
         let seq = b"GC";
-        let (gc, counts) = scan_contig_gc(seq, 4);
+        let (gc, counts) = scan_contig_gc(seq, 4, None);
         assert_eq!(gc.len(), 2);
         assert_eq!(gc[0], u8::MAX);
         assert_eq!(gc[1], u8::MAX);
@@ -882,7 +1016,7 @@ mod tests {
     fn test_scan_contig_gc_window_size_1() {
         // Window size 1: each position is its own window
         let seq = b"GCAT";
-        let (gc, counts) = scan_contig_gc(seq, 1);
+        let (gc, counts) = scan_contig_gc(seq, 1, None);
         assert_eq!(gc[0], 100); // G → 100% GC
         assert_eq!(gc[1], 100); // C → 100% GC
         assert_eq!(gc[2], 0); // A → 0% GC
@@ -895,7 +1029,7 @@ mod tests {
     fn test_scan_contig_gc_all_gc() {
         // All G/C → every window is 100% GC
         let seq = b"GCGCGCGC";
-        let (gc, counts) = scan_contig_gc(seq, 4);
+        let (gc, counts) = scan_contig_gc(seq, 4, None);
         for (pos, &val) in gc.iter().enumerate().take(5) {
             assert_eq!(val, 100, "pos {pos} should be 100% GC");
         }
@@ -907,7 +1041,7 @@ mod tests {
         // Exactly MAX_N_IN_WINDOW (4) Ns → valid; 5 Ns → invalid
         // Window size=5: "NNNNA" has 4 Ns → valid; "NNNNN" has 5 → invalid
         let seq = b"NNNNANNNN";
-        let (gc, _) = scan_contig_gc(seq, 5);
+        let (gc, _) = scan_contig_gc(seq, 5, None);
         // pos 0: NNNNA → 4 Ns, valid
         assert_ne!(gc[0], u8::MAX);
         assert_eq!(gc[0], 0); // 0 GC bases out of 5
@@ -916,8 +1050,30 @@ mod tests {
         assert_eq!(gc[4], 0);
         // But "NNNNN" (5 Ns) would be invalid
         let seq2 = b"NNNNN";
-        let (gc2, _) = scan_contig_gc(seq2, 5);
+        let (gc2, _) = scan_contig_gc(seq2, 5, None);
         assert_eq!(gc2[0], u8::MAX);
+    }
+
+    #[test]
+    fn test_scan_contig_gc_with_exclusion_mask() {
+        use bitvec::prelude::*;
+        // 8 G's, window_size 4 → 5 windows, all gc=100.
+        let seq = b"GGGGGGGG";
+        // Exclude window-start positions 0 and 1.
+        let mut mask: BitVec = bitvec![0; seq.len()];
+        mask.set(0, true);
+        mask.set(1, true);
+
+        let (gc, counts) = scan_contig_gc(seq, 4, Some(&mask));
+
+        // Excluded starts are invalid in gc_at_pos (so reads there are dropped)...
+        assert_eq!(gc[0], u8::MAX, "excluded window start 0 marked invalid");
+        assert_eq!(gc[1], u8::MAX, "excluded window start 1 marked invalid");
+        assert_eq!(gc[2], 100);
+        assert_eq!(gc[3], 100);
+        assert_eq!(gc[4], 100);
+        // ...and dropped from the window counts (denominator): 5 − 2 = 3.
+        assert_eq!(counts[100], 3, "excluded windows removed from the denominator");
     }
 
     // ── normalized_coverage_and_error ────────────────────────────────────────

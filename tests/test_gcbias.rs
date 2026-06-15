@@ -28,8 +28,19 @@ fn make_cmd(
         input: InputOptions { input: bam.to_path_buf() },
         output: OutputOptions { output: prefix.to_path_buf() },
         reference: ReferenceOptions { reference: ref_fa.to_path_buf() },
-        options: GcBiasOptions { exclude_duplicates, window_size, min_mapq, exclude_supplementary },
+        options: GcBiasOptions {
+            exclude_duplicates,
+            window_size,
+            min_mapq,
+            exclude_supplementary,
+            exclude_intervals: None,
+        },
     }
+}
+
+/// Sum the binned read starts across all GC bins (i.e. the reads actually used).
+fn reads_used(detail: &[GcBiasDetailMetric]) -> u64 {
+    detail.iter().map(|r| r.read_starts).sum()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -179,21 +190,29 @@ fn test_duplicate_handling() {
     bld.add_unpaired("dup", 0, 1, 60, 10, false, true, false, None);
     let bam = bld.to_temp_bam().unwrap();
 
-    // Default (include duplicates)
+    // Default (include duplicates): all three reads are used.
     let dir1 = TempDir::new().unwrap();
     let prefix1 = dir1.path().join("out");
     make_cmd(bam.path(), refa.path(), &prefix1, false, 10, 20, false).execute().unwrap();
+    let detail1: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir1.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     let summary1: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir1.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
     assert_eq!(summary1[0].aligned_reads, 3);
+    assert_eq!(reads_used(&detail1), 3);
+    assert_eq!(summary1[0].filtered_reads, 0);
 
-    // Exclude duplicates
+    // Exclude duplicates: the duplicate is still aligned, but filtered from the bins.
     let dir2 = TempDir::new().unwrap();
     let prefix2 = dir2.path().join("out");
     make_cmd(bam.path(), refa.path(), &prefix2, true, 10, 20, false).execute().unwrap();
+    let detail2: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir2.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     let summary2: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir2.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
-    assert_eq!(summary2[0].aligned_reads, 2);
+    assert_eq!(summary2[0].aligned_reads, 3, "the duplicate is mapped, so still aligned");
+    assert_eq!(reads_used(&detail2), 2, "the duplicate is excluded from the GC bins");
+    assert_eq!(summary2[0].filtered_reads, 1);
 }
 
 /// GC dropout: reads only in low-GC regions → `gc_dropout` > 0.
@@ -362,10 +381,19 @@ fn test_read_filtering() {
 
     make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
 
+    let detail: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
-    // Good read + supplementary read should be counted (supplementary included by default)
-    assert_eq!(summary[0].aligned_reads, 2, "good + supplementary reads should be counted");
+
+    // Secondary and QC-fail reads are discarded entirely (counted nowhere).
+    // The remaining good/supplementary/low-MAPQ reads are all mapped, so all
+    // three count as aligned; only good + supplementary are actually used.
+    assert_eq!(summary[0].total_reads, 3, "good + supplementary + low-MAPQ survive discard");
+    assert_eq!(summary[0].aligned_reads, 3, "all three survivors are mapped");
+    assert_eq!(reads_used(&detail), 2, "low-MAPQ read is filtered from the GC bins");
+    assert_eq!(summary[0].filtered_reads, 1, "the low-MAPQ read is the one filtered");
+    assert_float_eq!(summary[0].frac_filtered_reads, 1.0 / 3.0, 1e-5);
 }
 
 /// Paired reads: first-of-pair counts as cluster, both count as aligned.
@@ -452,8 +480,173 @@ fn test_exclude_supplementary() {
 
     make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, true).execute().unwrap();
 
+    let detail: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
-    // Only the good read should be counted when supplementary reads are excluded
-    assert_eq!(summary[0].aligned_reads, 1, "supplementary should be excluded");
+    // The supplementary read is mapped (so still aligned) but excluded from the
+    // GC bins; only the good read is used.
+    assert_eq!(summary[0].aligned_reads, 2, "both reads are mapped");
+    assert_eq!(reads_used(&detail), 1, "supplementary excluded from the bins");
+    assert_eq!(summary[0].filtered_reads, 1);
+}
+
+/// Build a `gcbias` command with an explicit exclusion-intervals file.
+fn make_cmd_with_excludes(
+    bam: &std::path::Path,
+    ref_fa: &std::path::Path,
+    prefix: &std::path::Path,
+    window_size: u32,
+    exclude_intervals: std::path::PathBuf,
+) -> GcBias {
+    GcBias {
+        input: InputOptions { input: bam.to_path_buf() },
+        output: OutputOptions { output: prefix.to_path_buf() },
+        reference: ReferenceOptions { reference: ref_fa.to_path_buf() },
+        options: GcBiasOptions {
+            exclude_duplicates: false,
+            window_size,
+            min_mapq: 20,
+            exclude_supplementary: false,
+            exclude_intervals: Some(exclude_intervals),
+        },
+    }
+}
+
+/// Excluded intervals drop both the read (numerator) and its reference window
+/// (denominator), keyed on the read's computed start position.
+#[test]
+fn test_exclude_intervals_drops_reads_and_windows() {
+    // All-G reference of length 40 → with window_size 10 there are 31 windows,
+    // every one at gc=100.
+    let ref_seq = vec![b'G'; 40];
+    let refa = FastaBuilder::new().add_contig("chr1", &ref_seq).to_temp_fasta().unwrap();
+
+    // Read A starts at 0-based 0 (we will exclude it); read B at 0-based 10 (kept).
+    let mut bld = coord_builder(&[("chr1", 40)]);
+    bld.add_unpaired("a_excluded", 0, 1, 60, 10, false, false, false, None);
+    bld.add_unpaired("b_kept", 0, 11, 60, 10, false, false, false, None);
+    let bam = bld.to_temp_bam().unwrap();
+
+    // Baseline without exclusion: 31 windows, both reads used.
+    let dir0 = TempDir::new().unwrap();
+    let prefix0 = dir0.path().join("out");
+    make_cmd(bam.path(), refa.path(), &prefix0, false, 10, 20, false).execute().unwrap();
+    let detail0: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir0.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+    assert_eq!(detail0[100].windows, 31, "31 all-G windows without exclusion");
+    assert_eq!(detail0[100].read_starts, 2, "both reads used without exclusion");
+
+    // Exclude window-start positions 0..10 via a BED file.
+    let dir = TempDir::new().unwrap();
+    let bed = dir.path().join("exclude.bed");
+    std::fs::write(&bed, "chr1\t0\t10\n").unwrap();
+    let prefix = dir.path().join("out");
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute().unwrap();
+
+    let detail: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+    let summary: Vec<GcBiasSummaryMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
+
+    // Denominator: window starts 0..9 (10 windows) dropped → 21 remain.
+    assert_eq!(detail[100].windows, 21, "10 excluded windows removed from the denominator");
+    // Numerator: read A (start 0) dropped; read B (start 10) kept.
+    assert_eq!(detail[100].read_starts, 1, "read starting in an excluded region is dropped");
+    assert_eq!(reads_used(&detail), 1);
+    // Both reads are aligned; the excluded one shows up as filtered.
+    assert_eq!(summary[0].aligned_reads, 2);
+    assert_eq!(summary[0].filtered_reads, 1);
+    assert_float_eq!(summary[0].frac_filtered_reads, 0.5, 1e-5);
+}
+
+/// The same exclusion expressed as an IntervalList (1-based, inclusive) drops
+/// the same windows as the BED form.
+#[test]
+fn test_exclude_intervals_accepts_interval_list() {
+    let ref_seq = vec![b'G'; 40];
+    let refa = FastaBuilder::new().add_contig("chr1", &ref_seq).to_temp_fasta().unwrap();
+    let bld = coord_builder(&[("chr1", 40)]);
+    let bam = bld.to_temp_bam().unwrap();
+
+    // 0-based [0,10) == 1-based [1,10] inclusive.
+    let dir = TempDir::new().unwrap();
+    let il = dir.path().join("exclude.interval_list");
+    std::fs::write(&il, "@SQ\tSN:chr1\tLN:40\nchr1\t1\t10\t+\texcl\n").unwrap();
+    let prefix = dir.path().join("out");
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, il).execute().unwrap();
+
+    let detail: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+    assert_eq!(detail[100].windows, 21, "IntervalList exclusion drops the same 10 windows");
+}
+
+/// Exclusion is keyed on a reverse-strand read's *computed* start position
+/// (`alignment_end - window_size`), not on whether its span overlaps the
+/// interval. This is the distinguishing behavior vs. an overlap-based filter.
+#[test]
+fn test_exclude_intervals_reverse_strand_uses_computed_start() {
+    // All-G reference, length 40, window_size 10 → 31 windows, all gc=100.
+    let ref_seq = vec![b'G'; 40];
+    let refa = FastaBuilder::new().add_contig("chr1", &ref_seq).to_temp_fasta().unwrap();
+
+    let mut bld = coord_builder(&[("chr1", 40)]);
+    // Reverse read, 20M at 1-based pos 1 → spans 0-based [0,20), which OVERLAPS
+    // the excluded region [0,10). But its computed start is
+    // alignment_end(20) - window_size(10) = 0-based 10, which is NOT excluded →
+    // an overlap filter would drop it; start-position keying KEEPS it.
+    bld.add_unpaired("rev_kept", 0, 1, 60, 20, true, false, false, None);
+    // Reverse read, 5M at 1-based pos 11 → spans 0-based [10,15), which does NOT
+    // overlap [0,10). But its computed start is end(15) - 10 = 0-based 5, which
+    // IS excluded → an overlap filter would keep it; start-position keying DROPS
+    // it.
+    bld.add_unpaired("rev_dropped", 0, 11, 60, 5, true, false, false, None);
+    let bam = bld.to_temp_bam().unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let bed = dir.path().join("exclude.bed");
+    std::fs::write(&bed, "chr1\t0\t10\n").unwrap();
+    let prefix = dir.path().join("out");
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute().unwrap();
+
+    let detail: Vec<GcBiasDetailMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+    let summary: Vec<GcBiasSummaryMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
+
+    // Only rev_kept is binned; rev_dropped is filtered. Both are aligned.
+    assert_eq!(reads_used(&detail), 1, "only the read whose computed start is unexcluded is used");
+    assert_eq!(detail[100].read_starts, 1);
+    assert_eq!(summary[0].aligned_reads, 2);
+    assert_eq!(summary[0].filtered_reads, 1);
+}
+
+/// Unmapped reads are counted in total_reads / total_clusters but not in
+/// aligned_reads, and they never inflate filtered_reads.
+#[test]
+fn test_unmapped_counts_in_total_not_aligned() {
+    let ref_seq = vec![b'A'; 20];
+    let refa = FastaBuilder::new().add_contig("chr1", &ref_seq).to_temp_fasta().unwrap();
+
+    let mut bld = coord_builder(&[("chr1", 20)]);
+    bld.add_unpaired("mapped", 0, 1, 60, 10, false, false, false, None);
+    let unmapped = RecordBuf::builder()
+        .set_name("unmapped")
+        .set_flags(Flags::UNMAPPED)
+        .set_sequence(Sequence::from(vec![b'A'; 10]))
+        .set_quality_scores(QualityScores::from(vec![30u8; 10]))
+        .build();
+    bld.add_record(unmapped);
+    let bam = bld.to_temp_bam().unwrap();
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+
+    let summary: Vec<GcBiasSummaryMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
+    assert_eq!(summary[0].total_reads, 2, "both reads counted in total_reads");
+    assert_eq!(summary[0].total_clusters, 2, "both reads counted as clusters");
+    assert_eq!(summary[0].aligned_reads, 1, "only the mapped read is aligned");
+    assert_eq!(summary[0].filtered_reads, 0, "the unmapped read never enters the aligned funnel");
 }

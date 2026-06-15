@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`gcbias --exclude-intervals`** (BED or IntervalList, auto-detected) to mask
+  artifact regions — e.g. poly-G stretches or adapter constructs — from the
+  GC-bias signal. Both the read and its reference window at an excluded position
+  are dropped, keeping the numerator/denominator normalization consistent.
+  Exclusion is keyed on each read's computed start position and applied per read.
+  ([#31](https://github.com/fulcrumgenomics/riker/pull/31))
+
 ### Changed
 
+- **`gcbias` summary schema:** read accounting is now an explicit, auditable
+  funnel — `total_reads` → `aligned_reads` → `filtered_reads` /
+  `frac_filtered_reads` — and secondary/QC-fail records are excluded outright
+  (counted nowhere) rather than inflating the totals.
+  ([#31](https://github.com/fulcrumgenomics/riker/pull/31))
 - **`wgs`: replaced `--exclude-unpaired-reads` with `--include-unpaired-reads`.**
   The old flag was a boolean that defaulted to `true` with no way to negate it
   from the command line, so unpaired reads (and reads with an unmapped mate)
