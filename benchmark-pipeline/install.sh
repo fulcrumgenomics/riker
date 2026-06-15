@@ -125,7 +125,9 @@ ARCH="$(uname -m)"
 if [[ "$ARCH" == "x86_64" || "$ARCH" == "amd64" ]]; then
   if ! command -v cargo-multivers >/dev/null 2>&1; then
     log "Installing cargo-multivers"
-    cargo install cargo-multivers --locked
+    # Floor of 0.12.0: carries the fexecve/memfd fix needed for the launcher
+    # to run under binfmt emulation (fulcrumgenomics/riker#32).
+    cargo install cargo-multivers --locked --version '>=0.12.0'
   else
     log "cargo-multivers found"
   fi
