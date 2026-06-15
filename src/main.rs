@@ -39,6 +39,7 @@ const STYLES: Styles = Styles::styled()
 #[derive(Parser)]
 #[command(
     name = "riker",
+    bin_name = "riker",
     version = env!("CARGO_PKG_VERSION"),
     long_about,
     styles = STYLES,
