@@ -12,6 +12,22 @@ license = "MIT"
 edition = "2024"
 rust-version = "1.94.0" # minimum supported; toolchain pinned to stable
 
+# Allowlist of what gets published to crates.io. An allowlist (rather than an
+# `exclude` denylist) means dev/release tooling and the benchmark pipeline can
+# never silently leak into a release: only the paths named here ship. `LICENSE`
+# must be listed explicitly because `license` above is an SPDX id, not a
+# `license-file`. Cargo.lock, Cargo.toml.orig, and .cargo_vcs_info.json are
+# added by cargo regardless and are not listed.
+include = [
+    "/src",
+    "/build.rs",
+    "/tests",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
+
 [lib]
 name = "riker_lib"
 path = "src/lib.rs"
