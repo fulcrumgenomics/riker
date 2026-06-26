@@ -321,6 +321,16 @@ So `total_reads ≥ aligned_reads ≥ (aligned_reads − filtered_reads)`, the l
 
 **Impact:** for files containing secondary or QC-fail reads, riker's `total_clusters` and `aligned_reads` are lower than Picard's by the count of those reads.
 
+#### Read-to-window GC binning (forward-strand offset)
+
+Both tools precompute, for every reference position, the %GC of the window starting there, then assign each read to a single %GC bin using the window at one computed position: the alignment start for forward-strand reads, and `alignment_end − window_size` for reverse-strand reads.
+
+Picard stores these per-window GC values in a 0-based array (`gc[i]` is the window covering reference bases `[i, i + windowSize)`) but, for forward reads, indexes it with `SAMRecord.getAlignmentStart()`, which is **1-based**. A forward read therefore lands on `gc[start]` — the window beginning one base 3′ of the read's actual leftmost aligned base. Reverse reads use `getAlignmentEnd() − scanWindowSize`, which resolves to the intended window, so they are unaffected.
+
+riker converts the alignment start to 0-based before indexing, so a forward read is binned by the window anchored exactly at its leftmost aligned base. riker's reverse-strand handling matches Picard's.
+
+**Impact:** forward-strand reads are binned by windows that sit one base apart between the two tools; reverse-strand reads agree. This affects every forward read — not only N-containing or flagged regions — so it is the one difference present even with default flags and an N-free reference. Near a local GC transition a read can fall into an adjacent integer %GC bin, producing a small, systematic shift in the detail GC curve and in the `at_dropout` / `gc_dropout` and normalized-coverage values derived from it.
+
 #### `--min-mapq` and `--exclude-intervals` (vs. Picard PR #2030)
 
 riker supports a `--min-mapq` threshold and an `--exclude-intervals` mask (BED or IntervalList) for skipping artifact regions such as poly-G stretches and adapter constructs. Released Picard's `CollectGcBiasMetrics` has neither; both correspond to the unreleased Picard PR [#2030](https://github.com/broadinstitute/picard/pull/2030), with two deliberate improvements over that PR:
@@ -330,7 +340,7 @@ riker supports a `--min-mapq` threshold and an `--exclude-intervals` mask (BED o
 
 Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per template**: each mate is evaluated independently, mirroring gcbias's per-read-start accounting, so one mate of a pair may be filtered while the other is still counted. riker does not drop a pair as a unit when only one mate fails a filter; widen the intervals to cover both mates, or pre-filter the BAM, if you need pair-level semantics.
 
-**Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema and read-filtering differences above).
+**Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema, read-filtering, and forward-strand binning differences above).
 
 ### Differences in error vs. CollectSamErrorMetrics
 
