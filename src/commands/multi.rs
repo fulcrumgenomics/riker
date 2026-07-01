@@ -61,18 +61,19 @@
 //!   returning (without finalizing), so the reader aborts on its next send
 //!   and sibling workers stop at their next batch instead of processing the
 //!   rest of the in-flight work.
-//! - If the reader itself errors it returns `Err`; `run_parallel` sets the
-//!   poison flag after `reader_handle.join()` so workers skip finalization
-//!   and return without writing partial output.
+//! - If the reader itself errors it returns `Err`; the reader closure sets
+//!   the poison flag *before* dropping the group senders, so by the time a
+//!   worker is woken by the closed channel and reaches its post-EOF check the
+//!   flag is already visible and it skips finalization — no partial output.
 //!
 //! Errors are surfaced by `handle.join()` on the main thread — the
 //! reader's error wins if present, otherwise the first worker error.
 //!
 //! All `poison` flag accesses use `Ordering::Relaxed`. Relaxed is
-//! sufficient because the flag is a hint that *some* thread errored; the
-//! actual shared state (the channels) is synchronised by its own
-//! primitives and provides whatever happens-before edges the program
-//! needs.
+//! sufficient because the flag is a standalone boolean read only through its
+//! own atomic (coherence guarantees a store becomes visible to later loads);
+//! it carries no other memory with it, and the reader-error ordering above is
+//! established by the channel close, not by the flag.
 //!
 //! ## Single-threaded path
 //!
@@ -354,7 +355,10 @@ impl Command for Multi {
 
         let collectors = self.build_collectors(&seen, reader.header())?;
 
-        if plan.compute_workers > 1 {
+        // A budget above 1 always runs the pipeline (reader thread + at least
+        // one worker), so the extra thread is actually used; only a budget of
+        // 1 collapses to a single serial pass.
+        if total.get() > 1 {
             run_parallel(reader, collectors, plan.compute_workers)?;
         } else {
             run_single_threaded(reader, collectors)?;
@@ -627,13 +631,21 @@ fn run_parallel(
                 requirements_ref,
                 poison_ref,
             );
+            // Poison BEFORE closing the channels: dropping the senders is what
+            // wakes the workers out of `recv()`, so if we dropped first a
+            // worker could observe the closed channel, read `poison == false`,
+            // and finalize (writing output over a truncated record stream)
+            // before we set the flag. Setting it first guarantees every worker
+            // sees the poison at its post-EOF check.
+            if reader_result.is_err() {
+                poison_ref.store(true, Ordering::Relaxed);
+            }
             drop(group_senders);
             reader_result
         });
 
         let reader_result = reader_handle.join().map_err(|_| anyhow!("reader thread panicked"))?;
         if let Err(e) = reader_result {
-            poison.store(true, Ordering::Relaxed);
             for handle in worker_handles {
                 let _ = handle.join();
             }

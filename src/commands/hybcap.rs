@@ -1281,6 +1281,14 @@ impl Collector for HybCapCollector {
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE
     }
+
+    /// Per-base target/bait coverage pileup makes this a heavy collector, so it
+    /// earns a large share of a worker. This is an estimate — `hybcap` was not
+    /// part of the 5-collector isolation benchmark the other hints came from —
+    /// pending its own measurement.
+    fn cost_hint(&self) -> u32 {
+        50
+    }
 }
 
 // ─── Metric structs ───────────────────────────────────────────────────────────

@@ -1100,6 +1100,14 @@ impl Collector for ErrorCollector {
         // Reads sequence bases + quality scores + the NM aux tag.
         RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM")
     }
+
+    /// Per-base covariate stratification plus VCF-mask lookups make this a
+    /// heavy collector, so it earns a large share of a worker. This is an
+    /// estimate — `error` was not part of the 5-collector isolation benchmark
+    /// the other hints came from — pending its own measurement.
+    fn cost_hint(&self) -> u32 {
+        45
+    }
 }
 
 // ─── Metric structs ─────────────────────────────────────────────────────────────
