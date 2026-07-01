@@ -20,7 +20,7 @@ fn run_alignment(bam: &std::path::Path) -> Result<Vec<AlignmentSummaryMetric>> {
     let mut collector =
         AlignmentCollector::new(bam, &prefix_path, None, &AlignmentOptions::default());
 
-    let mut reader = AlignmentReader::open(bam, None)?;
+    let mut reader = AlignmentReader::open(bam, None, 0)?;
     let header = reader.header().clone();
     collector.initialize(&header)?;
     let requirements = collector.field_needs();
@@ -571,7 +571,7 @@ fn test_reference_validation_missing_contig_errors() -> Result<()> {
         &AlignmentOptions::default(),
     );
 
-    let reader = AlignmentReader::open(bam.path(), None)?;
+    let reader = AlignmentReader::open(bam.path(), None, 0)?;
     let result = collector.initialize(reader.header());
     assert!(result.is_err(), "expected error for missing contig");
     assert!(result.unwrap_err().to_string().contains("chrZ"));
@@ -593,7 +593,7 @@ fn test_output_file_created_with_correct_suffix() -> Result<()> {
 
     let mut collector =
         AlignmentCollector::new(bam.path(), &prefix_path, None, &AlignmentOptions::default());
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let header = reader.header().clone();
     collector.initialize(&header)?;
     let requirements = collector.field_needs();

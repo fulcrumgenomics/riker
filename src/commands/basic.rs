@@ -12,7 +12,7 @@ use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::Command;
+use crate::commands::command::{Command, resolve_threads};
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::metrics::write_tsv;
 use crate::plotting::{
@@ -78,9 +78,14 @@ pub struct Basic {
 impl Command for Basic {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output files cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan =
+            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
         let mut collector = BasicCollector::new(&self.input.input, &self.output.output);
         let mut progress = ProgressLogger::new("basic", "reads", 5_000_000);
         drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
@@ -588,6 +593,12 @@ impl Collector for BasicCollector {
 
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE.with_sequence()
+    }
+
+    /// Relative per-record cost (see [`Collector::cost_hint`]); ~28 from the
+    /// `multi` per-collector isolation benchmark on a WGS BAM.
+    fn cost_hint(&self) -> u32 {
+        28
     }
 }
 

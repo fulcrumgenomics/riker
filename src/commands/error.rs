@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use strum::EnumCount as _;
 
 use crate::collector::Collector;
-use crate::commands::command::Command;
+use crate::commands::command::{Command, resolve_threads};
 use crate::commands::common::{InputOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_6dp, write_tsv};
@@ -231,30 +231,37 @@ impl Error {
     }
 }
 
+/// Ensure the reference FASTA at `ref_path` has a sibling `.fai` index,
+/// erroring with a `samtools faidx` hint if it does not.
+fn validate_fasta_index(ref_path: &Path) -> Result<()> {
+    let mut p = ref_path.as_os_str().to_owned();
+    p.push(".fai");
+    let fai_path = PathBuf::from(p);
+    if !fai_path.exists() {
+        bail!(
+            "FASTA index not found: expected {}\n\
+             Run `samtools faidx {}` to create it.",
+            fai_path.display(),
+            ref_path.display(),
+        );
+    }
+    Ok(())
+}
+
 impl Command for Error {
     #[expect(clippy::cast_possible_truncation, reason = "contig lengths fit in u32")]
-    fn execute(&self) -> Result<()> {
-        // Upfront validation
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
         let ref_path = &self.options.reference;
-        let fai_path = {
-            let mut p = ref_path.as_os_str().to_owned();
-            p.push(".fai");
-            PathBuf::from(p)
-        };
-        if !fai_path.exists() {
-            bail!(
-                "FASTA index not found: expected {}\n\
-                 Run `samtools faidx {}` to create it.",
-                fai_path.display(),
-                ref_path.display(),
-            );
-        }
+        validate_fasta_index(ref_path)?;
 
         // Open reference
         let fasta = Fasta::from_path(ref_path)?;
 
         // Open indexed alignment file
-        let mut alignment_reader = IndexedAlignmentReader::open(&self.input.input, Some(ref_path))?;
+        let plan =
+            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let mut alignment_reader =
+            IndexedAlignmentReader::open(&self.input.input, Some(ref_path), plan.decode_threads)?;
         let header = alignment_reader.header().clone();
 
         // Build sequence dictionary

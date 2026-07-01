@@ -13,7 +13,7 @@ fn test_docs_text_output() -> Result<()> {
     let dir = TempDir::new()?;
     let out = dir.path().join("docs.txt");
 
-    Docs { format: "text".to_string(), output: Some(out.clone()) }.execute()?;
+    Docs { format: "text".to_string(), output: Some(out.clone()) }.execute(None)?;
 
     let text = std::fs::read_to_string(&out)?;
 
@@ -44,7 +44,7 @@ fn test_docs_markdown_output() -> Result<()> {
     let dir = TempDir::new()?;
     let out = dir.path().join("docs.md");
 
-    Docs { format: "markdown".to_string(), output: Some(out.clone()) }.execute()?;
+    Docs { format: "markdown".to_string(), output: Some(out.clone()) }.execute(None)?;
 
     let text = std::fs::read_to_string(&out)?;
 
@@ -65,12 +65,12 @@ fn test_docs_markdown_output() -> Result<()> {
 /// Defaults to stdout (no output path) without error.
 #[test]
 fn test_docs_stdout_default() -> Result<()> {
-    Docs { format: "text".to_string(), output: None }.execute()
+    Docs { format: "text".to_string(), output: None }.execute(None)
 }
 
 /// Unknown format should produce an error.
 #[test]
 fn test_docs_unknown_format() {
-    let result = Docs { format: "csv".to_string(), output: None }.execute();
+    let result = Docs { format: "csv".to_string(), output: None }.execute(None);
     assert!(result.is_err());
 }

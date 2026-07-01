@@ -26,7 +26,7 @@ fn run_basic(builder: &SamBuilder) -> (TempDir, std::path::PathBuf) {
     collector.initialize(&header).unwrap();
 
     let mut reader =
-        riker_lib::sam::alignment_reader::AlignmentReader::open(bam.path(), None).unwrap();
+        riker_lib::sam::alignment_reader::AlignmentReader::open(bam.path(), None, 0).unwrap();
     let hdr = reader.header().clone();
     let requirements = collector.field_needs();
     for result in reader.riker_records(&requirements) {

@@ -60,6 +60,17 @@ pub trait Collector: Send {
     /// when adding a new collector. Return
     /// [`RikerRecordRequirements::NONE`] if no expensive fields are needed.
     fn field_needs(&self) -> RikerRecordRequirements;
+
+    /// Relative per-record processing cost, used only by `multi` to balance
+    /// collectors across worker threads (heaviest collectors get their own
+    /// worker). This is a self-reported hint, not a hard number — the
+    /// scheduler compares hints, so only the ratios matter. Default `1`
+    /// (a light, accumulate-only collector). Collectors with expensive
+    /// per-record kernels (e.g. coverage pileup) should override with a
+    /// larger value.
+    fn cost_hint(&self) -> u32 {
+        1
+    }
 }
 
 /// Drive a single reader through a single collector's full lifecycle:

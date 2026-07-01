@@ -50,7 +50,7 @@ fn test_basic_fr_five_pairs() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), &prefix, false, 0.05).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.05).execute(None).unwrap();
 
     let rows: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -90,7 +90,7 @@ fn test_varied_insert_sizes() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), &prefix, false, 0.05).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.05).execute(None).unwrap();
 
     let metrics_path = dir.path().join(format!("out{METRICS_SUFFIX}"));
     let rows: Vec<InsertSizeMetric> = read_metrics_tsv(&metrics_path).unwrap();
@@ -121,14 +121,14 @@ fn test_duplicate_filter() {
 
     let dir_excl = TempDir::new().unwrap();
     let prefix_excl = dir_excl.path().join("out");
-    make_cmd(bam.path(), &prefix_excl, false, 0.0).execute().unwrap();
+    make_cmd(bam.path(), &prefix_excl, false, 0.0).execute(None).unwrap();
     let rows_excl: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir_excl.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
     assert_eq!(rows_excl[0].read_pairs, 5, "should exclude duplicates");
 
     let dir_incl = TempDir::new().unwrap();
     let prefix_incl = dir_incl.path().join("out");
-    make_cmd(bam.path(), &prefix_incl, true, 0.0).execute().unwrap();
+    make_cmd(bam.path(), &prefix_incl, true, 0.0).execute(None).unwrap();
     let rows_incl: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir_incl.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
     assert_eq!(rows_incl[0].read_pairs, 8, "should include duplicates");
@@ -148,7 +148,7 @@ fn test_qc_fail_filter() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), &prefix, false, 0.0).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.0).execute(None).unwrap();
 
     let rows: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -170,7 +170,7 @@ fn test_min_frac_excludes_minority_orientation() {
     let prefix = dir.path().join("out");
 
     // RF = 1/21 ≈ 4.8% < 5% → excluded
-    make_cmd(bam.path(), &prefix, false, 0.05).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.05).execute(None).unwrap();
 
     let rows: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -190,7 +190,7 @@ fn test_min_frac_zero_includes_all_orientations() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), &prefix, false, 0.0).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.0).execute(None).unwrap();
 
     let rows: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -211,7 +211,7 @@ fn test_histogram_output() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), &prefix, false, 0.0).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.0).execute(None).unwrap();
 
     let hist: Vec<InsertSizeHistogramEntry> =
         read_metrics_tsv(&dir.path().join(format!("out{HISTOGRAM_SUFFIX}"))).unwrap();
@@ -249,7 +249,7 @@ fn test_histogram_trims_long_tail() {
     let bam = builder.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
-    make_cmd(bam.path(), &prefix, false, 0.0).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.0).execute(None).unwrap();
 
     let metrics: Vec<InsertSizeMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -294,7 +294,7 @@ fn test_plot_output_created() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), &prefix, false, 0.05).execute().unwrap();
+    make_cmd(bam.path(), &prefix, false, 0.05).execute(None).unwrap();
 
     let plot_path = dir.path().join(format!("out{PLOT_SUFFIX}"));
     assert!(plot_path.exists(), "PDF plot file should be created");

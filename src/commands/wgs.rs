@@ -14,7 +14,7 @@ use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::Command;
+use crate::commands::command::{Command, resolve_threads};
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::counter::Counter;
 use crate::fasta::Fasta;
@@ -134,8 +134,14 @@ pub struct Wgs {
 impl Command for Wgs {
     /// # Errors
     /// Returns an error if the BAM or reference cannot be read, or if output cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader = AlignmentReader::open(&self.input.input, Some(&self.reference.reference))?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan =
+            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            Some(&self.reference.reference),
+            plan.decode_threads,
+        )?;
         let reference = Fasta::from_path(&self.reference.reference)?;
 
         let mut collector =
@@ -742,6 +748,14 @@ impl Collector for WgsCollector {
 
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE
+    }
+
+    /// Coverage pileup (per-base CIGAR walk + mate-overlap dedup + per-contig
+    /// finalize) is by far the heaviest collector — ~70 vs ~26-30 for the
+    /// others in the `multi` per-collector isolation benchmark — so it earns
+    /// its own worker thread when the budget allows.
+    fn cost_hint(&self) -> u32 {
+        70
     }
 }
 

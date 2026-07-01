@@ -35,7 +35,7 @@ pub struct Docs {
 }
 
 impl Command for Docs {
-    fn execute(&self) -> Result<()> {
+    fn execute(&self, _threads: Option<u8>) -> Result<()> {
         let stdout;
         let mut out: Box<dyn Write> = if let Some(path) = &self.output {
             Box::new(BufWriter::new(File::create(path)?))

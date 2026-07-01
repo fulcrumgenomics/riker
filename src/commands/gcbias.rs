@@ -15,7 +15,7 @@ use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::Command;
+use crate::commands::command::{Command, resolve_threads};
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
@@ -189,8 +189,14 @@ pub struct GcBias {
 impl Command for GcBias {
     /// # Errors
     /// Returns an error if the BAM or reference cannot be read, or if output cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader = AlignmentReader::open(&self.input.input, Some(&self.reference.reference))?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan =
+            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            Some(&self.reference.reference),
+            plan.decode_threads,
+        )?;
         let reference = Fasta::from_path(&self.reference.reference)?;
 
         let mut collector =
@@ -675,6 +681,12 @@ impl Collector for GcBiasCollector {
         // (always available). Sequence bases are never read, so we don't
         // declare `with_sequence`.
         RikerRecordRequirements::NONE.with_aux_tag(*b"NM")
+    }
+
+    /// Relative per-record cost (see [`Collector::cost_hint`]); ~30 from the
+    /// `multi` per-collector isolation benchmark on a WGS BAM.
+    fn cost_hint(&self) -> u32 {
+        30
     }
 }
 

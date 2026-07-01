@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::Command;
+use crate::commands::command::{Command, resolve_threads};
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::intervals::{Interval, Intervals};
@@ -177,9 +177,14 @@ pub struct HybCap {
 }
 
 impl Command for HybCap {
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan =
+            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
         let sample = derive_sample(&self.input.input, reader.header());
 
         // Load reference if provided (needed for GC dropout)

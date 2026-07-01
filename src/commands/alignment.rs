@@ -8,7 +8,7 @@ use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::Command;
+use crate::commands::command::{Command, resolve_threads};
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::counter::Counter;
 use crate::fasta::Fasta;
@@ -86,9 +86,14 @@ pub struct Alignment {
 impl Command for Alignment {
     /// # Errors
     /// Returns an error if the BAM cannot be read or the output cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan =
+            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
 
         let mut collector = AlignmentCollector::new(
             &self.input.input,
@@ -216,6 +221,12 @@ impl Collector for AlignmentCollector {
             // never read its content. Presence-only skips the per-record
             // `String(Vec<u8>)` allocation.
             .with_aux_tag_presence(*b"SA")
+    }
+
+    /// Relative per-record cost (see [`Collector::cost_hint`]); ~26 from the
+    /// `multi` per-collector isolation benchmark on a WGS BAM.
+    fn cost_hint(&self) -> u32 {
+        26
     }
 }
 

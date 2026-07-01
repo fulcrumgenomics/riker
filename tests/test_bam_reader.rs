@@ -12,7 +12,7 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn test_open_nonexistent_file() {
-    match AlignmentReader::open(Path::new("/no/such/file.bam"), None) {
+    match AlignmentReader::open(Path::new("/no/such/file.bam"), None, 0) {
         Err(e) => {
             let msg = e.to_string();
             assert!(msg.contains("/no/such/file.bam"), "error should contain path, got: {msg}");
@@ -28,7 +28,7 @@ fn test_open_invalid_bam() -> Result<()> {
     tmp.flush()?;
 
     assert!(
-        AlignmentReader::open(tmp.path(), None).is_err(),
+        AlignmentReader::open(tmp.path(), None, 0).is_err(),
         "opening garbage data as BAM should fail"
     );
     Ok(())
@@ -47,7 +47,7 @@ fn test_bamrec_roundtrip_preserves_scalars() -> Result<()> {
     builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
     let bam = builder.to_temp_bam()?;
 
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
 
     let mut record = reader.empty_record();
@@ -87,7 +87,7 @@ fn test_bamrec_alignment_end_matches_cigar_span() -> Result<()> {
     builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
     let bam = builder.to_temp_bam()?;
 
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let mut record = reader.empty_record();
     assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
 
@@ -117,7 +117,7 @@ fn test_cram_roundtrip_via_fill_record() -> Result<()> {
     builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, None);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
 
     let requirements = RikerRecordRequirements::NONE;
     let mut record = reader.empty_record();
@@ -180,7 +180,7 @@ fn test_cram_drives_through_collector() -> Result<()> {
     builder.add_pair("p2", 0, 300, 400, 200, 60, 50, false, false);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
     let mut collector = Counter { n: 0 };
     let mut progress = ProgressLogger::new("test", "reads", 1_000_000);
     drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
@@ -223,7 +223,7 @@ fn test_drive_collector_does_not_finish_after_failed_initialize() -> Result<()> 
     let mut builder = SamBuilder::new();
     builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
     let bam = builder.to_temp_bam()?;
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let mut collector = FailingInit { finish_called: false };
     let mut progress = ProgressLogger::new("test", "reads", 1_000_000);
 
@@ -251,7 +251,7 @@ fn test_cram_fill_record_decodes_sequence_and_aux() -> Result<()> {
     builder.add_pair("pair1", 0, 200, 400, 200, 60, 50, false, false);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
     let mut record = reader.empty_record();
 
@@ -291,7 +291,7 @@ fn test_htslibrec_alignment_end_matches_cigar_span() -> Result<()> {
     builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
     let mut record = reader.empty_record();
     assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
 
@@ -318,7 +318,7 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
     builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
     let sam = builder.to_temp_sam()?;
 
-    let mut reader = AlignmentReader::open(sam.path(), None)?;
+    let mut reader = AlignmentReader::open(sam.path(), None, 0)?;
 
     let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
     let mut record = reader.empty_record();

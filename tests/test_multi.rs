@@ -77,7 +77,7 @@ fn make_multi(
         reference: OptionalReferenceOptions { reference: None },
 
         tools: collectors,
-        threads: 1,
+        threads: Some(1),
         wgs_opts,
         isize_opts,
         hybcap_opts,
@@ -101,7 +101,7 @@ fn make_multi_with_ref(
         reference: OptionalReferenceOptions { reference: Some(ref_path.to_path_buf()) },
 
         tools: collectors,
-        threads: 1,
+        threads: Some(1),
         wgs_opts,
         isize_opts,
         hybcap_opts,
@@ -148,7 +148,7 @@ fn test_both_collectors() -> Result<()> {
     let prefix = dir.path().join("out");
 
     make_multi(bam.path(), &prefix, vec![CollectorKind::Isize, CollectorKind::Alignment])
-        .execute()?;
+        .execute(None)?;
 
     // Both output files should exist and contain data.
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
@@ -176,7 +176,7 @@ fn test_isize_only() -> Result<()> {
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
-    make_multi(bam.path(), &prefix, vec![CollectorKind::Isize]).execute()?;
+    make_multi(bam.path(), &prefix, vec![CollectorKind::Isize]).execute(None)?;
 
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
     let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
@@ -196,7 +196,7 @@ fn test_alignment_only() -> Result<()> {
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
-    make_multi(bam.path(), &prefix, vec![CollectorKind::Alignment]).execute()?;
+    make_multi(bam.path(), &prefix, vec![CollectorKind::Alignment]).execute(None)?;
 
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
     let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
@@ -220,7 +220,7 @@ fn test_matches_standalone_isize() -> Result<()> {
     // Run multi with isize only.
     let dir_multi = TempDir::new()?;
     let prefix_multi = dir_multi.path().join("out");
-    make_multi(bam.path(), &prefix_multi, vec![CollectorKind::Isize]).execute()?;
+    make_multi(bam.path(), &prefix_multi, vec![CollectorKind::Isize]).execute(None)?;
 
     // Run standalone isize with matching default options.
     let dir_standalone = TempDir::new()?;
@@ -231,7 +231,7 @@ fn test_matches_standalone_isize() -> Result<()> {
         reference: OptionalReferenceOptions { reference: None },
         options: IsizeOptions::default(),
     };
-    standalone.execute()?;
+    standalone.execute(None)?;
 
     let multi_metrics: Vec<InsertSizeMetric> =
         read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix_multi.display())))?;
@@ -258,7 +258,7 @@ fn test_empty_bam() -> Result<()> {
     let prefix = dir.path().join("out");
 
     make_multi(bam.path(), &prefix, vec![CollectorKind::Isize, CollectorKind::Alignment])
-        .execute()?;
+        .execute(None)?;
 
     // Both files should exist (even if empty / with zero counts).
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
@@ -279,7 +279,8 @@ fn test_wgs_collector() -> Result<()> {
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
-    make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::Wgs]).execute()?;
+    make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::Wgs])
+        .execute(None)?;
 
     let wgs_path = PathBuf::from(format!("{}{WGS_SUFFIX}", prefix.display()));
     let cov_path = PathBuf::from(format!("{}{WGS_COVERAGE_SUFFIX}", prefix.display()));
@@ -307,7 +308,7 @@ fn test_all_collectors() -> Result<()> {
         refa.path(),
         vec![CollectorKind::Alignment, CollectorKind::Isize, CollectorKind::Wgs],
     )
-    .execute()?;
+    .execute(None)?;
 
     let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
@@ -329,7 +330,7 @@ fn test_matches_standalone_wgs() -> Result<()> {
     let dir_multi = TempDir::new()?;
     let prefix_multi = dir_multi.path().join("out");
     make_multi_with_ref(bam.path(), &prefix_multi, refa.path(), vec![CollectorKind::Wgs])
-        .execute()?;
+        .execute(None)?;
 
     // Run standalone WGS with matching default options.
     let dir_standalone = TempDir::new()?;
@@ -341,7 +342,7 @@ fn test_matches_standalone_wgs() -> Result<()> {
 
         options: WgsOptions::default(),
     };
-    standalone.execute()?;
+    standalone.execute(None)?;
 
     let multi_metrics: Vec<WgsMetrics> =
         read_metrics_tsv(&PathBuf::from(format!("{}{WGS_SUFFIX}", prefix_multi.display())))?;
@@ -369,7 +370,7 @@ fn test_wgs_requires_reference() {
     let prefix = dir.path().join("out");
 
     // Multi with WGS but no reference should fail.
-    let result = make_multi(bam.path(), &prefix, vec![CollectorKind::Wgs]).execute();
+    let result = make_multi(bam.path(), &prefix, vec![CollectorKind::Wgs]).execute(None);
     assert!(result.is_err(), "WGS without reference should error");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -387,7 +388,8 @@ fn test_gcbias_collector() -> Result<()> {
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
-    make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::GcBias]).execute()?;
+    make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::GcBias])
+        .execute(None)?;
 
     let detail_path = PathBuf::from(format!("{}{GCBIAS_DETAIL_SUFFIX}", prefix.display()));
     let summary_path = PathBuf::from(format!("{}{GCBIAS_SUMMARY_SUFFIX}", prefix.display()));
@@ -404,7 +406,7 @@ fn test_gcbias_requires_reference() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    let result = make_multi(bam.path(), &prefix, vec![CollectorKind::GcBias]).execute();
+    let result = make_multi(bam.path(), &prefix, vec![CollectorKind::GcBias]).execute(None);
     assert!(result.is_err(), "GC bias without reference should error");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -427,7 +429,7 @@ fn test_duplicate_collectors_deduplicated() -> Result<()> {
         &prefix,
         vec![CollectorKind::Alignment, CollectorKind::Alignment, CollectorKind::Isize],
     )
-    .execute()?;
+    .execute(None)?;
 
     let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
@@ -449,10 +451,10 @@ fn make_multi_threaded(
     bam_path: &std::path::Path,
     prefix: &std::path::Path,
     collectors: Vec<CollectorKind>,
-    threads: usize,
+    threads: u8,
 ) -> Multi {
     let mut m = make_multi(bam_path, prefix, collectors);
-    m.threads = threads;
+    m.threads = Some(threads);
     m
 }
 
@@ -461,10 +463,10 @@ fn make_multi_threaded_with_ref(
     prefix: &std::path::Path,
     ref_path: &std::path::Path,
     collectors: Vec<CollectorKind>,
-    threads: usize,
+    threads: u8,
 ) -> Multi {
     let mut m = make_multi_with_ref(bam_path, prefix, ref_path, collectors);
-    m.threads = threads;
+    m.threads = Some(threads);
     m
 }
 
@@ -476,12 +478,12 @@ fn test_parallel_matches_single_threaded_isize_alignment() -> Result<()> {
     // Single-threaded run.
     let single_dir = TempDir::new()?;
     let single_prefix = single_dir.path().join("out");
-    make_multi(bam.path(), &single_prefix, collectors.clone()).execute()?;
+    make_multi(bam.path(), &single_prefix, collectors.clone()).execute(None)?;
 
     // Parallel run with 2 threads.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
-    make_multi_threaded(bam.path(), &parallel_prefix, collectors, 2).execute()?;
+    make_multi_threaded(bam.path(), &parallel_prefix, collectors, 2).execute(None)?;
 
     // Compare isize metrics.
     let single_isize: Vec<InsertSizeMetric> =
@@ -525,13 +527,14 @@ fn test_parallel_all_collectors() -> Result<()> {
         CollectorKind::GcBias,
         CollectorKind::Wgs,
     ];
-    make_multi_with_ref(bam.path(), &single_prefix, refa.path(), collectors.clone()).execute()?;
+    make_multi_with_ref(bam.path(), &single_prefix, refa.path(), collectors.clone())
+        .execute(None)?;
 
     // Parallel with 3 threads.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
     make_multi_threaded_with_ref(bam.path(), &parallel_prefix, refa.path(), collectors, 3)
-        .execute()?;
+        .execute(None)?;
 
     // Compare WGS metrics.
     let single_wgs: Vec<WgsMetrics> =
@@ -586,7 +589,7 @@ fn test_parallel_more_threads_than_collectors() -> Result<()> {
     // Single-threaded baseline.
     let single_dir = TempDir::new()?;
     let single_prefix = single_dir.path().join("out");
-    make_multi(bam.path(), &single_prefix, vec![CollectorKind::Isize]).execute()?;
+    make_multi(bam.path(), &single_prefix, vec![CollectorKind::Isize]).execute(None)?;
 
     // Parallel with --threads 4 (1 reader + 3 workers) but only 1
     // collector — two workers are idle (blocked on the per-collector
@@ -594,7 +597,8 @@ fn test_parallel_more_threads_than_collectors() -> Result<()> {
     // match the serial path.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
-    make_multi_threaded(bam.path(), &parallel_prefix, vec![CollectorKind::Isize], 4).execute()?;
+    make_multi_threaded(bam.path(), &parallel_prefix, vec![CollectorKind::Isize], 4)
+        .execute(None)?;
 
     let single: Vec<InsertSizeMetric> =
         read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", single_prefix.display())))?;
@@ -623,7 +627,7 @@ fn test_parallel_empty_bam() -> Result<()> {
         vec![CollectorKind::Isize, CollectorKind::Alignment],
         2,
     )
-    .execute()?;
+    .execute(None)?;
 
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
     let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
@@ -643,7 +647,7 @@ fn test_hybcap_requires_targets_and_baits() {
     let prefix = dir.path().join("out");
 
     // HybCap selected but no targets/baits → error.
-    let result = make_multi(bam.path(), &prefix, vec![CollectorKind::HybCap]).execute();
+    let result = make_multi(bam.path(), &prefix, vec![CollectorKind::HybCap]).execute(None);
     assert!(result.is_err(), "hybcap without targets should error");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -659,7 +663,7 @@ fn test_hybcap_targets_not_required_when_not_selected() -> Result<()> {
     let prefix = dir.path().join("out");
 
     // Only isize selected — hybcap targets/baits should not be required.
-    make_multi(bam.path(), &prefix, vec![CollectorKind::Isize]).execute()?;
+    make_multi(bam.path(), &prefix, vec![CollectorKind::Isize]).execute(None)?;
     Ok(())
 }
 
@@ -707,7 +711,7 @@ fn test_hybcap_via_multi() -> Result<()> {
         reference: OptionalReferenceOptions { reference: None },
 
         tools: vec![CollectorKind::HybCap],
-        threads: 1,
+        threads: Some(1),
         wgs_opts,
         isize_opts,
         hybcap_opts,
@@ -715,7 +719,7 @@ fn test_hybcap_via_multi() -> Result<()> {
         alignment_opts,
         error_opts,
     };
-    multi.execute()?;
+    multi.execute(None)?;
 
     let metrics_path = PathBuf::from(format!("{}{HYBCAP_SUFFIX}", prefix.display()));
     assert!(metrics_path.exists(), "hybcap metrics file should exist");
