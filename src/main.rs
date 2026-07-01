@@ -50,8 +50,7 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
-    /// Total number of threads to use (place before the subcommand, e.g.
-    /// `riker --threads 4 wgs ...`).
+    /// Total number of threads to use.
     ///
     /// This is a whole-toolkit budget: each command divides it between decoding
     /// the input and its own work. Unset (the default) runs single-threaded for
@@ -59,12 +58,7 @@ struct Cli {
     /// speed up input decoding — CRAM benefits most, especially the heavier
     /// "small"/"archive" codecs — with sub-linear gains (most of the win is the
     /// first extra thread or two), so a small value usually suffices.
-    //
-    // Deliberately NOT `global = true`: `multi` keeps a deprecated local
-    // `--threads`, and a global arg of the same name would bind to both,
-    // defeating the "set one or the other" check. Once `multi --threads` is
-    // removed this can become global so it may follow the subcommand too.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
     threads: Option<u8>,
 
     #[command(subcommand)]

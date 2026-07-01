@@ -239,12 +239,12 @@ riker multi \
 
 ### Threads
 
-Riker takes a single, whole-toolkit `--threads` budget, placed **before** the
-subcommand:
+Riker takes a single, whole-toolkit `--threads` budget. It's a global option, so
+it works either before or after the subcommand:
 
 ```bash
 riker --threads 4 wgs -i sample.bam -r ref.fa -o out_prefix
-riker --threads 4 multi -i sample.bam -r ref.fa -o out_prefix --tools wgs gcbias basic alignment isize
+riker multi --threads 4 -i sample.bam -r ref.fa -o out_prefix --tools wgs gcbias basic alignment isize
 ```
 
 Each command spends the budget as it sees fit. The single-pass tools (`wgs`,
@@ -258,10 +258,6 @@ format: CRAM decode is expensive and scales well (especially the heavier
 `archive`/`small` codecs), while BAM decode is cheap and saturates after one or
 two threads. Peak memory rises modestly with thread count for CRAM and is
 essentially flat for BAM.
-
-> `riker multi --threads N` (the old per-subcommand flag) is **deprecated** in
-> favor of the top-level `riker --threads N` and will be removed in a future
-> release; setting both is an error.
 
 ## Output Format
 

@@ -77,7 +77,6 @@ fn make_multi(
         reference: OptionalReferenceOptions { reference: None },
 
         tools: collectors,
-        threads: Some(1),
         wgs_opts,
         isize_opts,
         hybcap_opts,
@@ -101,7 +100,6 @@ fn make_multi_with_ref(
         reference: OptionalReferenceOptions { reference: Some(ref_path.to_path_buf()) },
 
         tools: collectors,
-        threads: Some(1),
         wgs_opts,
         isize_opts,
         hybcap_opts,
@@ -446,29 +444,9 @@ fn test_duplicate_collectors_deduplicated() -> Result<()> {
 }
 
 // ─── Parallel (threaded) tests ──────────────────────────────────────────────
-
-fn make_multi_threaded(
-    bam_path: &std::path::Path,
-    prefix: &std::path::Path,
-    collectors: Vec<CollectorKind>,
-    threads: u8,
-) -> Multi {
-    let mut m = make_multi(bam_path, prefix, collectors);
-    m.threads = Some(threads);
-    m
-}
-
-fn make_multi_threaded_with_ref(
-    bam_path: &std::path::Path,
-    prefix: &std::path::Path,
-    ref_path: &std::path::Path,
-    collectors: Vec<CollectorKind>,
-    threads: u8,
-) -> Multi {
-    let mut m = make_multi_with_ref(bam_path, prefix, ref_path, collectors);
-    m.threads = Some(threads);
-    m
-}
+//
+// The thread count is supplied through `.execute(Some(n))` (the toolkit-wide
+// `--threads`); `make_multi`/`make_multi_with_ref` build the unthreaded config.
 
 #[test]
 fn test_parallel_matches_single_threaded_isize_alignment() -> Result<()> {
@@ -483,7 +461,7 @@ fn test_parallel_matches_single_threaded_isize_alignment() -> Result<()> {
     // Parallel run with 2 threads.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
-    make_multi_threaded(bam.path(), &parallel_prefix, collectors, 2).execute(None)?;
+    make_multi(bam.path(), &parallel_prefix, collectors).execute(Some(2))?;
 
     // Compare isize metrics.
     let single_isize: Vec<InsertSizeMetric> =
@@ -522,12 +500,9 @@ fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
     let bam = build_test_bam()?;
     let collectors = vec![CollectorKind::Alignment, CollectorKind::Basic, CollectorKind::Isize];
 
-    // Baseline: single-threaded via the top-level --threads path. `make_multi`
-    // pre-sets the deprecated local flag, so clear it to use the global one.
+    // Baseline: single-threaded via the top-level --threads path.
     let base_dir = TempDir::new()?;
-    let mut base = make_multi(bam.path(), &base_dir.path().join("out"), collectors.clone());
-    base.threads = None;
-    base.execute(Some(1))?;
+    make_multi(bam.path(), &base_dir.path().join("out"), collectors.clone()).execute(Some(1))?;
 
     let mut baseline: Vec<(std::ffi::OsString, Vec<u8>)> = Vec::new();
     for entry in std::fs::read_dir(base_dir.path())? {
@@ -541,9 +516,8 @@ fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
 
     for threads in [2u8, 3, 4] {
         let dir = TempDir::new()?;
-        let mut m = make_multi(bam.path(), &dir.path().join("out"), collectors.clone());
-        m.threads = None;
-        m.execute(Some(threads))?;
+        make_multi(bam.path(), &dir.path().join("out"), collectors.clone())
+            .execute(Some(threads))?;
         for (name, bytes) in &baseline {
             let got = std::fs::read(dir.path().join(name))?;
             assert_eq!(&got, bytes, "output {name:?} differs at --threads {threads}");
@@ -572,8 +546,7 @@ fn test_parallel_all_collectors() -> Result<()> {
     // Parallel with 3 threads.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
-    make_multi_threaded_with_ref(bam.path(), &parallel_prefix, refa.path(), collectors, 3)
-        .execute(None)?;
+    make_multi_with_ref(bam.path(), &parallel_prefix, refa.path(), collectors).execute(Some(3))?;
 
     // Compare WGS metrics.
     let single_wgs: Vec<WgsMetrics> =
@@ -636,8 +609,7 @@ fn test_parallel_more_threads_than_collectors() -> Result<()> {
     // match the serial path.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
-    make_multi_threaded(bam.path(), &parallel_prefix, vec![CollectorKind::Isize], 4)
-        .execute(None)?;
+    make_multi(bam.path(), &parallel_prefix, vec![CollectorKind::Isize]).execute(Some(4))?;
 
     let single: Vec<InsertSizeMetric> =
         read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", single_prefix.display())))?;
@@ -660,13 +632,8 @@ fn test_parallel_empty_bam() -> Result<()> {
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
-    make_multi_threaded(
-        bam.path(),
-        &prefix,
-        vec![CollectorKind::Isize, CollectorKind::Alignment],
-        2,
-    )
-    .execute(None)?;
+    make_multi(bam.path(), &prefix, vec![CollectorKind::Isize, CollectorKind::Alignment])
+        .execute(Some(2))?;
 
     let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
     let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
@@ -750,7 +717,6 @@ fn test_hybcap_via_multi() -> Result<()> {
         reference: OptionalReferenceOptions { reference: None },
 
         tools: vec![CollectorKind::HybCap],
-        threads: Some(1),
         wgs_opts,
         isize_opts,
         hybcap_opts,

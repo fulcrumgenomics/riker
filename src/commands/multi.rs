@@ -90,7 +90,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use clap::{Args, ValueEnum};
 use crossbeam_channel::{Receiver, Sender};
 use noodles::sam::Header;
@@ -175,15 +175,6 @@ pub struct Multi {
     )]
     pub tools: Vec<CollectorKind>,
 
-    /// DEPRECATED: use the top-level `riker --threads` instead.
-    ///
-    /// Sets the total thread budget for this run (which multi divides between
-    /// input decoding and compute workers). Kept for backwards compatibility;
-    /// it will be removed in a future release. Setting both this and
-    /// `riker --threads` is an error.
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..), help_heading = "Multi Command Options")]
-    pub threads: Option<u8>,
-
     // Per-tool options
     #[command(flatten)]
     pub alignment_opts: MultiAlignmentOptions,
@@ -200,14 +191,6 @@ pub struct Multi {
 }
 
 impl Multi {
-    /// Resolve the total thread budget from the top-level `--threads`
-    /// (`global`) and the deprecated `multi --threads` (`self.threads`).
-    /// Setting both is an error; the deprecated flag warns; neither falls
-    /// back to [`default_threads`](Command::default_threads).
-    fn resolve_total_threads(&self, global: Option<u8>) -> Result<NonZero<usize>> {
-        resolve_budget(global, self.threads, self.default_threads())
-    }
-
     /// Build the list of collectors based on the deduplicated kinds.
     fn build_collectors(
         &self,
@@ -304,7 +287,7 @@ impl Command for Multi {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or any collector fails.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
-        let total = self.resolve_total_threads(threads)?;
+        let total = resolve_threads(threads, self.default_threads());
 
         // Deduplicate the collector list while preserving order.
         let mut seen = Vec::new();
@@ -412,32 +395,6 @@ impl fmt::Display for CollectorKind {
 }
 
 // ─── Threading helpers ───────────────────────────────────────────────────────
-
-/// Resolve a total thread budget from the top-level `--threads` (`global`) and
-/// the deprecated `multi --threads` (`local`), falling back to `default` when
-/// neither is set. Setting both is an error; using the deprecated local flag
-/// warns. Pure so the truth table can be tested directly.
-fn resolve_budget(
-    global: Option<u8>,
-    local: Option<u8>,
-    default: NonZero<usize>,
-) -> Result<NonZero<usize>> {
-    match (global, local) {
-        (Some(_), Some(_)) => bail!(
-            "set the thread count with the top-level `riker --threads`, not both it and \
-             `multi --threads` (the latter is deprecated)"
-        ),
-        (Some(_), None) => Ok(resolve_threads(global, default)),
-        (None, Some(_)) => {
-            log::warn!(
-                "`multi --threads` is deprecated and will be removed in a future release; \
-                 use the top-level `riker --threads` instead"
-            );
-            Ok(resolve_threads(local, default))
-        }
-        (None, None) => Ok(default),
-    }
-}
 
 /// Split a total thread budget into reader-decode workers and compute worker
 /// groups. multi's orchestrator thread is near-idle, so the whole budget goes
@@ -942,30 +899,6 @@ mod tests {
 
     fn nz(n: usize) -> NonZero<usize> {
         NonZero::new(n).expect("test uses non-zero")
-    }
-
-    #[test]
-    fn resolve_budget_neither_uses_default() {
-        let got = resolve_budget(None, None, nz(3)).unwrap();
-        assert_eq!(got.get(), 3);
-    }
-
-    #[test]
-    fn resolve_budget_global_wins_over_default() {
-        let got = resolve_budget(Some(5), None, nz(3)).unwrap();
-        assert_eq!(got.get(), 5);
-    }
-
-    #[test]
-    fn resolve_budget_local_deprecated_flag_is_honored() {
-        let got = resolve_budget(None, Some(2), nz(4)).unwrap();
-        assert_eq!(got.get(), 2);
-    }
-
-    #[test]
-    fn resolve_budget_both_set_is_an_error() {
-        let err = resolve_budget(Some(2), Some(2), nz(4)).expect_err("both set must error");
-        assert!(err.to_string().contains("not both"), "unexpected error: {err}");
     }
 
     #[test]
