@@ -683,10 +683,12 @@ impl Collector for GcBiasCollector {
         RikerRecordRequirements::NONE.with_aux_tag(*b"NM")
     }
 
-    /// Relative per-record cost (see [`Collector::cost_hint`]); ~30 from the
-    /// `multi` per-collector isolation benchmark on a WGS BAM.
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~22 from
+    /// a samply worker-compute measurement on a 12x WGS BAM. gcbias is
+    /// reader-bound — its worker sits idle much of the time — so its worker
+    /// share is modest even though its overall runtime is not.
     fn cost_hint(&self) -> u32 {
-        30
+        22
     }
 }
 

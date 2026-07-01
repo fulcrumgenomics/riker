@@ -750,10 +750,12 @@ impl Collector for WgsCollector {
         RikerRecordRequirements::NONE
     }
 
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]). Anchor
+    /// value for the scale; from a samply worker-compute measurement
+    /// (`accept`+`finish` inclusive, input decode excluded) on a 12x WGS BAM.
     /// Coverage pileup (per-base CIGAR walk + mate-overlap dedup + per-contig
-    /// finalize) is by far the heaviest collector — ~70 vs ~26-30 for the
-    /// others in the `multi` per-collector isolation benchmark — so it earns
-    /// its own worker thread when the budget allows.
+    /// finalize) is one of the heaviest per-record kernels, so wgs earns its
+    /// own worker when the budget allows.
     fn cost_hint(&self) -> u32 {
         70
     }

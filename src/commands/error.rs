@@ -1101,12 +1101,14 @@ impl Collector for ErrorCollector {
         RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM")
     }
 
-    /// Per-base covariate stratification plus VCF-mask lookups make this a
-    /// heavy collector, so it earns a large share of a worker. This is an
-    /// estimate — `error` was not part of the 5-collector isolation benchmark
-    /// the other hints came from — pending its own measurement.
+    /// Per-base covariate stratification makes this by far the heaviest
+    /// collector: with the default `--stratify-by` set it measured ~100x `wgs`
+    /// per read (~22 us/read on a 12x WGS BAM). Its cost swings ~40x with the
+    /// stratifier set, so rather than a faithful (huge, config-specific) value,
+    /// this is set well above every other collector — enough to guarantee
+    /// `error` is always packed onto its own worker.
     fn cost_hint(&self) -> u32 {
-        45
+        500
     }
 }
 

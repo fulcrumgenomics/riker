@@ -1282,12 +1282,15 @@ impl Collector for HybCapCollector {
         RikerRecordRequirements::NONE
     }
 
-    /// Per-base target/bait coverage pileup makes this a heavy collector, so it
-    /// earns a large share of a worker. This is an estimate — `hybcap` was not
-    /// part of the 5-collector isolation benchmark the other hints came from —
-    /// pending its own measurement.
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~140,
+    /// the heaviest collector — dual bait+target per-base pileup. Measured on an
+    /// exome BAM (samply worker-compute) at ~2x `basic` per read, then placed on
+    /// the WGS-BAM hint scale by anchoring to the shared collectors (basic ->
+    /// 155, alignment -> 120; center ~140). Approximate — per-read cost varies
+    /// with read length across data sets — but its ordering as the heaviest is
+    /// robust.
     fn cost_hint(&self) -> u32 {
-        50
+        140
     }
 }
 

@@ -354,6 +354,13 @@ impl Collector for InsertSizeCollector {
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE
     }
+
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~5 from a
+    /// samply worker-compute measurement on a 12x WGS BAM — insert-size
+    /// tallying is the lightest real collector.
+    fn cost_hint(&self) -> u32 {
+        5
+    }
 }
 
 // ─── Metric structs ──────────────────────────────────────────────────────────

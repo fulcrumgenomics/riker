@@ -223,10 +223,10 @@ impl Collector for AlignmentCollector {
             .with_aux_tag_presence(*b"SA")
     }
 
-    /// Relative per-record cost (see [`Collector::cost_hint`]); ~26 from the
-    /// `multi` per-collector isolation benchmark on a WGS BAM.
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~55 from
+    /// a samply worker-compute measurement on a 12x WGS BAM.
     fn cost_hint(&self) -> u32 {
-        26
+        55
     }
 }
 

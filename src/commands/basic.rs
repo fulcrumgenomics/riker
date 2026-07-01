@@ -595,10 +595,12 @@ impl Collector for BasicCollector {
         RikerRecordRequirements::NONE.with_sequence()
     }
 
-    /// Relative per-record cost (see [`Collector::cost_hint`]); ~28 from the
-    /// `multi` per-collector isolation benchmark on a WGS BAM.
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~76 from
+    /// a samply worker-compute measurement on a 12x WGS BAM — its three
+    /// per-base passes (base distribution + quality by cycle + quality
+    /// distribution) make it one of the heaviest collectors.
     fn cost_hint(&self) -> u32 {
-        28
+        76
     }
 }
 
