@@ -2,15 +2,18 @@
 //!
 //! ## Threading model
 //!
-//! multi receives the toolkit-wide `--threads` budget and divides it in
-//! [`Multi::plan_threads`] into reader-decode workers and compute **worker
-//! groups**. One thread drives the reader/fan-out; the remaining budget is
-//! split by input format — BAM decode is cheap and multi is compute-bound on
-//! it, so nearly all of it becomes worker groups, while CRAM decode is
-//! expensive and gets its own pool. Collectors are partitioned into
-//! `min(workers, n_collectors)` groups by [`partition_collectors`], each
-//! owned by one worker thread. A budget of 1 skips the parallel pipeline
-//! entirely (see "Single-threaded path" below).
+//! multi receives the toolkit-wide `--threads` budget and lays it out in
+//! [`plan_multi`] across three roles: **parallel read threads** (bgzf inflate
+//! for BAM / htslib decode pool for CRAM), a **dispatch thread** (reads,
+//! extracts, and fans records out to the workers), and **compute worker
+//! groups** (each owns a subset of collectors, partitioned by
+//! [`partition_collectors`] into `min(workers, n_collectors)` groups). The
+//! layout is tuned per input format and was chosen from benchmarking (see
+//! [`plan_multi`]): BAM is compute-bound (cheap inflate) so it favors workers;
+//! CRAM is decode-bound (expensive decode) so it favors read threads and stays
+//! serial-main at low budgets; SAM can't decode in parallel so it's all
+//! workers. A budget of 1 — and CRAM's low-budget serial-main layouts — skip
+//! the pipeline entirely (see "Single-threaded path" below).
 //!
 //! ## Collector→worker affinity
 //!
@@ -77,11 +80,12 @@
 //!
 //! ## Single-threaded path
 //!
-//! For a budget of 1 the whole thing collapses to [`run_single_threaded`]:
-//! no channels, no extra threads, just a serial loop that drives the
-//! same reader API — in-place fills via [`AlignmentReader::fill_record`]
-//! for every format. Useful for testing and small runs where threading
-//! overhead isn't worth it.
+//! When [`plan_multi`] asks for zero compute workers — a budget of 1, or CRAM
+//! at budget 2-3 where the scarce threads are better spent decoding — the run
+//! collapses to [`run_single_threaded`]: no channels, no worker pool, just a
+//! serial loop on the main thread that drives the same reader API (in-place
+//! fills via [`AlignmentReader::fill_record`]), while the reader's decode pool
+//! (if any) inflates/decodes in parallel behind it.
 
 use std::fmt;
 use std::num::NonZero;
@@ -313,8 +317,8 @@ impl Command for Multi {
             }
         }
 
-        // Divide the budget between input decode and compute workers, then
-        // open the reader (also needed to build interval maps for WGS).
+        // Plan the thread layout, then open the reader (also needed to build
+        // interval maps for WGS) with its share of decode threads.
         let plan = self.plan_threads(total, &self.input.input);
         let reader = AlignmentReader::open(
             &self.input.input,
@@ -324,13 +328,13 @@ impl Command for Multi {
 
         let collectors = self.build_collectors(&seen, reader.header())?;
 
-        // A budget above 1 always runs the pipeline (reader thread + at least
-        // one worker), so the extra thread is actually used; only a budget of
-        // 1 collapses to a single serial pass.
-        if total.get() > 1 {
-            run_parallel(reader, collectors, plan.compute_workers)?;
-        } else {
+        // `compute_workers == 0` is serial-main mode (collectors run on the main
+        // thread, decode offloaded to the reader's pool); `>= 1` spins the
+        // dispatch + worker pipeline.
+        if plan.compute_workers == 0 {
             run_single_threaded(reader, collectors)?;
+        } else {
+            run_parallel(reader, collectors, plan.compute_workers)?;
         }
 
         Ok(())
@@ -344,15 +348,19 @@ impl Command for Multi {
         cores.min(NonZero::new(4).expect("4 is non-zero"))
     }
 
-    /// Split the budget between reader-decode workers and compute worker
-    /// groups. multi's orchestrator thread is near-idle, so the whole budget
-    /// goes to the reader + workers rather than reserving one for the main
-    /// thread. BAM decode is cheap and multi is compute-bound on it, so favor
-    /// compute workers; CRAM decode is expensive and scales, so give the
-    /// reader a decode pool. (Starting heuristic — constants to be tuned.)
+    /// Lay out the thread budget across reader-decode threads and compute
+    /// worker groups, tuned per input format — see [`plan_multi`].
     fn plan_threads(&self, total: NonZero<usize>, input: &Path) -> ThreadPlan {
-        let is_cram = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("cram"));
-        split_budget(total, is_cram)
+        let n_tools = {
+            let mut seen = Vec::new();
+            for kind in &self.tools {
+                if !seen.contains(kind) {
+                    seen.push(*kind);
+                }
+            }
+            seen.len().max(1)
+        };
+        plan_multi(total, n_tools, InputKind::of(input))
     }
 }
 
@@ -396,22 +404,77 @@ impl fmt::Display for CollectorKind {
 
 // ─── Threading helpers ───────────────────────────────────────────────────────
 
-/// Split a total thread budget into reader-decode workers and compute worker
-/// groups. multi's orchestrator thread is near-idle, so the whole budget goes
-/// to the reader + workers rather than reserving one for the main thread: one
-/// thread drives the reader/fan-out and the rest are split. BAM decode is cheap
-/// and multi is compute-bound on it, so all of the remainder becomes compute
-/// workers; CRAM decode is expensive and scales, so the reader gets up to half
-/// (capped at 4) as a decode pool. (Starting heuristic — constants to be tuned.)
-fn split_budget(total: NonZero<usize>, is_cram: bool) -> ThreadPlan {
-    let n = total.get();
-    if n <= 1 {
-        return ThreadPlan { decode_threads: 0, compute_workers: 1 };
+/// Input format, coarsened to what drives the thread layout: BAM (cheap
+/// parallel bgzf inflate), CRAM (expensive, well-parallelizing htslib decode),
+/// SAM (single-threaded text parse — no decode threads to hand out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Sam,
+    Bam,
+    Cram,
+}
+
+impl InputKind {
+    /// Classify by extension. The reader does the authoritative format
+    /// detection; this only needs to be right enough to plan threads (a
+    /// misclassified SAM/BAM just means the reader ignores a decode count).
+    fn of(path: &Path) -> Self {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+        if ext.eq_ignore_ascii_case("cram") {
+            Self::Cram
+        } else if ext.eq_ignore_ascii_case("sam")
+            || (ext.eq_ignore_ascii_case("gz")
+                && Path::new(path.file_stem().unwrap_or_default())
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("sam")))
+        {
+            Self::Sam
+        } else {
+            Self::Bam
+        }
     }
-    let rest = n - 1;
-    let decode_threads = if is_cram { (rest / 2).min(4) } else { 0 };
-    let compute_workers = rest.saturating_sub(decode_threads).max(1);
-    ThreadPlan { decode_threads, compute_workers }
+}
+
+/// Lay out a total thread budget for `multi` across reader-decode threads and
+/// compute worker groups. `compute_workers == 0` means serial-main mode
+/// (collectors run on the main thread, decode offloaded to the reader's pool);
+/// `>= 1` means the dispatch + worker pipeline (with one uncounted dispatch
+/// thread). Workers are capped at `n_tools` (a collector can't use more groups
+/// than there are collectors).
+///
+/// The layout is tuned from benchmarking (12x WGS BAM + its CRAM 3.1
+/// normal/archive transcodes, wgs panel). The formats differ because the pole
+/// differs: **BAM** inflate is cheap so multi is compute-bound — favor workers,
+/// with just enough read threads to keep the dispatcher fed. **CRAM** decode is
+/// expensive and parallelizes well — favor read threads, staying serial-main at
+/// low budgets so a scarce thread decodes rather than idling as a worker. **SAM**
+/// can't decode in parallel, so everything goes to workers.
+fn plan_multi(total: NonZero<usize>, n_tools: usize, kind: InputKind) -> ThreadPlan {
+    let cap = n_tools.max(1);
+    let serial = ThreadPlan { decode_threads: 0, compute_workers: 0 };
+    let t = total.get();
+    match (kind, t) {
+        // Budget of 1 is always a single serial pass.
+        (_, 1) => serial,
+        // t = 2, 3: dispatcher is counted; small per-format special cases.
+        (InputKind::Cram, 2) => ThreadPlan { decode_threads: 1, compute_workers: 0 },
+        (InputKind::Cram, 3) => ThreadPlan { decode_threads: 2, compute_workers: 0 },
+        (_, 2) => ThreadPlan { decode_threads: 0, compute_workers: 1 },
+        (_, 3) => ThreadPlan { decode_threads: 0, compute_workers: 2.min(cap) },
+        // t >= 4: the dispatcher becomes free; split the budget `t` into readers
+        // + workers, format-tuned by which dimension gets the odd thread.
+        (InputKind::Sam, _) => ThreadPlan { decode_threads: 0, compute_workers: t.min(cap) },
+        (InputKind::Bam, _) => {
+            let workers = t.div_ceil(2).min(cap);
+            ThreadPlan { decode_threads: t - workers, compute_workers: workers }
+        }
+        (InputKind::Cram, _) => {
+            // floor(t/2) workers (readers get the odd thread); any budget freed
+            // by the worker cap goes to reads, which CRAM decode makes good use of.
+            let workers = (t / 2).min(cap);
+            ThreadPlan { decode_threads: t - workers, compute_workers: workers }
+        }
+    }
 }
 
 /// A batch of records shared across collector channels.
@@ -901,35 +964,92 @@ mod tests {
         NonZero::new(n).expect("test uses non-zero")
     }
 
+    fn plan(t: usize, n_tools: usize, kind: InputKind) -> (usize, usize) {
+        let p = plan_multi(nz(t), n_tools, kind);
+        (p.decode_threads, p.compute_workers)
+    }
+
     #[test]
-    fn split_budget_bam_gives_all_of_the_remainder_to_compute() {
-        // BAM decode is cheap: no decode workers, rest-1 compute workers.
-        for (n, compute) in [(1, 1), (2, 1), (3, 2), (4, 3), (8, 7)] {
-            let plan = split_budget(nz(n), false);
-            assert_eq!(plan.decode_threads, 0, "bam n={n} should use no decode workers");
-            assert_eq!(plan.compute_workers, compute, "bam n={n} compute workers");
+    fn plan_bam_is_worker_leaning() {
+        // t=1 serial; t=2,3 dispatcher + workers (inflate is cheap, done inline);
+        // t>=4 workers get the odd thread (workers=ceil(t/2), readers=rest).
+        let cases = [
+            (1, (0, 0)),
+            (2, (0, 1)),
+            (3, (0, 2)),
+            (4, (2, 2)),
+            (5, (2, 3)),
+            (6, (3, 3)),
+            (7, (3, 4)),
+        ];
+        for (t, want) in cases {
+            assert_eq!(plan(t, 5, InputKind::Bam), want, "bam t={t}");
         }
     }
 
     #[test]
-    fn split_budget_cram_reserves_a_decode_pool() {
-        // CRAM decode scales: reader gets up to half the remainder, capped at 4.
-        for (n, decode, compute) in
-            [(1, 0, 1), (2, 0, 1), (3, 1, 1), (4, 1, 2), (8, 3, 4), (12, 4, 7)]
-        {
-            let plan = split_budget(nz(n), true);
-            assert_eq!(plan.decode_threads, decode, "cram n={n} decode workers");
-            assert_eq!(plan.compute_workers, compute, "cram n={n} compute workers");
+    fn plan_cram_is_read_leaning() {
+        // t=1 serial; t=2,3 serial-main + decode threads (a scarce thread should
+        // decode, not idle as a worker); t>=4 readers get the odd thread.
+        let cases = [
+            (1, (0, 0)),
+            (2, (1, 0)),
+            (3, (2, 0)),
+            (4, (2, 2)),
+            (5, (3, 2)),
+            (6, (3, 3)),
+            (7, (4, 3)),
+        ];
+        for (t, want) in cases {
+            assert_eq!(plan(t, 5, InputKind::Cram), want, "cram t={t}");
         }
     }
 
     #[test]
-    fn split_budget_never_yields_zero_compute_workers() {
-        for n in 1..=64 {
-            for is_cram in [false, true] {
-                let plan = split_budget(nz(n), is_cram);
-                assert!(plan.compute_workers >= 1, "n={n} cram={is_cram} needs >=1 worker");
+    fn plan_sam_gives_everything_to_workers() {
+        // SAM parse is single-threaded; no decode threads, all budget to workers.
+        for (t, want) in [(1, (0, 0)), (2, (0, 1)), (3, (0, 2)), (4, (0, 4)), (8, (0, 5))] {
+            assert_eq!(plan(t, 5, InputKind::Sam), want, "sam t={t}");
+        }
+    }
+
+    #[test]
+    fn plan_caps_workers_at_tool_count_and_spends_the_rest_on_reads() {
+        // 2 tools -> at most 2 workers; freed budget becomes read threads.
+        assert_eq!(plan(8, 2, InputKind::Bam), (6, 2), "bam capped");
+        assert_eq!(plan(8, 2, InputKind::Cram), (6, 2), "cram capped");
+        // A single tool never spins more than one worker.
+        assert_eq!(plan(6, 1, InputKind::Bam), (5, 1), "bam single tool");
+    }
+
+    #[test]
+    fn plan_bam_and_cram_spend_the_whole_budget() {
+        // BAM/CRAM absorb any worker-cap slack into read threads, so readers +
+        // workers always equal the budget.
+        for kind in [InputKind::Bam, InputKind::Cram] {
+            for t in 4..=64 {
+                let (r, w) = plan(t, 5, kind);
+                assert_eq!(r + w, t, "kind={kind:?} t={t} should spend the whole budget");
             }
         }
+    }
+
+    #[test]
+    fn plan_sam_is_bounded_by_tool_count() {
+        // SAM can't decode in parallel, so it can't use more threads than there
+        // are collector workers — extra budget is legitimately unused.
+        for t in 4..=64 {
+            let (r, w) = plan(t, 5, InputKind::Sam);
+            assert_eq!((r, w), (0, t.min(5)), "sam t={t}");
+        }
+    }
+
+    #[test]
+    fn plan_input_kind_classifies_by_extension() {
+        assert_eq!(InputKind::of(Path::new("x.cram")), InputKind::Cram);
+        assert_eq!(InputKind::of(Path::new("x.CRAM")), InputKind::Cram);
+        assert_eq!(InputKind::of(Path::new("x.sam")), InputKind::Sam);
+        assert_eq!(InputKind::of(Path::new("x.sam.gz")), InputKind::Sam);
+        assert_eq!(InputKind::of(Path::new("x.bam")), InputKind::Bam);
     }
 }

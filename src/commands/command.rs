@@ -10,8 +10,11 @@ pub struct ThreadPlan {
     /// BGZF/CRAM decode workers handed to the reader, in addition to the
     /// calling thread. `0` reads single-threaded.
     pub decode_threads: usize,
-    /// Parallel compute workers the command runs. `1` for the single-pass
-    /// tools (their compute is serial on the main thread); `multi` uses more.
+    /// Parallel compute workers the command runs. `multi` interprets `0` as
+    /// serial-main mode (collectors run on the main thread with decode
+    /// offloaded to the reader pool) and `>= 1` as its dispatch+worker
+    /// pipeline. The single-pass tools ignore this (their compute is always
+    /// serial on the main thread) and only read `decode_threads`.
     pub compute_workers: usize,
 }
 

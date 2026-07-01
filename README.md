@@ -247,17 +247,22 @@ riker --threads 4 wgs -i sample.bam -r ref.fa -o out_prefix
 riker multi --threads 4 -i sample.bam -r ref.fa -o out_prefix --tools wgs gcbias basic alignment isize
 ```
 
-Each command spends the budget as it sees fit. The single-pass tools (`wgs`,
+`--threads` is the number of cores riker will try to saturate; it may spin a
+few more threads internally (e.g. a dispatch thread) to keep them busy. Each
+command spends the budget as it sees fit. The single-pass tools (`wgs`,
 `alignment`, …) run their own work on one thread and hand the remainder to
-input decoding; `multi` divides it between input decoding and parallel
-collector workers. Left unset, the single-pass tools run single-threaded and
-`multi` uses a small default pool.
+input decoding; `multi` lays it out across input-decode threads, a dispatch
+thread, and parallel collector workers, tuned to the input format. Left unset,
+the single-pass tools run single-threaded and `multi` uses a small default pool.
 
-Extra threads accelerate input **decoding**, so the payoff tracks the input
-format: CRAM decode is expensive and scales well (especially the heavier
-`archive`/`small` codecs), while BAM decode is cheap and saturates after one or
-two threads. Peak memory rises modestly with thread count for CRAM and is
-essentially flat for BAM.
+The payoff is format-dependent: **BAM** inflate is cheap, so `multi` is
+compute-bound and leans on collector workers; **CRAM** decode is expensive and
+parallelizes well, so it leans on decode threads (and CRAM peak memory rises
+with thread count, especially for the heavier `archive`/`small` codecs, while
+BAM stays essentially flat). Gains are sub-linear — as a rough guide returns
+flatten past ~6 threads for BAM and ~8 for CRAM — but the sweet spot is
+platform- and input-dependent, and over-supplying threads can slow a run down,
+so it's worth measuring on your own data.
 
 ## Output Format
 

@@ -9,16 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Toolkit-wide `--threads` option** for multithreaded input decoding. It is a
-  single, global budget (accepted before or after the subcommand) that each
-  command divides between decoding the input and its own work. The single-pass
-  tools (`wgs`, `alignment`, …) run their own work on one thread and hand the
-  rest to input decoding; `multi` splits the budget between decode workers and
-  parallel collector workers. BAM uses `noodles-bgzf`'s multithreaded BGZF
-  reader and CRAM sizes htslib's decode pool. CRAM benefits most (its decode is
-  expensive and scales well); BAM decode saturates after one or two threads.
-  Left unset, the single-pass tools run single-threaded and `multi` uses a small
-  default pool.
+- **Toolkit-wide `--threads` option** for multithreaded input decoding — the
+  number of cores riker tries to saturate (it may spin a few more threads
+  internally to do so). It is a single, global budget (accepted before or after
+  the subcommand) that each command divides between decoding the input and its
+  own work. The single-pass tools (`wgs`, `alignment`, …) run their own work on
+  one thread and hand the rest to input decoding; `multi` lays the budget out
+  across decode threads, a dispatch thread, and parallel collector workers,
+  **tuned to the input format** (from benchmarking): BAM inflate is cheap so it
+  favors collector workers, while CRAM decode is expensive and parallelizes
+  well so it favors decode threads. BAM uses `noodles-bgzf`'s multithreaded BGZF
+  reader; CRAM sizes htslib's decode pool. Gains are sub-linear and flatten
+  past ~6 threads for BAM / ~8 for CRAM, but the sweet spot is platform- and
+  input-dependent. Left unset, the single-pass tools run single-threaded and
+  `multi` uses a small default pool.
 
 ### Changed
 

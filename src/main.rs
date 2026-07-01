@@ -50,14 +50,17 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
-    /// Total number of threads to use.
+    /// Number of cores riker should try to saturate.
     ///
-    /// This is a whole-toolkit budget: each command divides it between decoding
-    /// the input and its own work. Unset (the default) runs single-threaded for
-    /// the individual tools; `multi` defaults to a small pool. Extra threads
-    /// speed up input decoding — CRAM benefits most, especially the heavier
-    /// "small"/"archive" codecs — with sub-linear gains (most of the win is the
-    /// first extra thread or two), so a small value usually suffices.
+    /// A whole-toolkit budget; riker may run a few more threads internally (e.g.
+    /// a dispatch thread) to keep those cores busy. Each command divides it
+    /// between decoding the input and its own work. Unset (the default) runs the
+    /// individual tools single-threaded; `multi` uses a small default pool.
+    ///
+    /// Gains are sub-linear and format-dependent — CRAM decode scales further
+    /// than BAM. As a rough guide the returns flatten past ~6 for BAM and ~8 for
+    /// CRAM, but the sweet spot is platform- and input-dependent, and
+    /// over-supplying threads can slow a run down; measure on your own data.
     #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
     threads: Option<u8>,
 
