@@ -60,3 +60,47 @@ pub fn resolve_threads(threads: Option<u8>, default: NonZero<usize>) -> NonZero<
 pub fn output_path(prefix: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{suffix}", prefix.to_string_lossy()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nz(n: usize) -> NonZero<usize> {
+        NonZero::new(n).expect("test uses non-zero")
+    }
+
+    #[test]
+    fn resolve_threads_unset_uses_the_default() {
+        assert_eq!(resolve_threads(None, nz(1)).get(), 1);
+        assert_eq!(resolve_threads(None, nz(7)).get(), 7);
+    }
+
+    #[test]
+    fn resolve_threads_uses_the_provided_value() {
+        assert_eq!(resolve_threads(Some(1), nz(9)).get(), 1);
+        assert_eq!(resolve_threads(Some(6), nz(9)).get(), 6);
+    }
+
+    /// A minimal command exercising the trait defaults.
+    struct Dummy;
+    impl Command for Dummy {
+        fn execute(&self, _threads: Option<u8>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_command_is_single_threaded() {
+        assert_eq!(Dummy.default_threads().get(), 1);
+    }
+
+    #[test]
+    fn default_plan_hands_the_whole_remainder_to_decoding() {
+        // Single-pass tools compute on the calling thread and decode with the
+        // rest, so decode_threads = total - 1 and compute stays at 1.
+        let plan = Dummy.plan_threads(nz(1), Path::new("x.bam"));
+        assert_eq!((plan.decode_threads, plan.compute_workers), (0, 1));
+        let plan = Dummy.plan_threads(nz(4), Path::new("x.bam"));
+        assert_eq!((plan.decode_threads, plan.compute_workers), (3, 1));
+    }
+}

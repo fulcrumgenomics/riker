@@ -205,21 +205,7 @@ impl Multi {
     /// Setting both is an error; the deprecated flag warns; neither falls
     /// back to [`default_threads`](Command::default_threads).
     fn resolve_total_threads(&self, global: Option<u8>) -> Result<NonZero<usize>> {
-        match (global, self.threads) {
-            (Some(_), Some(_)) => bail!(
-                "set the thread count with the top-level `riker --threads`, not both it and \
-                 `multi --threads` (the latter is deprecated)"
-            ),
-            (Some(_), None) => Ok(resolve_threads(global, self.default_threads())),
-            (None, Some(_)) => {
-                log::warn!(
-                    "`multi --threads` is deprecated and will be removed in a future release; \
-                     use the top-level `riker --threads` instead"
-                );
-                Ok(resolve_threads(self.threads, self.default_threads()))
-            }
-            (None, None) => Ok(self.default_threads()),
-        }
+        resolve_budget(global, self.threads, self.default_threads())
     }
 
     /// Build the list of collectors based on the deduplicated kinds.
@@ -382,16 +368,8 @@ impl Command for Multi {
     /// compute workers; CRAM decode is expensive and scales, so give the
     /// reader a decode pool. (Starting heuristic — constants to be tuned.)
     fn plan_threads(&self, total: NonZero<usize>, input: &Path) -> ThreadPlan {
-        let n = total.get();
-        if n <= 1 {
-            return ThreadPlan { decode_threads: 0, compute_workers: 1 };
-        }
-        // One thread drives the reader/fan-out; the rest are split below.
-        let rest = n - 1;
         let is_cram = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("cram"));
-        let decode_threads = if is_cram { (rest / 2).min(4) } else { 0 };
-        let compute_workers = rest.saturating_sub(decode_threads).max(1);
-        ThreadPlan { decode_threads, compute_workers }
+        split_budget(total, is_cram)
     }
 }
 
@@ -434,6 +412,50 @@ impl fmt::Display for CollectorKind {
 }
 
 // ─── Threading helpers ───────────────────────────────────────────────────────
+
+/// Resolve a total thread budget from the top-level `--threads` (`global`) and
+/// the deprecated `multi --threads` (`local`), falling back to `default` when
+/// neither is set. Setting both is an error; using the deprecated local flag
+/// warns. Pure so the truth table can be tested directly.
+fn resolve_budget(
+    global: Option<u8>,
+    local: Option<u8>,
+    default: NonZero<usize>,
+) -> Result<NonZero<usize>> {
+    match (global, local) {
+        (Some(_), Some(_)) => bail!(
+            "set the thread count with the top-level `riker --threads`, not both it and \
+             `multi --threads` (the latter is deprecated)"
+        ),
+        (Some(_), None) => Ok(resolve_threads(global, default)),
+        (None, Some(_)) => {
+            log::warn!(
+                "`multi --threads` is deprecated and will be removed in a future release; \
+                 use the top-level `riker --threads` instead"
+            );
+            Ok(resolve_threads(local, default))
+        }
+        (None, None) => Ok(default),
+    }
+}
+
+/// Split a total thread budget into reader-decode workers and compute worker
+/// groups. multi's orchestrator thread is near-idle, so the whole budget goes
+/// to the reader + workers rather than reserving one for the main thread: one
+/// thread drives the reader/fan-out and the rest are split. BAM decode is cheap
+/// and multi is compute-bound on it, so all of the remainder becomes compute
+/// workers; CRAM decode is expensive and scales, so the reader gets up to half
+/// (capped at 4) as a decode pool. (Starting heuristic — constants to be tuned.)
+fn split_budget(total: NonZero<usize>, is_cram: bool) -> ThreadPlan {
+    let n = total.get();
+    if n <= 1 {
+        return ThreadPlan { decode_threads: 0, compute_workers: 1 };
+    }
+    let rest = n - 1;
+    let decode_threads = if is_cram { (rest / 2).min(4) } else { 0 };
+    let compute_workers = rest.saturating_sub(decode_threads).max(1);
+    ThreadPlan { decode_threads, compute_workers }
+}
 
 /// A batch of records shared across collector channels.
 ///
@@ -916,5 +938,65 @@ mod tests {
             "expected the failing collector's error, got: {err}"
         );
         Ok(())
+    }
+
+    fn nz(n: usize) -> NonZero<usize> {
+        NonZero::new(n).expect("test uses non-zero")
+    }
+
+    #[test]
+    fn resolve_budget_neither_uses_default() {
+        let got = resolve_budget(None, None, nz(3)).unwrap();
+        assert_eq!(got.get(), 3);
+    }
+
+    #[test]
+    fn resolve_budget_global_wins_over_default() {
+        let got = resolve_budget(Some(5), None, nz(3)).unwrap();
+        assert_eq!(got.get(), 5);
+    }
+
+    #[test]
+    fn resolve_budget_local_deprecated_flag_is_honored() {
+        let got = resolve_budget(None, Some(2), nz(4)).unwrap();
+        assert_eq!(got.get(), 2);
+    }
+
+    #[test]
+    fn resolve_budget_both_set_is_an_error() {
+        let err = resolve_budget(Some(2), Some(2), nz(4)).expect_err("both set must error");
+        assert!(err.to_string().contains("not both"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn split_budget_bam_gives_all_of_the_remainder_to_compute() {
+        // BAM decode is cheap: no decode workers, rest-1 compute workers.
+        for (n, compute) in [(1, 1), (2, 1), (3, 2), (4, 3), (8, 7)] {
+            let plan = split_budget(nz(n), false);
+            assert_eq!(plan.decode_threads, 0, "bam n={n} should use no decode workers");
+            assert_eq!(plan.compute_workers, compute, "bam n={n} compute workers");
+        }
+    }
+
+    #[test]
+    fn split_budget_cram_reserves_a_decode_pool() {
+        // CRAM decode scales: reader gets up to half the remainder, capped at 4.
+        for (n, decode, compute) in
+            [(1, 0, 1), (2, 0, 1), (3, 1, 1), (4, 1, 2), (8, 3, 4), (12, 4, 7)]
+        {
+            let plan = split_budget(nz(n), true);
+            assert_eq!(plan.decode_threads, decode, "cram n={n} decode workers");
+            assert_eq!(plan.compute_workers, compute, "cram n={n} compute workers");
+        }
+    }
+
+    #[test]
+    fn split_budget_never_yields_zero_compute_workers() {
+        for n in 1..=64 {
+            for is_cram in [false, true] {
+                let plan = split_budget(nz(n), is_cram);
+                assert!(plan.compute_workers >= 1, "n={n} cram={is_cram} needs >=1 worker");
+            }
+        }
     }
 }

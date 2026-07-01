@@ -513,6 +513,45 @@ fn test_parallel_matches_single_threaded_isize_alignment() -> Result<()> {
     Ok(())
 }
 
+/// multi output must be byte-identical across thread counts when the budget is
+/// set via the top-level `--threads` (the non-deprecated path). Compares every
+/// `.txt` output file against the single-threaded run; PDF plots embed
+/// non-deterministic bytes and are skipped.
+#[test]
+fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
+    let bam = build_test_bam()?;
+    let collectors = vec![CollectorKind::Alignment, CollectorKind::Basic, CollectorKind::Isize];
+
+    // Baseline: single-threaded via the top-level --threads path. `make_multi`
+    // pre-sets the deprecated local flag, so clear it to use the global one.
+    let base_dir = TempDir::new()?;
+    let mut base = make_multi(bam.path(), &base_dir.path().join("out"), collectors.clone());
+    base.threads = None;
+    base.execute(Some(1))?;
+
+    let mut baseline: Vec<(std::ffi::OsString, Vec<u8>)> = Vec::new();
+    for entry in std::fs::read_dir(base_dir.path())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "txt") {
+            let name = path.file_name().expect("output file has a name").to_owned();
+            baseline.push((name, std::fs::read(&path)?));
+        }
+    }
+    assert!(!baseline.is_empty(), "expected at least one .txt output file");
+
+    for threads in [2u8, 3, 4] {
+        let dir = TempDir::new()?;
+        let mut m = make_multi(bam.path(), &dir.path().join("out"), collectors.clone());
+        m.threads = None;
+        m.execute(Some(threads))?;
+        for (name, bytes) in &baseline {
+            let got = std::fs::read(dir.path().join(name))?;
+            assert_eq!(&got, bytes, "output {name:?} differs at --threads {threads}");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn test_parallel_all_collectors() -> Result<()> {
     let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
