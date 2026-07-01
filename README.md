@@ -81,7 +81,7 @@ Tool versions:
 | HG00188   | 37.5 GB| 30× | 8:14       | 1:46:16 (46:36 + 59:40) | **12.9×** | 1.48 GB   | 5.24 GB         |
 | HG02675   | 41.1 GB| 30× | 8:45       | 1:51:55 (51:13 + 60:42) | **12.8×** | 1.47 GB   | 5.20 GB         |
 
-Riker was tested with a single invocation of `riker multi --tools wgs gcbias alignment basic isize --threads 4`.
+Riker was tested with a single invocation of `riker --threads 4 multi --tools wgs gcbias alignment basic isize`.
 Picard was run twice, once for `CollectWgsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
 
 "Picard peak RSS" is the larger of the two sequential JVM runs — typically dominated by `CollectWgsMetrics`, which scales with genome size + coverage.
@@ -114,7 +114,7 @@ Hybcap measurements are the mean of three GIAB Ashkenazi trio samples (HG002, HG
 |---              |---      |---          |---         |---                       |---        |---        |---              |
 | AJ trio (mean)  | ~9.8 GB | Agilent v5  | 1:45       | 22:07 (7:57 + 14:09)     | **12.6×** | 0.99 GB   | 3.23 GB         |
 
-Riker was tested with a single invocation of `riker multi --tools hybcap alignment basic isize --threads 4`.
+Riker was tested with a single invocation of `riker --threads 4 multi --tools hybcap alignment basic isize`.
 Picard was run twice, once for `CollectHsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
 
 "Picard peak RSS" is the larger of the two sequential JVM runs — dominated by `CollectHsMetrics` on the hybcap trio.
@@ -236,6 +236,32 @@ riker multi \
   --hybcap::baits baits.bed \
   --hybcap::targets targets.bed
 ```
+
+### Threads
+
+Riker takes a single, whole-toolkit `--threads` budget, placed **before** the
+subcommand:
+
+```bash
+riker --threads 4 wgs -i sample.bam -r ref.fa -o out_prefix
+riker --threads 4 multi -i sample.bam -r ref.fa -o out_prefix --tools wgs gcbias basic alignment isize
+```
+
+Each command spends the budget as it sees fit. The single-pass tools (`wgs`,
+`alignment`, …) run their own work on one thread and hand the remainder to
+input decoding; `multi` divides it between input decoding and parallel
+collector workers. Left unset, the single-pass tools run single-threaded and
+`multi` uses a small default pool.
+
+Extra threads accelerate input **decoding**, so the payoff tracks the input
+format: CRAM decode is expensive and scales well (especially the heavier
+`archive`/`small` codecs), while BAM decode is cheap and saturates after one or
+two threads. Peak memory rises modestly with thread count for CRAM and is
+essentially flat for BAM.
+
+> `riker multi --threads N` (the old per-subcommand flag) is **deprecated** in
+> favor of the top-level `riker --threads N` and will be removed in a future
+> release; setting both is an error.
 
 ## Output Format
 

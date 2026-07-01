@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Toolkit-wide `--threads` option** for multithreaded input decoding. It is a
+  single budget placed before the subcommand (e.g. `riker --threads 4 wgs ...`)
+  that each command divides between decoding the input and its own work. The
+  single-pass tools (`wgs`, `alignment`, …) run their own work on one thread and
+  hand the rest to input decoding; `multi` splits the budget between decode
+  workers and parallel collector workers. BAM uses `noodles-bgzf`'s
+  multithreaded BGZF reader and CRAM sizes htslib's decode pool. CRAM benefits
+  most (its decode is expensive and scales well); BAM decode saturates after one
+  or two threads. Left unset, the single-pass tools run single-threaded and
+  `multi` uses a small default pool.
+
+### Changed
+
+- **`multi` default parallelism.** With no thread count given, `multi` now uses
+  up to four threads (clamped to the core count) instead of a fixed two, and
+  divides that budget between input decoding and collector workers rather than
+  treating it as a bare worker count.
+
+### Deprecated
+
+- **`multi --threads`** in favor of the top-level `riker --threads`. The old
+  per-subcommand flag still works (with a warning) and will be removed in a
+  future release; setting both is an error.
+
+### Fixed
+
+- **`multi` output is now deterministic across thread counts.** Each collector
+  is pinned to a single worker and receives batches in file order, so a
+  parallel run is byte-identical to a single-threaded one; previously the
+  per-record output order of some collectors could vary with the thread count.
+
 ## [0.3.0] - 2026-06-24
 
 ### Added
