@@ -86,6 +86,14 @@ panic = "abort"
 inherits = "release"
 incremental = false
 
+# Local profiling profile for samply/atos. Identical codegen to `release`
+# but keeps DWARF debug info so native frames symbolicate to function names.
+# Not used for distribution; `release`/`dist` stay lean. Build with
+# `cargo build --profile profiling` -> target/profiling/riker.
+[profile.profiling]
+inherits = "release"
+debug = true
+
 # x86_64 release binaries are packaged with `cargo multivers` into a single
 # launcher that embeds the variants below and dispatches to the highest
 # match at startup. Variants:
