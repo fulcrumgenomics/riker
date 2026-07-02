@@ -1356,14 +1356,17 @@ impl Collector for HybCapCollector {
         RikerRecordRequirements::NONE
     }
 
-    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~140,
-    /// the heaviest collector — dual bait+target per-base pileup. Measured on an
-    /// exome BAM (samply worker-compute) at roughly 2x `basic` per read (basic's
-    /// hint is 76, alignment's 55), which lands it near 140 on the shared hint
-    /// scale. Approximate — per-read cost varies with read length across data
-    /// sets — but its ordering as the heaviest is robust.
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~50, now
+    /// roughly `basic`-class. It was 140 (the heaviest collector, ~1.8x `basic`)
+    /// before the coordinate-order sweep rewrite, which cut `accept()`'s per-read
+    /// CPU to ~0.36x its former self (the per-base target search and the three
+    /// per-read lapper queries both collapsed to range arithmetic). Re-derived
+    /// against the unchanged reference-free `basic` anchor (76): 140 x 0.36 ~= 50.
+    /// Coarse — it is only an LPT input for `multi`'s worker balancing, and
+    /// per-read cost varies with read length and on-target density across data
+    /// sets.
     fn cost_hint(&self) -> u32 {
-        140
+        50
     }
 }
 
