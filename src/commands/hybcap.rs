@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::Op;
@@ -18,7 +18,6 @@ use crate::math::{safe_div, safe_div_f};
 use crate::metrics::{
     serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, tsv_writer, write_tsv,
 };
-use crate::overlapper::Overlapper;
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::record_utils::derive_sample;
@@ -145,6 +144,9 @@ impl Default for HybCapOptions {
 /// experiments, including on-target rate, coverage uniformity, and enrichment.
 /// Requires bait and target interval files in IntervalList or BED format.
 ///
+/// The input BAM must be coordinate-sorted (by reference, then position); a record
+/// that arrives out of order aborts the run with an error.
+///
 /// Reads that fail vendor quality checks (SAM QC_FAIL flag) are excluded from
 /// all computations.
 ///
@@ -225,9 +227,20 @@ pub struct HybCapCollector {
 
     // Initialized during initialize()
     dict: Option<SequenceDictionary>,
-    target_overlapper: Option<Overlapper<usize>>,
-    bait_overlapper: Option<Overlapper<Interval>>,
-    expanded_bait_overlapper: Option<Overlapper<()>>,
+    // Per-contig sorted, non-overlapping interval lists (indexed by ref_id), swept
+    // with monotonic cursors since reads arrive in coordinate order. Targets carry
+    // their flat index into `target_coverages` as the third field; bait lists leave
+    // it 0.
+    target_ivs: Vec<Vec<(u32, u32, u32)>>,
+    bait_ivs: Vec<Vec<(u32, u32, u32)>>,
+    expanded_bait_ivs: Vec<Vec<(u32, u32, u32)>>,
+    target_cursor: usize,
+    bait_cursor: usize,
+    expanded_cursor: usize,
+    // Coordinate-sort guard: last (ref_id, start) seen; a change of ref_id also
+    // triggers the per-contig cursor reset.
+    last_ref_id: Option<usize>,
+    last_start: u32,
 
     // Per-target coverage tracking (keyed by (ref_id, start, end))
     target_coverages: Vec<(Interval, TargetCoverage)>,
@@ -313,9 +326,14 @@ impl HybCapCollector {
             output_per_target: options.per_target_coverage,
 
             dict: None,
-            target_overlapper: None,
-            bait_overlapper: None,
-            expanded_bait_overlapper: None,
+            target_ivs: Vec::new(),
+            bait_ivs: Vec::new(),
+            expanded_bait_ivs: Vec::new(),
+            target_cursor: 0,
+            bait_cursor: 0,
+            expanded_cursor: 0,
+            last_ref_id: None,
+            last_start: 0,
 
             target_coverages: Vec::new(),
             target_gc: Vec::new(),
@@ -348,6 +366,11 @@ impl HybCapCollector {
             exc_overlap_bases: 0,
             exc_off_target_bases: 0,
         }
+    }
+
+    /// Return the contig name for a `ref_id`, or `?` if unknown. Used only in errors.
+    fn contig_name(&self, ref_id: usize) -> &str {
+        self.dict.as_ref().and_then(|d| d.get_by_index(ref_id)).map_or("?", |m| m.name())
     }
 
     /// Compute alignment span, aligned base count, and alignment blocks in a single
@@ -450,13 +473,16 @@ impl HybCapCollector {
         Some((mate_start - 1) as u32)
     }
 
-    /// Walk the CIGAR base-by-base for a surviving (post-filter) read, accumulating
-    /// on-target bases and per-target coverage depths.  Uses prefetched target indices
-    /// to avoid overlapper queries in the inner loop.
+    /// Walk the CIGAR for a surviving (post-filter) read, accumulating on-target
+    /// bases and per-target coverage depths.  Receives the read's overlapping
+    /// targets as a pre-swept, start-sorted `(start, end, coverage-index)` slice.
     ///
-    /// Overlap clipping is computed per M-block (not per-base) by calculating the
-    /// effective unclipped length before the inner loop.  The off-target fast path
-    /// uses a contiguous slice scan that LLVM can auto-vectorize.
+    /// Overlap clipping is computed per M-block (not per-base) via the effective
+    /// unclipped length.  Because target intervals are merged (non-overlapping),
+    /// each M-block is decomposed into alternating off-target and on-target
+    /// segments by range arithmetic: off-target runs use one auto-vectorized
+    /// quality scan, on-target runs increment a contiguous depth slice — avoiding
+    /// the per-base target-membership search.
     #[expect(clippy::too_many_lines, reason = "CIGAR walk is inherently detailed")]
     #[expect(
         clippy::cast_possible_truncation,
@@ -468,31 +494,32 @@ impl HybCapCollector {
         start: u32,
         mate_clip_ref_pos: Option<u32>,
         is_mapped_pair: bool,
-        target_idxs: &SmallVec<[usize; 4]>,
+        cached_targets: &[(u32, u32, u32)],
     ) {
         let qual_bytes: &[u8] = record.quality_scores();
+        let min_bq = self.min_bq;
         // Sentinel value: u32::MAX means "no clipping"
         let clip_ref_pos = mate_clip_ref_pos.unwrap_or(u32::MAX);
 
-        // Change 5: Cache target bounds on the stack to avoid heap reads in the
-        // inner loop.  Only the `add_base` / `read_count` calls index into
-        // `target_coverages`.
-        let cached_targets: SmallVec<[(u32, u32, usize); 4]> = target_idxs
-            .iter()
-            .map(|&idx| {
-                let (tgt, _) = &self.target_coverages[idx];
-                (tgt.start, tgt.end, idx)
-            })
-            .collect();
+        // Scalar counters accumulate in locals and flush to `self` once at the
+        // end.  A `self.field += 1` inside the per-base loops would force a
+        // reload/store through `self` on every base, since the optimizer cannot
+        // prove the depth-array writes do not alias the counter fields.
+        let mut on_target: u64 = 0;
+        let mut on_target_from_pairs: u64 = 0;
+        let mut exc_baseq: u64 = 0;
+        let mut exc_off_target: u64 = 0;
+        let mut exc_overlap: u64 = 0;
 
         let mut ref_pos = start;
         let mut read_offset: usize = 0;
         let mut clipping_active = false;
 
-        // Track which targets have been counted for read_count using a bitmask.
-        // Indexed by position within target_idxs (not by target_coverages index).
-        // Supports up to 64 overlapping targets per read.
-        let mut counted_mask: u64 = 0;
+        // Dedup read_count across M-blocks that touch the same target.  Targets are
+        // encountered in non-decreasing order across a read (ref_pos is monotonic
+        // and targets are sorted), so remembering only the last-counted local index
+        // suffices — and, unlike a bitmask, imposes no cap on overlaps per read.
+        let mut last_counted: usize = usize::MAX;
 
         for op in record.cigar_ops() {
             let op: Op = op;
@@ -500,8 +527,9 @@ impl HybCapCollector {
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                     let block_end = ref_pos + op.len() as u32;
 
-                    // Change 2: Compute effective (unclipped) length once per M-block
-                    // instead of checking `pos >= clip_ref_pos` on every base.
+                    // Compute the effective (unclipped) length once per M-block
+                    // instead of testing `pos >= clip_ref_pos` on every base.
+                    // Clipping always removes a suffix, so the kept part is a prefix.
                     let (effective_len, clipped_count) = if block_end <= clip_ref_pos {
                         (op.len(), 0)
                     } else if ref_pos >= clip_ref_pos {
@@ -511,7 +539,7 @@ impl HybCapCollector {
                         (unclipped, op.len() - unclipped)
                     };
                     if clipped_count > 0 {
-                        self.exc_overlap_bases += clipped_count as u64;
+                        exc_overlap += clipped_count as u64;
                         clipping_active = true;
                     }
 
@@ -525,65 +553,73 @@ impl HybCapCollector {
                     let scan_len = effective_len.min(avail);
                     let truncated = (effective_len - scan_len) as u64;
                     if truncated > 0 {
-                        self.exc_baseq_bases += truncated;
+                        exc_baseq += truncated;
                     }
 
-                    if cached_targets.is_empty() {
-                        // Change 3: Off-target fast path — when the block is fully
-                        // unclipped, scan a contiguous quality slice (auto-vectorizable)
-                        // instead of per-base branching.
-                        if effective_len == op.len() && scan_len > 0 {
-                            let quals = &qual_bytes[read_offset..read_offset + scan_len];
-                            let low_qual = simd::count_bases_lt_q(quals, self.min_bq);
-                            self.exc_baseq_bases += low_qual;
-                            self.exc_off_target_bases += scan_len as u64 - low_qual;
-                        } else {
-                            // Partially clipped block — per-base fallback (rare)
-                            for i in 0..scan_len {
-                                let qual = qual_bytes.get(read_offset + i).copied().unwrap_or(0);
-                                if qual < self.min_bq {
-                                    self.exc_baseq_bases += 1;
-                                } else {
-                                    self.exc_off_target_bases += 1;
+                    if scan_len > 0 {
+                        // Quality slice for this block's kept (unclipped, in-bounds)
+                        // prefix; sliced once for bounds-check-free access.
+                        let quals = &qual_bytes[read_offset..read_offset + scan_len];
+                        let r_end = ref_pos + scan_len as u32;
+                        let mut cursor = ref_pos;
+
+                        // Sweep the block against the sorted, non-overlapping
+                        // targets: off-target gaps are counted with one vectorized
+                        // low-quality scan; on-target runs increment a contiguous
+                        // depth slice with only a per-base quality test.
+                        for (local_idx, &(tgt_start, tgt_end, idx)) in
+                            cached_targets.iter().enumerate()
+                        {
+                            if cursor >= r_end {
+                                break;
+                            }
+                            // Off-target gap before this target.
+                            let gap_end = tgt_start.min(r_end);
+                            if cursor < gap_end {
+                                let lo = (cursor - ref_pos) as usize;
+                                let hi = (gap_end - ref_pos) as usize;
+                                let low = simd::count_bases_lt_q(&quals[lo..hi], min_bq);
+                                exc_baseq += low;
+                                exc_off_target += (hi - lo) as u64 - low;
+                                cursor = gap_end;
+                            }
+                            // On-target overlap [cursor, min(tgt_end, r_end)).
+                            let on_end = tgt_end.min(r_end);
+                            if cursor < on_end {
+                                let lo = (cursor - ref_pos) as usize;
+                                let seg_len = (on_end - cursor) as usize;
+                                let depth_base = (cursor - tgt_start) as usize;
+                                let seg_quals = &quals[lo..lo + seg_len];
+                                let cov = &mut self.target_coverages[idx as usize].1;
+                                let depths = &mut cov.hq_depths[depth_base..depth_base + seg_len];
+                                let mut hq: u64 = 0;
+                                for (d, &qual) in depths.iter_mut().zip(seg_quals) {
+                                    if qual < min_bq {
+                                        continue;
+                                    }
+                                    *d = d.saturating_add(1);
+                                    hq += 1;
                                 }
+                                on_target += hq;
+                                if is_mapped_pair {
+                                    on_target_from_pairs += hq;
+                                }
+                                exc_baseq += seg_len as u64 - hq;
+                                if hq > 0 && local_idx != last_counted {
+                                    cov.read_count += 1;
+                                    last_counted = local_idx;
+                                }
+                                cursor = on_end;
                             }
                         }
-                    } else {
-                        // Change 4: Slice quality array once per M-block for bounds-check-
-                        // free access in the inner loop.
-                        let quals = &qual_bytes[read_offset..read_offset + scan_len];
-                        for (i, &qual) in quals.iter().enumerate() {
-                            if qual < self.min_bq {
-                                self.exc_baseq_bases += 1;
-                                continue;
-                            }
 
-                            // Check cached target bounds (Change 5)
-                            let pos = ref_pos + i as u32;
-                            let mut hit = false;
-                            for (local_idx, &(tgt_start, tgt_end, idx)) in
-                                cached_targets.iter().enumerate()
-                            {
-                                if pos >= tgt_start && pos < tgt_end {
-                                    hit = true;
-                                    self.target_coverages[idx]
-                                        .1
-                                        .add_base((pos - tgt_start) as usize);
-                                    if counted_mask & (1 << local_idx) == 0 {
-                                        self.target_coverages[idx].1.read_count += 1;
-                                        counted_mask |= 1 << local_idx;
-                                    }
-                                }
-                            }
-
-                            if hit {
-                                self.on_target_bases += 1;
-                                if is_mapped_pair {
-                                    self.on_target_bases_from_pairs += 1;
-                                }
-                            } else {
-                                self.exc_off_target_bases += 1;
-                            }
+                        // Trailing off-target run after the last target (also the
+                        // whole block when the read overlaps no targets).
+                        if cursor < r_end {
+                            let lo = (cursor - ref_pos) as usize;
+                            let low = simd::count_bases_lt_q(&quals[lo..scan_len], min_bq);
+                            exc_baseq += low;
+                            exc_off_target += (scan_len - lo) as u64 - low;
                         }
                     }
 
@@ -592,21 +628,21 @@ impl HybCapCollector {
                 }
                 Kind::Insertion => {
                     if self.include_indels && !cached_targets.is_empty() {
-                        // Inserted bases count toward on_target_bases if ref_pos is on target.
-                        let on_target = cached_targets.iter().any(|&(tgt_start, tgt_end, _)| {
+                        // Inserted bases count toward on_target if ref_pos is on target.
+                        let on_tgt = cached_targets.iter().any(|&(tgt_start, tgt_end, _)| {
                             ref_pos >= tgt_start && ref_pos < tgt_end
                         });
-                        if on_target {
+                        if on_tgt {
                             for i in 0..op.len() {
                                 if clipping_active {
-                                    self.exc_overlap_bases += 1;
+                                    exc_overlap += 1;
                                     continue;
                                 }
                                 let qual = qual_bytes.get(read_offset + i).copied().unwrap_or(0);
-                                if qual >= self.min_bq {
-                                    self.on_target_bases += 1;
+                                if qual >= min_bq {
+                                    on_target += 1;
                                     if is_mapped_pair {
-                                        self.on_target_bases_from_pairs += 1;
+                                        on_target_from_pairs += 1;
                                     }
                                 }
                             }
@@ -618,9 +654,9 @@ impl HybCapCollector {
                     if self.include_indels && !cached_targets.is_empty() {
                         for i in 0..op.len() {
                             let pos = ref_pos + i as u32;
-                            for &(tgt_start, tgt_end, idx) in &cached_targets {
+                            for &(tgt_start, tgt_end, idx) in cached_targets {
                                 if pos >= tgt_start && pos < tgt_end {
-                                    self.target_coverages[idx]
+                                    self.target_coverages[idx as usize]
                                         .1
                                         .add_base((pos - tgt_start) as usize);
                                 }
@@ -638,6 +674,12 @@ impl HybCapCollector {
                 Kind::HardClip | Kind::Pad => {}
             }
         }
+
+        self.on_target_bases += on_target;
+        self.on_target_bases_from_pairs += on_target_from_pairs;
+        self.exc_baseq_bases += exc_baseq;
+        self.exc_off_target_bases += exc_off_target;
+        self.exc_overlap_bases += exc_overlap;
     }
 
     /// Compute GC fractions for all targets using region queries to fetch only
@@ -894,19 +936,29 @@ impl Collector for HybCapCollector {
             self.merged_target_territory
         );
 
-        // Build overlap detectors
-        // Build target overlapper storing indices into target_coverages for O(1) lookup
-        self.target_overlapper = Some(Overlapper::<usize>::new(
-            merged_targets.iter().enumerate().map(|(idx, iv)| (iv.ref_id, iv.start, iv.end, idx)),
-        ));
-        self.bait_overlapper = Some(Overlapper::<Interval>::from_intervals(&merged_baits));
+        // Build per-contig sorted interval lists for the coordinate-order sweep.
+        // Inputs are merged (sorted, non-overlapping), so each read's overlaps are a
+        // contiguous run reachable by a monotonic cursor. Targets carry their flat
+        // index into `target_coverages` (built in the same merged order below).
+        let n_contigs = dict.len();
+        self.target_ivs = bucket_by_contig(
+            n_contigs,
+            merged_targets.iter().enumerate().map(|(idx, iv)| {
+                (iv.ref_id, iv.start, iv.end, u32::try_from(idx).expect("target index fits in u32"))
+            }),
+        );
+        self.bait_ivs = bucket_by_contig(
+            n_contigs,
+            merged_baits.iter().map(|iv| (iv.ref_id, iv.start, iv.end, 0u32)),
+        );
 
-        // Build expanded bait detector for near-bait classification.
-        // Only `overlaps_any()` is called, so store `()` to avoid cloning Interval data.
+        // Expanded baits (padded by near_distance, re-merged) drive near-bait
+        // classification; only run-nonemptiness is queried.
         let expanded_baits = merged_baits.padded(self.near_distance).merged();
-        self.expanded_bait_overlapper = Some(Overlapper::<()>::new(
-            expanded_baits.iter().map(|iv| (iv.ref_id, iv.start, iv.end, ())),
-        ));
+        self.expanded_bait_ivs = bucket_by_contig(
+            n_contigs,
+            expanded_baits.iter().map(|iv| (iv.ref_id, iv.start, iv.end, 0u32)),
+        );
 
         // Initialize per-target coverage arrays
         for iv in merged_targets.iter() {
@@ -914,8 +966,9 @@ impl Collector for HybCapCollector {
             self.target_coverages.push((iv.clone(), TargetCoverage::new(len)));
         }
 
-        // Compute GC fractions per target.  Load each contig once and reuse the
-        // sequence for all targets on that contig, avoiding 4702 full-contig loads.
+        // Compute GC fractions per target via one indexed region fetch each.
+        // Targets are sparse relative to the genome, so per-region fetches read
+        // far fewer bytes than loading whole contigs would.
         self.target_gc = self.compute_all_target_gc(&dict);
 
         self.dict = Some(dict);
@@ -972,25 +1025,47 @@ impl Collector for HybCapCollector {
             return Ok(());
         };
 
-        // ── Prefetch all overlaps once per read ──
-        let target_idxs: SmallVec<[usize; 4]> = self
-            .target_overlapper
-            .as_ref()
-            .map(|o| o.get_overlaps(ref_id, start, end).copied().collect())
-            .unwrap_or_default();
+        // ── Coordinate-sort gate + per-contig cursor reset ──
+        // The cursor sweeps below require reads ordered by (ref_id, position).
+        // Reject any regression (also catches a BAM whose header claims coordinate
+        // sort but isn't) rather than silently emitting wrong metrics.
+        if let Some(last_ref_id) = self.last_ref_id {
+            if ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start) {
+                return Err(anyhow!(
+                    "hybcap requires a coordinate-sorted BAM (ordered by reference, then \
+                     position); encountered {}:{} after {}:{}. Sort with `samtools sort`.",
+                    self.contig_name(ref_id),
+                    u64::from(start) + 1,
+                    self.contig_name(last_ref_id),
+                    u64::from(self.last_start) + 1,
+                ));
+            }
+            if ref_id != last_ref_id {
+                self.target_cursor = 0;
+                self.bait_cursor = 0;
+                self.expanded_cursor = 0;
+            }
+        }
+        self.last_ref_id = Some(ref_id);
+        self.last_start = start;
 
-        let bait_hits: SmallVec<[(u32, u32); 4]> = self
-            .bait_overlapper
-            .as_ref()
-            .map(|o| o.get_overlaps(ref_id, start, end).map(|iv| (iv.start, iv.end)).collect())
-            .unwrap_or_default();
+        // ── Sweep the sorted per-contig interval lists (amortized O(1) per read vs.
+        //    a from-scratch binary search, since reads arrive in coordinate order) ──
+        let (tlo, thi) = sweep_run(&self.target_ivs[ref_id], &mut self.target_cursor, start, end);
+        let cached_targets: SmallVec<[(u32, u32, u32); 4]> =
+            self.target_ivs[ref_id][tlo..thi].iter().copied().collect();
 
-        // Change 6: Skip expanded_bait query when bait_hits is non-empty (the read
-        // directly overlaps a bait, so it's definitely on expanded bait too).
+        let (blo, bhi) = sweep_run(&self.bait_ivs[ref_id], &mut self.bait_cursor, start, end);
+        let bait_hits: SmallVec<[(u32, u32); 4]> =
+            self.bait_ivs[ref_id][blo..bhi].iter().map(|&(s, e, _)| (s, e)).collect();
+
+        // Skip the expanded-bait sweep when the read already overlaps a bait (then
+        // it's on expanded bait too); its cursor catches up lazily on the next read
+        // that needs it, since prunes are start-driven.
         let on_expanded_bait = if bait_hits.is_empty() {
-            self.expanded_bait_overlapper
-                .as_ref()
-                .is_some_and(|o| o.overlaps_any(ref_id, start, end))
+            let (elo, ehi) =
+                sweep_run(&self.expanded_bait_ivs[ref_id], &mut self.expanded_cursor, start, end);
+            ehi > elo
         } else {
             true
         };
@@ -1037,7 +1112,7 @@ impl Collector for HybCapCollector {
             start,
             mate_clip_ref_pos,
             is_mapped_pair,
-            &target_idxs,
+            &cached_targets,
         );
 
         Ok(())
@@ -1551,6 +1626,41 @@ impl TargetCoverage {
             zeros as f64 / self.hq_depths.len() as f64
         }
     }
+}
+
+// ─── Interval sweep helpers ───────────────────────────────────────────────────
+
+/// Bucket `(ref_id, start, end, payload)` intervals into per-contig lists indexed
+/// by `ref_id`, each sorted by start.  Inputs come from merged interval sets, so
+/// the per-contig lists are non-overlapping.
+fn bucket_by_contig(
+    n_contigs: usize,
+    intervals: impl Iterator<Item = (usize, u32, u32, u32)>,
+) -> Vec<Vec<(u32, u32, u32)>> {
+    let mut per_contig = vec![Vec::new(); n_contigs];
+    for (ref_id, start, end, payload) in intervals {
+        per_contig[ref_id].push((start, end, payload));
+    }
+    for list in &mut per_contig {
+        list.sort_unstable_by_key(|&(start, _, _)| start);
+    }
+    per_contig
+}
+
+/// Advance `cursor` past intervals in the sorted, non-overlapping `ivs` that end at
+/// or before `start`, then return the `[lo, hi)` index range of intervals
+/// overlapping `[start, end)`.  Correct only when `start` is monotonically
+/// non-decreasing across calls (coordinate-sorted reads); the caller enforces that.
+fn sweep_run(ivs: &[(u32, u32, u32)], cursor: &mut usize, start: u32, end: u32) -> (usize, usize) {
+    while *cursor < ivs.len() && ivs[*cursor].1 <= start {
+        *cursor += 1;
+    }
+    let lo = *cursor;
+    let mut hi = lo;
+    while hi < ivs.len() && ivs[hi].0 < end {
+        hi += 1;
+    }
+    (lo, hi)
 }
 
 // ─── Histogram helper functions ───────────────────────────────────────────────

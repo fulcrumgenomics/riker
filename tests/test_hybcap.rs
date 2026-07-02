@@ -211,6 +211,37 @@ fn add_single_record(
     builder.add_record(record);
 }
 
+// ─── Input requirements ────────────────────────────────────────────────────────
+
+/// hybcap requires coordinate-sorted input (its interval sweep assumes reads
+/// arrive in reference/position order). An out-of-order record must produce a
+/// clear error rather than silently yielding wrong metrics.
+#[test]
+fn coordinate_unsorted_input_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let bait_path = dir.path().join("baits.bed");
+    let target_path = dir.path().join("targets.bed");
+    write_bed(&bait_path, &[("chr1", 0, 1000)]);
+    write_bed(&target_path, &[("chr1", 0, 1000)]);
+
+    // Unsorted builder preserves insertion order: add a read at pos 500 followed
+    // by one at pos 100, so the second regresses in position.
+    let mut bld =
+        SamBuilder::with_contigs(&[("chr1".to_string(), 10_000)]).sort_order(SortOrder::Unsorted);
+    let qual = vec![30u8; 100];
+    let cigar = [Op::new(Kind::Match, 100)];
+    add_single_record(&mut bld, "late", 0, 500, &cigar, &qual, 20, Flags::empty());
+    add_single_record(&mut bld, "early", 0, 100, &cigar, &qual, 20, Flags::empty());
+
+    let bam = bld.to_temp_bam().unwrap();
+    let prefix = dir.path().join("out");
+    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+
+    let err = cmd.execute(None).expect_err("coordinate-unsorted input should be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("coordinate-sorted"), "unexpected error message: {msg}");
+}
+
 // ─── Tests ported from Picard ─────────────────────────────────────────────────
 
 /// Port of Picard test #1: Two 100bp reads with different base qualities.
