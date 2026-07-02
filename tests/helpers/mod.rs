@@ -434,7 +434,6 @@ impl SamBuilder {
     /// # Errors
     /// Returns an error if the BAM or index cannot be written.
     #[allow(dead_code)]
-    /// Write the BAM and a sibling `.bam.bai` index built by reading through it.
     pub fn to_temp_indexed_bam(&self) -> Result<NamedTempFile> {
         use noodles::bam::bai;
 

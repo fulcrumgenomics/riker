@@ -232,7 +232,7 @@ riker multi \
   -i sample.bam \
   -r ref.fa \
   -o out_prefix \
-  --tools alignment isize basic hypcap \
+  --tools alignment isize basic hybcap \
   --hybcap::baits baits.bed \
   --hybcap::targets targets.bed
 ```
@@ -403,14 +403,13 @@ Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per temp
 
 #### Stratifiers not ported from Picard
 
-Picard's `CollectSamErrorMetrics` defines 32 stratifiers. riker ports 15 of them (`all`, `bq`, `mapq`, `cycle`, `read_num`, `strand`, `pair_orientation`, `isize`, `gc`, `read_base`, `ref_base`, `hp_len`, `pre_dinuc`, `post_dinuc`, `context_3bp`). The following Picard stratifiers are **not** available in riker:
+Picard's `CollectSamErrorMetrics` defines 32 stratifiers. riker ports 17 of them (`all`, `bq`, `mapq`, `cycle`, `read_num`, `strand`, `pair_orientation`, `isize`, `gc`, `read_base`, `ref_base`, `hp_len`, `pre_dinuc`, `post_dinuc`, `context_3bp`, `nm`, `indel_len`). The following Picard stratifiers are **not** available in riker:
 
 - `PAIR_PROPERNESS` — whether the read is in a proper pair
 - `HOMOPOLYMER` — the homopolymer base (A/C/G/T) at the current position
 - `BINNED_HOMOPOLYMER` — homopolymer length bucketed into bins
 - `BINNED_CYCLE` — machine cycle bucketed into bins
 - `SOFT_CLIPS` — number of soft-clipped bases in the read
-- `MISMATCHES_IN_READ` — total mismatches in the read (`nm` is similar)
 - `TWO_BASE_PADDED_CONTEXT` — 5-base context (2bp each side) (`Context3bp` is provided)
 - `CONSENSUS` — whether the read is a consensus/duplex read
 - `NS_IN_READ` — number of N bases in the read

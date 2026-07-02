@@ -8,16 +8,16 @@ use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 /// Trait implemented by each metric collector.
 ///
 /// Each collector stores its own configuration (output paths, reference handle, thresholds)
-/// as fields set at construction time. The trait methods only receive the BAM header and
-/// records, enabling the `multi` command to share a single BAM pass across collectors.
+/// as fields set at construction time. The trait methods only receive the header and
+/// records, enabling the `multi` command to share a single input pass across collectors.
 pub trait Collector: Send {
-    /// Called once with the BAM header before any records are processed.
+    /// Called once with the header before any records are processed.
     ///
     /// # Errors
     /// Returns an error if the header is invalid for this collector's configuration.
     fn initialize(&mut self, header: &Header) -> Result<()>;
 
-    /// Called once per record in the BAM file.
+    /// Called once per record.
     ///
     /// # Errors
     /// Returns an error if the record cannot be processed.

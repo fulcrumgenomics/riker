@@ -21,7 +21,7 @@ cargo nextest run --test test_isize    # all tests in one integration test file
 # Lint and format
 cargo ci-lint                          # clippy with pedantic warnings as errors
 cargo ci-fmt                           # check formatting (--check mode)
-cargo fmt --package riker              # apply formatting
+cargo fmt --package riker-ngs          # apply formatting
 ```
 
 The `ci-*` aliases are defined in `.cargo/config.toml`. CI runs all three.
@@ -106,13 +106,19 @@ Each command's core logic lives in a `Collector` struct implementing the `Collec
 ```rust
 pub trait Collector: Send {
     fn initialize(&mut self, header: &Header) -> Result<()>;
-    fn accept(&mut self, record: &RecordBuf, header: &Header) -> Result<()>;
+    fn accept(&mut self, record: &RikerRecord, header: &Header) -> Result<()>;
+    // Default loops over `accept`; override to amortize per-batch setup.
+    fn accept_multiple(&mut self, records: &[RikerRecord], header: &Header) -> Result<()>;
     fn finish(&mut self) -> Result<()>;
     fn name(&self) -> &'static str;
+    // Which expensive RikerRecord fields this collector reads (drives decode).
+    fn field_needs(&self) -> RikerRecordRequirements;
+    // Relative per-record cost; `multi` balances workers by this (default 1).
+    fn cost_hint(&self) -> u32 { 1 }
 }
 ```
 
-Collectors store all configuration (output paths, reference handle, thresholds) as fields set at construction. The trait methods only receive the BAM header and records. This design enables the `multi` command to feed a single BAM pass to multiple collectors in parallel.
+Collectors store all configuration (output paths, reference handle, thresholds) as fields set at construction. The trait methods only receive the header and records. This design enables the `multi` command to feed a single input pass to multiple collectors in parallel.
 
 ### Metrics Serialization
 
@@ -127,17 +133,18 @@ Collectors store all configuration (output paths, reference handle, thresholds) 
 
 Reusable `#[derive(clap::Args)]` structs in `src/commands/common.rs`:
 - `InputOptions` — `--input`
+- `OutputOptions` — `--output`
 - `ReferenceOptions` — `--reference` (required FASTA with .fai)
 - `OptionalReferenceOptions` — `--reference` (optional FASTA with .fai)
-- `IntervalOptions` — `--intervals` (IntervalList or BED)
-- `DuplicateOptions` — `--include-duplicates`
+
+Interval and duplicate-handling flags (`--intervals`, `--include-duplicates`,
+etc.) are declared per-command, not shared.
 
 ### Key Source Modules
 
 | Module | Purpose |
 |--------|---------|
-| `src/sam/alignment_reader.rs` | `AlignmentReader` — opens SAM/BAM/CRAM via noodles; `for_each_record()` iterates with buffer reuse for BAM/SAM |
-| `src/sam/indexed_reader.rs` | `IndexedAlignmentReader` — indexed BAM/CRAM with region queries |
+| `src/sam/alignment_reader.rs` | `AlignmentReader` — sequential reads (BAM via noodles, CRAM via rust-htslib); `fill_record()` reads in place, `riker_records()` iterates. `IndexedAlignmentReader` — region queries on indexed BAM/CRAM, both via rust-htslib |
 | `src/sam/record_filter.rs` | Filtering predicates (secondary, duplicate, PF, MAPQ) |
 | `src/sam/pair_orientation.rs` | `PairOrientation` enum (FR/RF/Tandem) |
 | `src/fasta.rs` | FASTA loading via noodles `IndexedReader`, wrapped in `Fasta` |

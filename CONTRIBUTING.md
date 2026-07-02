@@ -72,9 +72,10 @@ live in `src/metrics.rs`.
 
 ### Shared CLI Options
 
-Reusable option groups in `src/commands/common.rs` (`InputBamOptions`,
-`ReferenceOptions`, `OptionalReferenceOptions`, `IntervalOptions`,
-`DuplicateOptions`) are composed into commands via `#[command(flatten)]`.
+Reusable option groups in `src/commands/common.rs` (`InputOptions`,
+`OutputOptions`, `ReferenceOptions`, `OptionalReferenceOptions`) are composed
+into commands via `#[command(flatten)]`. Interval and duplicate-handling flags
+are declared per-command.
 
 ## Adding a New Command
 
@@ -163,25 +164,29 @@ impl Collector for MyCollector {
 }
 ```
 
-**`Command` impl** — the standalone execution path. Use `for_each_record` to
-iterate records with buffer reuse (avoids per-record allocation for BAM/SAM):
+**`Command` impl** — the standalone execution path. `thread_plan` splits the
+`--threads` budget; `AlignmentReader::open` takes the decode-thread share;
+`drive_collector_single_threaded` runs the collector's full
+`initialize`/`accept`/`finish` lifecycle over the reader:
 
 ```rust
 impl Command for MyCommand {
-    fn execute(&self) -> Result<()> {
-        let (mut reader, header) = AlignmentReader::new(&self.input.input, ...)?;
-        let mut collector = MyCollector::new(&self.output, &self.options);
-        collector.initialize(&header)?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
+        let mut collector = MyCollector::new(&self.input.input, &self.output.output, &self.options);
         let mut progress = ProgressLogger::new("<name>", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 ```
+
+(To parallelize the command's own work when run singly, override
+`thread_plan` to claim `compute_workers` and handle the plan in `execute`.)
 
 ### 2. Register the command
 
@@ -192,7 +197,7 @@ impl Command for MyCommand {
   ```
 - Add a match arm in `impl Command for Subcommand::execute()`:
   ```rust
-  Subcommand::MyCmd(c) => c.execute(),
+  Subcommand::MyCmd(c) => c.execute(threads),
   ```
 
 ### 3. Integrate with the multi command
@@ -374,7 +379,7 @@ style your files use.
 - Verify correctness after any optimization (diff outputs against a baseline and
   run the full test suite)
 
-### The `multi` work queue (kanal) and its soundness invariant
+### The `multi` channels (kanal) and their soundness invariant
 
 `multi`'s reader→worker channels use [kanal](https://crates.io/crates/kanal)
 rather than crossbeam-channel: benchmarked ~4% faster wall-clock on a 12x WGS
