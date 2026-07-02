@@ -56,6 +56,23 @@ fn parse_line(line: &str, line_num: usize) -> Result<ParsedTranscript> {
     let tx_end: u32 = parse_u32(cols[5], line_num, "txEnd")?;
     let cds_start_raw: u32 = parse_u32(cols[6], line_num, "cdsStart")?;
     let cds_end_raw: u32 = parse_u32(cols[7], line_num, "cdsEnd")?;
+
+    // Enforce the coordinate invariants that downstream block/span intersection
+    // (count_blocks, build_loci) relies on — those use unchecked u32 subtraction,
+    // so a malformed/hand-edited file that violates them would silently wrap in
+    // release. UCSC refFlat always satisfies these: a transcript has a non-empty
+    // span, and (when coding) its CDS lies within that span.
+    if tx_end <= tx_start {
+        bail!("refFlat line {line_num}: txEnd {tx_end} is not after txStart {tx_start}");
+    }
+    if cds_start_raw != cds_end_raw
+        && (cds_start_raw > cds_end_raw || cds_start_raw < tx_start || cds_end_raw > tx_end)
+    {
+        bail!(
+            "refFlat line {line_num}: CDS [{cds_start_raw},{cds_end_raw}) is not within transcript span [{tx_start},{tx_end})"
+        );
+    }
+
     let exon_count: usize = parse_u32(cols[8], line_num, "exonCount")? as usize;
     let exon_starts = parse_csv_u32(cols[9], line_num, "exonStarts")?;
     let exon_ends = parse_csv_u32(cols[10], line_num, "exonEnds")?;
@@ -74,6 +91,11 @@ fn parse_line(line: &str, line_num: usize) -> Result<ParsedTranscript> {
     for (&s, &e) in exon_starts.iter().zip(&exon_ends) {
         if e <= s {
             bail!("refFlat line {line_num}: exon end {e} is not after start {s}");
+        }
+        if s < tx_start || e > tx_end {
+            bail!(
+                "refFlat line {line_num}: exon [{s},{e}) is outside transcript span [{tx_start},{tx_end})"
+            );
         }
         exons.push(Exon { start: s + 1, end: e });
     }
@@ -169,6 +191,26 @@ mod tests {
     fn errors_on_empty_or_inverted_exon() {
         // exonStart == exonEnd (empty, 0-based half-open) would invert to start > end.
         let line = "G\tT\tchr1\t+\t10\t90\t20\t80\t1\t50,\t50,";
+        assert!(parse(line.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn errors_on_inverted_transcript_span() {
+        let line = "G\tT\tchr1\t+\t90\t10\t90\t10\t1\t90,\t100,";
+        assert!(parse(line.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn errors_on_exon_outside_transcript_span() {
+        // Exon end 600 exceeds txEnd 500 — count_blocks would wrap on span intersection.
+        let line = "G\tT\tchr1\t+\t100\t500\t150\t450\t1\t100,\t600,";
+        assert!(parse(line.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn errors_on_cds_outside_transcript_span() {
+        // cdsEnd 600 exceeds txEnd 500.
+        let line = "G\tT\tchr1\t+\t100\t500\t150\t600\t1\t100,\t500,";
         assert!(parse(line.as_bytes()).is_err());
     }
 }

@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconciliation (`chr` add/strip, `MT`↔`chrM`, RefSeq accession → common name).
   Strandedness is auto-detected by default (`--strand auto`); ribosomal territory
   is the union of biotype-derived rRNA genes and an optional `--ribosomal-intervals`
-  file (BED or IntervalList). Writes `.rna-metrics.txt`, `.rna-biotype.txt`,
-  `.rna-coverage.txt` (+`.pdf`), and `.rna-insert-size.txt` / `-histogram.txt` (+`.pdf`).
+  file (BED or IntervalList). Writes `.rna-metrics.txt`, `.rna-biotype.txt` (+`.pdf`),
+  `.rna-gene-expression.pdf`, `.rna-coverage.pdf`, and `.rna-insert-size.txt` /
+  `-histogram.txt` (+`.pdf`).
   Tunable via `--genes-detected-min-reads` (5), `--junction-min-intron` (50), and
   `--tin-min-coverage` (10). Requires a
   coordinate-sorted input; the `MC` (mate CIGAR) tag is required for the insert-size

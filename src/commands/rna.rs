@@ -12,8 +12,11 @@
 //! contig are counted only as `ignored_reads`; secondary and unmapped reads are then dropped.
 //! Duplicates are **included by default** (RNA-seq coordinate duplicates are usually
 //! independent cDNAs from abundant transcripts, not PCR artifacts); `--exclude-duplicates`
-//! drops them from every metric. `--min-mapq` (default 0, Picard parity) gates the
-//! alignment-based metrics but not `bases`. The observed `duplicate_rate` is always reported.
+//! stops them counting toward the genomic-origin/ribosomal numerators, but they remain in
+//! `mapped_reads` (the shared `frac_*_reads` denominator) and `duplicate_rate` so the fractions
+//! stay comparable across filter settings. `--min-mapq` (default 0, Picard parity) gates the
+//! alignment-based metrics the same way but not `bases`. The observed `duplicate_rate` is always
+//! reported.
 //!
 //! ## Deviations from the reference tools (all bugs fixed + documented)
 //!
@@ -49,7 +52,7 @@ use crate::commands::common::{
     InputOptions, OptionalReferenceOptions, OutputOptions, parse_existing_file,
 };
 use crate::counter::Counter;
-use crate::gene_model::{Biotype, GeneModel, encloses_inclusive, overlap_inclusive};
+use crate::gene_model::{Biotype, GeneModel};
 use crate::intervals::Intervals;
 use crate::metrics::{serialize_f64_5dp, serialize_opt_f64_5dp, write_tsv};
 use crate::overlapper::Overlapper;
@@ -217,15 +220,34 @@ impl Default for RnaOptions {
 
 // ─── Command ─────────────────────────────────────────────────────────────────
 
-/// Collect RNA-seq QC metrics in a single pass: read accounting, read genomic origin (exonic / intronic / intergenic / ambiguous / ribosomal), base composition (coding / UTR / intronic / intergenic / ribosomal), gene detection, splice-junction annotation (known / partial-novel / novel), strand specificity, transcript 5'/3' coverage bias, transcript integrity (TIN), and transcript-space insert size. Outputs are written to <prefix>.rna-metrics.txt, <prefix>.rna-biotype.txt(.pdf), <prefix>.rna-gene-expression.pdf, <prefix>.rna-coverage.pdf, and <prefix>.rna-insert-size.txt / -histogram.txt(.pdf).
+/// Collect RNA-seq QC metrics in a single pass: read accounting, read genomic origin
+/// (exonic / intronic / intergenic / ambiguous / ribosomal), base composition (coding / UTR /
+/// intronic / intergenic / ribosomal), gene detection, splice-junction annotation (known /
+/// partial-novel / novel), strand specificity, transcript 5'/3' coverage bias, transcript
+/// integrity (TIN), and transcript-space insert size. Outputs are written to
+/// <prefix>.rna-metrics.txt, <prefix>.rna-biotype.txt(.pdf), <prefix>.rna-gene-expression.pdf,
+/// <prefix>.rna-coverage.pdf, and <prefix>.rna-insert-size.txt / -histogram.txt(.pdf).
 ///
-/// The input SAM/BAM/CRAM must be coordinate-sorted (@HD SO:coordinate); duplicates are included by default (--exclude-duplicates to drop them).
+/// The input SAM/BAM/CRAM must be coordinate-sorted (@HD SO:coordinate); duplicates are
+/// included by default (--exclude-duplicates to drop them).
 ///
-/// GENE MODEL: UCSC refFlat, GTF, or GFF3 (GENCODE / Ensembl / RefSeq), plain or gzip/bgzip-compressed (compression is taken from a .gz/.bgz extension). The format is auto-detected from the file contents. Contig names are reconciled to the BAM header automatically (add/strip 'chr', alias MT<->chrM, and map RefSeq accessions such as NC_000001.11 to common names).
+/// GENE MODEL: UCSC refFlat, GTF, or GFF3 (GENCODE / Ensembl / RefSeq), plain or
+/// gzip/bgzip-compressed (compression is taken from a .gz/.bgz extension). The format is
+/// auto-detected from the file contents. Contig names are reconciled to the BAM header
+/// automatically (add/strip 'chr', alias MT<->chrM, and map RefSeq accessions such as
+/// NC_000001.11 to common names).
 ///
-/// RIBOSOMAL REGIONS: the union of genes with biotype rRNA / Mt_rRNA / rRNA_pseudogene from the gene model (GTF and GFF3 carry biotypes and contribute; refFlat does not) and an explicit --ribosomal-intervals file (BED or Picard IntervalList). With neither source the ribosomal columns are left blank. Annotation-derived rRNA is a lower bound on GRCh38, where the rDNA tandem arrays are collapsed; supply curated --ribosomal-intervals for an accurate fraction.
+/// RIBOSOMAL REGIONS: the union of genes with biotype rRNA / Mt_rRNA / rRNA_pseudogene from the
+/// gene model (GTF and GFF3 carry biotypes and contribute; refFlat does not) and an explicit
+/// --ribosomal-intervals file (BED or Picard IntervalList). With neither source the ribosomal
+/// columns are left blank. Annotation-derived rRNA is a lower bound on GRCh38, where the rDNA
+/// tandem arrays are collapsed; supply curated --ribosomal-intervals for an accurate fraction.
 ///
-/// INSERT SIZE: the 5'-to-5' fragment length in transcript coordinates (introns collapsed), per pair orientation. Uses the MC (mate CIGAR) tag when present (any orientation, exact); without it, FR pairs are estimated from a spec-compliant TLEN field (non-FR pairs are skipped). For best results add MC with `samtools fixmate -m`. A BAM with neither MC nor valid TLEN yields no/incorrect insert sizes.
+/// INSERT SIZE: the 5'-to-5' fragment length in transcript coordinates (introns collapsed), per
+/// pair orientation. Uses the MC (mate CIGAR) tag when present (any orientation, exact); without
+/// it, FR pairs are estimated from a spec-compliant TLEN field (non-FR pairs are skipped). For
+/// best results add MC with `samtools fixmate -m`. A BAM with neither MC nor valid TLEN yields
+/// no/incorrect insert sizes.
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -1141,7 +1163,10 @@ impl RnaCollector {
     /// write the normalized-coverage-by-position table and chart.
     fn finish_coverage(&self) -> Result<CoverageMetrics> {
         let model = self.gene_model.as_ref().expect("gene model loaded");
-        let min_len = self.minimum_length.max(2 * self.end_bias_bases);
+        // saturating_mul so a pathological `--end-bias-bases` (near u32::MAX)
+        // can't wrap the gate and let a too-short transcript through to the
+        // `oriented[..end_bias]` slices below (which would then panic).
+        let min_len = self.minimum_length.max(self.end_bias_bases.saturating_mul(2));
 
         // Best (highest mean coverage) eligible transcript per locus. Per-transcript coverage is
         // reconstructed on demand from the locus's exon-union coverage.
@@ -1917,6 +1942,18 @@ struct CoverageMetrics {
     five_to_three: f64,
 }
 
+/// The mate read's resolved reference span for insert-size tallying. `blocks` are its M/=/X
+/// alignment blocks — the exact CIGAR blocks with `MC`, or a single whole-footprint block in the
+/// TLEN fallback; `end` is its 1-based inclusive reference end; `mapped` is the denominator for the
+/// exon-overlap fraction; `approximate` flags the MC-less fallback (which adds the
+/// both-ends-in-an-exon requirement before a transcript qualifies).
+struct MateSpan {
+    blocks: Vec<(u32, u32)>,
+    end: u32,
+    mapped: u32,
+    approximate: bool,
+}
+
 // ─── Module-level helpers ──────────────────────────────────────────────────────
 
 /// True if the header declares coordinate sort order (`@HD SO:coordinate`).
@@ -2153,6 +2190,20 @@ fn mate_alignment_blocks(mc: &[u8], mate_start: u32) -> Option<(Vec<(u32, u32)>,
     Some((blocks, pos.saturating_sub(1)))
 }
 
+/// Overlap (in bases) of two 1-based inclusive ranges; 0 if they do not overlap.
+/// Mirrors htsjdk `CoordMath.getOverlap` clamped at 0.
+fn overlap_inclusive(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> u32 {
+    let lo = a_start.max(b_start);
+    let hi = a_end.min(b_end);
+    if lo <= hi { hi - lo + 1 } else { 0 }
+}
+
+/// True if the 1-based inclusive `[outer_start, outer_end]` fully encloses
+/// `[inner_start, inner_end]`. Mirrors htsjdk `CoordMath.encloses`.
+fn encloses_inclusive(outer_start: u32, outer_end: u32, inner_start: u32, inner_end: u32) -> bool {
+    outer_start <= inner_start && inner_end <= outer_end
+}
+
 /// Number of read bases in `blocks` that overlap the transcript's exons (1-based inclusive).
 /// Ported from fgbio `numReadBasesOverlappingTranscript`.
 fn bases_overlapping_exons(blocks: &[(u32, u32)], exons: &[crate::gene_model::Exon]) -> u32 {
@@ -2163,18 +2214,6 @@ fn bases_overlapping_exons(blocks: &[(u32, u32)], exons: &[crate::gene_model::Ex
             exons.iter().map(move |e| overlap_inclusive(start, block_end, e.start, e.end))
         })
         .sum()
-}
-
-/// The mate read's resolved reference span for insert-size tallying. `blocks` are its M/=/X
-/// alignment blocks — the exact CIGAR blocks with `MC`, or a single whole-footprint block in the
-/// TLEN fallback; `end` is its 1-based inclusive reference end; `mapped` is the denominator for the
-/// exon-overlap fraction; `approximate` flags the MC-less fallback (which adds the
-/// both-ends-in-an-exon requirement before a transcript qualifies).
-struct MateSpan {
-    blocks: Vec<(u32, u32)>,
-    end: u32,
-    mapped: u32,
-    approximate: bool,
 }
 
 /// True if the 1-based position lies within any exon (1-based inclusive) of the slice.
@@ -2235,6 +2274,21 @@ fn median(values: &mut [f64]) -> f64 {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_inclusive_basic() {
+        assert_eq!(overlap_inclusive(10, 20, 15, 30), 6); // 15..=20
+        assert_eq!(overlap_inclusive(10, 20, 21, 30), 0); // disjoint
+        assert_eq!(overlap_inclusive(10, 20, 20, 20), 1); // single base
+    }
+
+    #[test]
+    fn encloses_inclusive_basic() {
+        assert!(encloses_inclusive(10, 100, 20, 90));
+        assert!(encloses_inclusive(10, 100, 10, 100));
+        assert!(!encloses_inclusive(10, 100, 5, 90));
+        assert!(!encloses_inclusive(10, 100, 20, 110));
+    }
 
     #[test]
     fn histogram_bins_partitions_all_values() {

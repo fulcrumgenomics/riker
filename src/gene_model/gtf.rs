@@ -44,7 +44,7 @@ pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
             bail!("GTF line {}: expected 9 columns, found {}", i + 1, cols.len());
         }
         let feature = cols[2];
-        if feature != "exon" && feature != "CDS" {
+        if feature != "exon" && feature != "CDS" && feature != "stop_codon" {
             continue;
         }
 
@@ -83,6 +83,10 @@ pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
         if feature == "exon" {
             accum.exons.push(Exon { start, end });
         } else {
+            // "CDS" or "stop_codon". GTF's CDS feature excludes the stop codon
+            // (it is a separate feature), so folding stop_codon into the coding
+            // extent makes cds_start/cds_end include it — matching Picard and
+            // our refFlat path, where cdsEnd covers the stop codon.
             accum.cds.push((start, end));
         }
     }
@@ -174,6 +178,34 @@ chr1\tHAVANA\texon\t300\t400\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\"; gen
         assert_eq!(txs[0].biotype, Some(Biotype::Rrna));
         // No gene_name → falls back to gene_id.
         assert_eq!(txs[0].gene_name, "ENSG1");
+    }
+
+    #[test]
+    fn stop_codon_extends_the_coding_extent() {
+        // GTF's CDS excludes the stop codon (a separate feature); the coding
+        // extent must grow to include it so cds_end matches Picard/refFlat.
+        let gtf = "\
+chr1\tHAVANA\texon\t100\t200\t.\t+\t.\ttranscript_id \"T1\"; gene_id \"G1\";
+chr1\tHAVANA\tCDS\t150\t180\t.\t+\t0\ttranscript_id \"T1\"; gene_id \"G1\";
+chr1\tHAVANA\tstop_codon\t181\t183\t.\t+\t0\ttranscript_id \"T1\"; gene_id \"G1\";
+";
+        let txs = parse(gtf.as_bytes()).unwrap();
+        assert_eq!(txs[0].cds_start, Some(150));
+        assert_eq!(txs[0].cds_end, Some(183), "cds_end must include the stop codon");
+    }
+
+    #[test]
+    fn negative_strand_stop_codon_extends_cds_start() {
+        // On the minus strand the stop codon sits 5' of the CDS, so it must pull
+        // cds_start down rather than cds_end up.
+        let gtf = "\
+chr2\tHAVANA\texon\t100\t300\t.\t-\t.\ttranscript_id \"T\"; gene_id \"G\";
+chr2\tHAVANA\tCDS\t150\t180\t.\t-\t0\ttranscript_id \"T\"; gene_id \"G\";
+chr2\tHAVANA\tstop_codon\t147\t149\t.\t-\t0\ttranscript_id \"T\"; gene_id \"G\";
+";
+        let txs = parse(gtf.as_bytes()).unwrap();
+        assert_eq!(txs[0].cds_start, Some(147), "cds_start must include the stop codon");
+        assert_eq!(txs[0].cds_end, Some(180));
     }
 
     #[test]

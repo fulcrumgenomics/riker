@@ -15,7 +15,9 @@ pub const FG_BLUE: &str = "#26a8e0";
 pub const FG_GREEN: &str = "#38b44a";
 /// Core dark blue (PMS 274) — good for a single solid series distinct from FG Blue.
 pub const FG_NAVY: &str = "#160052";
-/// Secondary dark green (PMS 7736).
+/// Secondary dark green (PMS 7736). Part of the brand palette; kept for completeness
+/// even though no plot currently uses it.
+#[allow(dead_code)]
 pub const FG_PINE: &str = "#315848";
 pub const FG_PACIFIC: &str = "#1693b9";
 pub const FG_SKY: &str = "#4dcce8";

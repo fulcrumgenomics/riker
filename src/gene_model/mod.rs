@@ -90,10 +90,11 @@ impl GeneModel {
         log::info!("rna: parsing gene model {} as {format}", path.display());
 
         let transcripts = match format {
-            GeneModelFormat::RefFlat => refflat::parse(open()?)?,
-            GeneModelFormat::Gtf => gtf::parse(open()?)?,
-            GeneModelFormat::Gff3 => gff::parse(open()?)?,
-        };
+            GeneModelFormat::RefFlat => refflat::parse(open()?),
+            GeneModelFormat::Gtf => gtf::parse(open()?),
+            GeneModelFormat::Gff3 => gff::parse(open()?),
+        }
+        .with_context(|| format!("Failed to parse gene model {} as {format}", path.display()))?;
 
         let loci = build_loci(transcripts, dict);
         if loci.is_empty() {
@@ -473,14 +474,18 @@ pub fn detect_format<R: BufRead>(reader: R) -> Result<Option<GeneModelFormat>> {
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() == 9 {
             let attrs = cols[8];
-            // GFF3 attributes are `key=value;...`; GTF attributes are `key "value";...`.
-            if attrs.contains('=') {
-                return Ok(Some(GeneModelFormat::Gff3));
-            }
-            if attrs.contains('"') {
-                return Ok(Some(GeneModelFormat::Gtf));
-            }
-            return Ok(None);
+            // GTF attributes are `key "value"; ...`; GFF3 are `key=value; ...`. A
+            // value can legitimately contain the *other* delimiter (e.g. a GTF
+            // `gene_id "AC=1"`, or a GFF3 `Note=he said "x"`), so decide by which
+            // key/value separator appears first, not merely which char is present.
+            return Ok(match (attrs.find('"'), attrs.find('=')) {
+                (Some(q), Some(e)) => {
+                    Some(if q < e { GeneModelFormat::Gtf } else { GeneModelFormat::Gff3 })
+                }
+                (Some(_), None) => Some(GeneModelFormat::Gtf),
+                (None, Some(_)) => Some(GeneModelFormat::Gff3),
+                (None, None) => None,
+            });
         }
         if cols.len() >= 10 && matches!(cols[3], "+" | "-") {
             return Ok(Some(GeneModelFormat::RefFlat));
@@ -699,29 +704,6 @@ fn spans_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
     a_start <= b_end && b_start <= a_end
 }
 
-// ─── Coordinate helpers (1-based inclusive, htsjdk CoordMath semantics) ─────────
-
-/// Overlap (in bases) of two 1-based inclusive ranges; 0 if they do not overlap.
-/// Mirrors htsjdk `CoordMath.getOverlap` clamped at 0.
-#[must_use]
-pub fn overlap_inclusive(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> u32 {
-    let lo = a_start.max(b_start);
-    let hi = a_end.min(b_end);
-    if lo <= hi { hi - lo + 1 } else { 0 }
-}
-
-/// True if the 1-based inclusive `[outer_start, outer_end]` fully encloses
-/// `[inner_start, inner_end]`. Mirrors htsjdk `CoordMath.encloses`.
-#[must_use]
-pub fn encloses_inclusive(
-    outer_start: u32,
-    outer_end: u32,
-    inner_start: u32,
-    inner_end: u32,
-) -> bool {
-    outer_start <= inner_start && inner_end <= outer_end
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,21 +740,42 @@ mod tests {
         assert_eq!(detect_format(line.as_bytes()).unwrap(), Some(GeneModelFormat::Gff3));
     }
 
-    // ── Coordinate helpers ────────────────────────────────────────────────────
-
     #[test]
-    fn overlap_inclusive_basic() {
-        assert_eq!(overlap_inclusive(10, 20, 15, 30), 6); // 15..=20
-        assert_eq!(overlap_inclusive(10, 20, 21, 30), 0); // disjoint
-        assert_eq!(overlap_inclusive(10, 20, 20, 20), 1); // single base
+    fn detect_gtf_when_a_quoted_value_contains_equals() {
+        // A GTF attribute value containing '=' must not be misdetected as GFF3:
+        // the quote precedes the '=', so GTF wins.
+        let line = "chr1\tHAVANA\texon\t1\t9\t.\t+\t.\tgene_id \"G=1\"; transcript_id \"T1\";\n";
+        assert_eq!(detect_format(line.as_bytes()).unwrap(), Some(GeneModelFormat::Gtf));
+    }
+
+    // ── Contig resolution ─────────────────────────────────────────────────────
+
+    fn dict_of(contigs: &[&str]) -> SequenceDictionary {
+        use noodles::sam::Header;
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        let mut builder = Header::builder();
+        for &name in contigs {
+            let rs = Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(1000).unwrap());
+            builder = builder.add_reference_sequence(name.as_bytes(), rs);
+        }
+        SequenceDictionary::from(&builder.build())
     }
 
     #[test]
-    fn encloses_inclusive_basic() {
-        assert!(encloses_inclusive(10, 100, 20, 90));
-        assert!(encloses_inclusive(10, 100, 10, 100));
-        assert!(!encloses_inclusive(10, 100, 5, 90));
-        assert!(!encloses_inclusive(10, 100, 20, 110));
+    fn resolve_contig_reconciles_chr_prefix_and_mt_aliases() {
+        let dict = dict_of(&["chr1", "chrM"]);
+        assert_eq!(resolve_contig(&dict, "chr1"), Some(0)); // exact
+        assert_eq!(resolve_contig(&dict, "1"), Some(0)); // unprefixed model → chr-prefixed BAM
+        assert_eq!(resolve_contig(&dict, "MT"), Some(1)); // MT alias → chrM
+        assert_eq!(resolve_contig(&dict, "M"), Some(1)); // M alias → chrM
+        assert_eq!(resolve_contig(&dict, "chr99"), None); // unresolvable → dropped
+    }
+
+    #[test]
+    fn resolve_contig_strips_chr_prefix_for_unprefixed_dict() {
+        let dict = dict_of(&["1", "MT"]);
+        assert_eq!(resolve_contig(&dict, "chr1"), Some(0)); // strip chr → 1
+        assert_eq!(resolve_contig(&dict, "chrM"), Some(1)); // chrM → MT alias
     }
 
     // ── Transcript ────────────────────────────────────────────────────────────

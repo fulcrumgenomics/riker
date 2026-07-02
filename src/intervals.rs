@@ -237,12 +237,12 @@ impl Intervals {
 }
 
 /// Read the contents of a text file as a UTF-8 string, transparently decompressing
-/// gzip/bgzip files detected by their magic bytes. Shared by the interval and gene-model
-/// readers so the detection/decompression logic lives in one place.
+/// gzip/bgzip files detected by their magic bytes. Used by the interval reader (the
+/// gene-model reader streams line-by-line via fgoxide instead).
 ///
 /// # Errors
 /// Returns an error if the file cannot be opened, read, or decompressed.
-pub(crate) fn read_file_contents(path: &Path) -> Result<String> {
+fn read_file_contents(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 

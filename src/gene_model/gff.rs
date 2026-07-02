@@ -78,7 +78,10 @@ pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
                     exons_by_parent.entry(parent).or_default().push(Exon { start, end });
                 }
             }
-            "CDS" => {
+            // "stop_codon" is folded into the coding extent: GENCODE GFF3 emits
+            // it as a separate feature that CDS excludes, so including it makes
+            // cds_start/cds_end cover the stop codon (matching Picard/refFlat).
+            "CDS" | "stop_codon" => {
                 for parent in parents(&attrs) {
                     cds_by_parent.entry(parent).or_default().push((start, end));
                 }
@@ -224,6 +227,22 @@ chr1\tHAVANA\texon\t300\t400\t.\t+\t.\tID=e2;Parent=ENST1
         assert_eq!(tx.cds_start, Some(150));
         assert_eq!(tx.cds_end, Some(180));
         assert_eq!(tx.exons.len(), 2);
+    }
+
+    #[test]
+    fn stop_codon_extends_the_coding_extent() {
+        // GENCODE GFF3 emits stop_codon as a separate feature that CDS excludes;
+        // it must extend the coding extent so cds_end matches Picard/refFlat.
+        let content = "\
+chr1\tHAVANA\tgene\t100\t400\t.\t+\t.\tID=ENSG1;gene_name=MYC;gene_type=protein_coding
+chr1\tHAVANA\tmRNA\t100\t400\t.\t+\t.\tID=ENST1;Parent=ENSG1
+chr1\tHAVANA\texon\t100\t400\t.\t+\t.\tID=e1;Parent=ENST1
+chr1\tHAVANA\tCDS\t150\t180\t.\t+\t0\tID=c1;Parent=ENST1
+chr1\tHAVANA\tstop_codon\t181\t183\t.\t+\t0\tID=s1;Parent=ENST1
+";
+        let txs = parse(content.as_bytes()).unwrap();
+        assert_eq!(txs[0].cds_start, Some(150));
+        assert_eq!(txs[0].cds_end, Some(183), "cds_end must include the stop codon");
     }
 
     #[test]
