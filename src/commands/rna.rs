@@ -574,12 +574,11 @@ impl RnaCollector {
     /// Classify the aligned bases of a primary, mapped read against the overlapping `loci`, tally
     /// per-transcript coverage, and determine the read's genomic origin. Returns whether the read
     /// overlapped any exon (for the strand logic) and its [`ReadOrigin`].
-    fn classify_bases(&mut self, record: &RikerRecord, loci: &[u32]) -> (bool, ReadOrigin) {
+    fn classify_bases(&mut self, blocks: &[(u32, u32)], loci: &[u32]) -> (bool, ReadOrigin) {
         let model = self.gene_model.as_ref().expect("gene model loaded");
-        let blocks = rec_alignment_blocks(record);
 
         // Functional base composition via interval arithmetic (block ∩ exon/coding/span sets).
-        let counts = model.classify_blocks(loci, &blocks);
+        let counts = model.classify_blocks(loci, blocks);
         self.coding_bases += counts.coding;
         self.utr_bases += counts.utr;
         self.intronic_bases += counts.intronic;
@@ -604,7 +603,7 @@ impl RnaCollector {
                 let hits_exon = locus
                     .transcripts
                     .iter()
-                    .any(|tx| bases_overlapping_exons(&blocks, &tx.exons) > 0);
+                    .any(|tx| bases_overlapping_exons(blocks, &tx.exons) > 0);
                 if hits_exon {
                     match exon_gene {
                         None => {
@@ -631,7 +630,7 @@ impl RnaCollector {
                 .coverage
                 .entry(locus_idx)
                 .or_insert_with(|| vec![0u32; locus.exon_union_len()]);
-            for &(block_start, block_len) in &blocks {
+            for &(block_start, block_len) in blocks {
                 locus.add_union_coverage(block_start, block_start + block_len - 1, cov);
             }
         }
@@ -754,7 +753,13 @@ impl RnaCollector {
     /// and mate clear the per-transcript exon-overlap threshold, with all transcripts agreeing on
     /// the size. This differs from fgbio (which requires exactly one gene to overlap the pair
     /// span): a non-enclosing bystander gene near the pair no longer disqualifies it.
-    fn tally_insert_size(&mut self, record: &RikerRecord, ref_id: usize, overlaps: &[u32]) {
+    fn tally_insert_size(
+        &mut self,
+        record: &RikerRecord,
+        ref_id: usize,
+        rec_blocks: &[(u32, u32)],
+        overlaps: &[u32],
+    ) {
         let flags = record.flags();
         // Gating common to both paths: paired, mate mapped, same contig, not supplementary.
         if !flags.is_segmented()
@@ -768,7 +773,6 @@ impl RnaCollector {
         let rec_start = position_u32(record.alignment_start());
         let rec_end = position_u32(record.alignment_end());
         let mate_start = position_u32(record.mate_alignment_start());
-        let rec_blocks = rec_alignment_blocks(record);
         let rec_mapped: u32 = rec_blocks.iter().map(|(_, l)| *l).sum();
 
         let Some(mate) = self.resolve_mate_span(record, rec_start, mate_start, rec_mapped) else {
@@ -810,7 +814,7 @@ impl RnaCollector {
             {
                 continue;
             }
-            let overlap = bases_overlapping_exons(&rec_blocks, &tx.exons)
+            let overlap = bases_overlapping_exons(rec_blocks, &tx.exons)
                 + bases_overlapping_exons(&mate.blocks, &tx.exons);
             if f64::from(overlap) / f64::from(mapped_bases) < self.isize_minimum_overlap {
                 continue;
@@ -1463,8 +1467,12 @@ impl Collector for RnaCollector {
         let mut loci = Vec::new();
         self.overlapping_loci(ref_id, start, end, &mut loci)?;
 
+        // This read's CIGAR alignment blocks, parsed once here and shared by base classification
+        // and transcript-space insert size (both previously re-parsed the CIGAR independently).
+        let rec_blocks = rec_alignment_blocks(record);
+
         // Base-level functional classification + coverage, plus the read's genomic origin.
-        let (overlaps_exon, origin) = self.classify_bases(record, &loci);
+        let (overlaps_exon, origin) = self.classify_bases(&rec_blocks, &loci);
 
         // Read-level genomic-origin accounting over primary, mapped, non-supplementary reads.
         if !flags.is_supplementary() {
@@ -1490,7 +1498,7 @@ impl Collector for RnaCollector {
         }
 
         // Transcript-space insert size (own filters; counts each pair once).
-        self.tally_insert_size(record, ref_id, &loci);
+        self.tally_insert_size(record, ref_id, &rec_blocks, &loci);
         Ok(())
     }
 
