@@ -67,6 +67,14 @@ use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
+use smallvec::SmallVec;
+
+// ─── Type aliases ──────────────────────────────────────────────────────────────
+
+/// A read's (or mate's) M/=/X CIGAR alignment blocks / intron gaps, `(start, len)` or
+/// `(start, end)`. Inline-backed for the common few-block read so the per-read parse does not
+/// touch the heap; spills to the heap only for reads spanning more than four blocks.
+type CigarBlocks = SmallVec<[(u32, u32); 4]>;
 
 // ─── Output file suffixes ──────────────────────────────────────────────────────
 
@@ -1985,7 +1993,7 @@ enum MateAlign {
     /// The `MC` tag is present but could not be parsed.
     Malformed,
     /// The `MC` tag parsed into its M/=/X alignment blocks and 1-based inclusive reference end.
-    Parsed { blocks: Vec<(u32, u32)>, end: u32 },
+    Parsed { blocks: CigarBlocks, end: u32 },
 }
 
 /// The mate read's resolved reference span for insert-size tallying. `blocks` are its M/=/X
@@ -2115,9 +2123,9 @@ fn position_u32(pos: Option<noodles::core::Position>) -> u32 {
 }
 
 /// Alignment blocks `(ref_start_1based, length)` for the M/=/X runs of a record's CIGAR.
-fn rec_alignment_blocks(record: &RikerRecord) -> Vec<(u32, u32)> {
+fn rec_alignment_blocks(record: &RikerRecord) -> CigarBlocks {
     let mut pos = position_u32(record.alignment_start());
-    let mut blocks = Vec::new();
+    let mut blocks = CigarBlocks::new();
     for op in record.cigar_ops() {
         #[allow(clippy::cast_possible_truncation)]
         let len = op.len() as u32;
@@ -2138,9 +2146,9 @@ fn rec_alignment_blocks(record: &RikerRecord) -> Vec<(u32, u32)> {
 
 /// Intron gaps `(start_1based, end_1based)` for each CIGAR N (skip) op of length `>= min_intron`.
 /// Returns a non-allocating empty vec for unspliced reads (the common case).
-fn rec_introns(record: &RikerRecord, min_intron: u32) -> Vec<(u32, u32)> {
+fn rec_introns(record: &RikerRecord, min_intron: u32) -> CigarBlocks {
     let mut pos = position_u32(record.alignment_start());
-    let mut introns = Vec::new();
+    let mut introns = CigarBlocks::new();
     for op in record.cigar_ops() {
         #[allow(clippy::cast_possible_truncation)]
         let len = op.len() as u32;
@@ -2221,9 +2229,9 @@ fn tlen_fragment_end(read_start: u32, mate_start: u32, template_len: i32) -> u32
 /// fgbio's `lengthOnTarget`, so a CIGAR ending in a deletion or skip (e.g. `50M2000N`) still
 /// reports the correct end — using only the last alignment block would undercount it.
 /// Returns `None` if the CIGAR string is malformed.
-fn mate_alignment_blocks(mc: &[u8], mate_start: u32) -> Option<(Vec<(u32, u32)>, u32)> {
+fn mate_alignment_blocks(mc: &[u8], mate_start: u32) -> Option<(CigarBlocks, u32)> {
     let mut pos = mate_start;
-    let mut blocks = Vec::new();
+    let mut blocks = CigarBlocks::new();
     let mut len: u32 = 0;
     let mut saw_digit = false;
     for &b in mc {
@@ -2420,7 +2428,7 @@ mod tests {
     fn mate_alignment_blocks_handles_spliced_cigar() {
         // 50M2000N50M starting at 1000: blocks at 1000 (len 50) and 3050 (len 50); end 3099.
         let (blocks, end) = mate_alignment_blocks(b"50M2000N50M", 1000).unwrap();
-        assert_eq!(blocks, vec![(1000, 50), (3050, 50)]);
+        assert_eq!(blocks.as_slice(), [(1000, 50), (3050, 50)].as_slice());
         assert_eq!(end, 3099);
     }
 
@@ -2429,7 +2437,7 @@ mod tests {
         // A CIGAR ending in N must extend the reference end past the last aligned block
         // (matches fgbio lengthOnTarget). 50M2000N starting at 1000 → end 3049.
         let (blocks, end) = mate_alignment_blocks(b"50M2000N", 1000).unwrap();
-        assert_eq!(blocks, vec![(1000, 50)]);
+        assert_eq!(blocks.as_slice(), [(1000, 50)].as_slice());
         assert_eq!(end, 3049);
     }
 
