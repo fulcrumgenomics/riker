@@ -69,7 +69,7 @@ pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
         if matches!(kind, "region" | "chromosome")
             && let Some(name) = attr(&attrs, "chromosome").or_else(|| attr(&attrs, "Name"))
         {
-            seqid_names.entry(cols[0].to_string()).or_insert_with(|| name.to_string());
+            seqid_names.entry(cols[0].to_string()).or_insert_with(|| decode(name));
         }
 
         match kind {
@@ -87,7 +87,7 @@ pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
                 }
             }
             _ => {
-                let Some(id) = attr(&attrs, "ID").map(str::to_string) else {
+                let Some(id) = attr(&attrs, "ID").map(decode) else {
                     continue; // genes/transcripts without an ID can't be linked
                 };
                 tx_order.push(id.clone());
@@ -97,10 +97,10 @@ pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
                         contig: cols[0].to_string(),
                         negative_strand,
                         parents: parents(&attrs),
-                        name: attr(&attrs, "Name").map(str::to_string),
-                        gene_name: attr(&attrs, "gene_name").map(str::to_string),
-                        gene_id: attr(&attrs, "gene_id").map(str::to_string),
-                        transcript_id: attr(&attrs, "transcript_id").map(str::to_string),
+                        name: attr(&attrs, "Name").map(decode),
+                        gene_name: attr(&attrs, "gene_name").map(decode),
+                        gene_id: attr(&attrs, "gene_id").map(decode),
+                        transcript_id: attr(&attrs, "transcript_id").map(decode),
                         biotype: biotype_of(&attrs),
                     },
                 );
@@ -180,7 +180,7 @@ fn biotype_of(attrs: &[(&str, &str)]) -> Option<Biotype> {
     attr(attrs, "gene_type")
         .or_else(|| attr(attrs, "gene_biotype"))
         .or_else(|| attr(attrs, "biotype"))
-        .map(Biotype::from_attr)
+        .map(|v| Biotype::from_attr(&decode(v)))
 }
 
 /// Parse a GFF3 attribute column into borrowed `(key, value)` pairs (`key=value;...`).
@@ -196,9 +196,18 @@ fn attr<'a>(attrs: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
     attrs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
+/// Percent-decode a GFF3 attribute value. The GFF3 spec `%XX`-encodes reserved
+/// characters (`;` `=` `&` `,` `%`, tab, newline) inside a value; decode them back.
+/// Lossy because the decoded bytes are meant to be text.
+fn decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
 /// All parent IDs (the `Parent` attribute may be comma-separated for shared features).
+/// Split on the raw `,` separator first, then percent-decode each id so an encoded
+/// comma (`%2C`) inside an id is not treated as a separator.
 fn parents(attrs: &[(&str, &str)]) -> Vec<String> {
-    attr(attrs, "Parent").map(|p| p.split(',').map(str::to_string).collect()).unwrap_or_default()
+    attr(attrs, "Parent").map(|p| p.split(',').map(decode).collect()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -305,5 +314,32 @@ chr1\tx\tmRNA\t1\t50\t.\t+\t.\tID=t1;Parent=g1
     fn errors_when_feature_end_precedes_start() {
         let content = "chr1\tx\texon\t90\t10\t.\t+\t.\tID=e1;Parent=t1\n";
         assert!(parse(content.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn percent_decodes_attribute_values() {
+        // GFF3 percent-encodes reserved characters in values; decode them. Here the
+        // gene name carries an encoded semicolon (%3B) and space (%20).
+        let content = "\
+chr1\tHAVANA\tgene\t1\t50\t.\t+\t.\tID=g1;gene_name=A%3BB%20C;gene_type=protein_coding
+chr1\tHAVANA\tmRNA\t1\t50\t.\t+\t.\tID=t1;Parent=g1;gene_name=A%3BB%20C
+chr1\tHAVANA\texon\t1\t50\t.\t+\t.\tParent=t1
+";
+        let txs = parse(content.as_bytes()).unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].gene_name, "A;B C");
+    }
+
+    #[test]
+    fn encoded_comma_is_not_a_parent_separator() {
+        // The Parent separator is a raw ',', so an encoded comma (%2C) is a literal
+        // comma inside a single id, not two parents.
+        let content = "\
+chr1\tx\tmRNA\t1\t50\t.\t+\t.\tID=t%2C1
+chr1\tx\texon\t1\t50\t.\t+\t.\tParent=t%2C1
+";
+        let txs = parse(content.as_bytes()).unwrap();
+        assert_eq!(txs.len(), 1, "encoded comma must not split Parent into two ids");
+        assert_eq!(txs[0].tx_name, "t,1");
     }
 }

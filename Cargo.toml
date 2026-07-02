@@ -58,6 +58,9 @@ log = "0"
 noodles = { version = "0.110", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
 noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
 num-traits = "0.2"
+# GFF3 attribute values percent-encode reserved chars (%3B ; %3D = %26 & %2C , etc.);
+# already in the tree transitively, promoted to a direct dep to decode them.
+percent-encoding = "2"
 riker_derive = { package = "riker-ngs-derive", version = "0.3.0", path = "riker_derive" }
 rpmalloc = "0.2"
 rust-htslib = { version = "1", default-features = false, features = ["bzip2", "lzma", "libdeflate", "static"] }
