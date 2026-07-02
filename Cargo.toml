@@ -61,6 +61,7 @@ num-traits = "0.2"
 riker_derive = { package = "riker-ngs-derive", version = "0.3.0", path = "riker_derive" }
 rpmalloc = "0.2"
 rust-htslib = { version = "1", default-features = false, features = ["bzip2", "lzma", "libdeflate", "static"] }
+rust-lapper = "1"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"

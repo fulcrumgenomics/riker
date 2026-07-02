@@ -231,9 +231,9 @@ pub struct HybCapCollector {
     // with monotonic cursors since reads arrive in coordinate order. Targets carry
     // their flat index into `target_coverages` as the third field; bait lists leave
     // it 0.
-    target_ivs: Vec<Vec<(u32, u32, u32)>>,
-    bait_ivs: Vec<Vec<(u32, u32, u32)>>,
-    expanded_bait_ivs: Vec<Vec<(u32, u32, u32)>>,
+    target_intervals: Vec<Vec<(u32, u32, u32)>>,
+    bait_intervals: Vec<Vec<(u32, u32, u32)>>,
+    expanded_bait_intervals: Vec<Vec<(u32, u32, u32)>>,
     target_cursor: usize,
     bait_cursor: usize,
     expanded_cursor: usize,
@@ -326,9 +326,9 @@ impl HybCapCollector {
             output_per_target: options.per_target_coverage,
 
             dict: None,
-            target_ivs: Vec::new(),
-            bait_ivs: Vec::new(),
-            expanded_bait_ivs: Vec::new(),
+            target_intervals: Vec::new(),
+            bait_intervals: Vec::new(),
+            expanded_bait_intervals: Vec::new(),
             target_cursor: 0,
             bait_cursor: 0,
             expanded_cursor: 0,
@@ -366,6 +366,33 @@ impl HybCapCollector {
             exc_overlap_bases: 0,
             exc_off_target_bases: 0,
         }
+    }
+
+    /// Enforce coordinate-sorted input (required by the per-contig interval sweep)
+    /// and reset the sweep cursors on a contig change. Errors on any regression in
+    /// `(ref_id, start)`; this also catches a BAM whose header claims coordinate
+    /// sort but isn't. Cursor resets rely on `ref_id` being non-decreasing.
+    fn check_coordinate_order(&mut self, ref_id: usize, start: u32) -> Result<()> {
+        if let Some(last_ref_id) = self.last_ref_id {
+            if ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start) {
+                return Err(anyhow!(
+                    "hybcap requires a coordinate-sorted BAM (ordered by reference, then \
+                     position); encountered {}:{} after {}:{}. Sort with `samtools sort`.",
+                    self.contig_name(ref_id),
+                    u64::from(start) + 1,
+                    self.contig_name(last_ref_id),
+                    u64::from(self.last_start) + 1,
+                ));
+            }
+            if ref_id != last_ref_id {
+                self.target_cursor = 0;
+                self.bait_cursor = 0;
+                self.expanded_cursor = 0;
+            }
+        }
+        self.last_ref_id = Some(ref_id);
+        self.last_start = start;
+        Ok(())
     }
 
     /// Return the contig name for a `ref_id`, or `?` if unknown. Used only in errors.
@@ -941,13 +968,13 @@ impl Collector for HybCapCollector {
         // contiguous run reachable by a monotonic cursor. Targets carry their flat
         // index into `target_coverages` (built in the same merged order below).
         let n_contigs = dict.len();
-        self.target_ivs = bucket_by_contig(
+        self.target_intervals = bucket_by_contig(
             n_contigs,
             merged_targets.iter().enumerate().map(|(idx, iv)| {
                 (iv.ref_id, iv.start, iv.end, u32::try_from(idx).expect("target index fits in u32"))
             }),
         );
-        self.bait_ivs = bucket_by_contig(
+        self.bait_intervals = bucket_by_contig(
             n_contigs,
             merged_baits.iter().map(|iv| (iv.ref_id, iv.start, iv.end, 0u32)),
         );
@@ -955,7 +982,7 @@ impl Collector for HybCapCollector {
         // Expanded baits (padded by near_distance, re-merged) drive near-bait
         // classification; only run-nonemptiness is queried.
         let expanded_baits = merged_baits.padded(self.near_distance).merged();
-        self.expanded_bait_ivs = bucket_by_contig(
+        self.expanded_bait_intervals = bucket_by_contig(
             n_contigs,
             expanded_baits.iter().map(|iv| (iv.ref_id, iv.start, iv.end, 0u32)),
         );
@@ -1025,46 +1052,34 @@ impl Collector for HybCapCollector {
             return Ok(());
         };
 
-        // ── Coordinate-sort gate + per-contig cursor reset ──
-        // The cursor sweeps below require reads ordered by (ref_id, position).
-        // Reject any regression (also catches a BAM whose header claims coordinate
-        // sort but isn't) rather than silently emitting wrong metrics.
-        if let Some(last_ref_id) = self.last_ref_id {
-            if ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start) {
-                return Err(anyhow!(
-                    "hybcap requires a coordinate-sorted BAM (ordered by reference, then \
-                     position); encountered {}:{} after {}:{}. Sort with `samtools sort`.",
-                    self.contig_name(ref_id),
-                    u64::from(start) + 1,
-                    self.contig_name(last_ref_id),
-                    u64::from(self.last_start) + 1,
-                ));
-            }
-            if ref_id != last_ref_id {
-                self.target_cursor = 0;
-                self.bait_cursor = 0;
-                self.expanded_cursor = 0;
-            }
-        }
-        self.last_ref_id = Some(ref_id);
-        self.last_start = start;
+        // ── Coordinate-sort gate + per-contig cursor reset (the sweep below
+        //    requires reads ordered by (ref_id, position)) ──
+        self.check_coordinate_order(ref_id, start)?;
 
         // ── Sweep the sorted per-contig interval lists (amortized O(1) per read vs.
-        //    a from-scratch binary search, since reads arrive in coordinate order) ──
-        let (tlo, thi) = sweep_run(&self.target_ivs[ref_id], &mut self.target_cursor, start, end);
+        //    a from-scratch binary search, since reads arrive in coordinate order).
+        //    `.get(ref_id)` degrades to no-overlaps for an out-of-range contig id
+        //    (e.g. a malformed record) rather than panicking, as the old Overlapper
+        //    did. ──
+        let contig_targets: &[(u32, u32, u32)] =
+            self.target_intervals.get(ref_id).map_or(&[], Vec::as_slice);
+        let (tlo, thi) = sweep_run(contig_targets, &mut self.target_cursor, start, end);
         let cached_targets: SmallVec<[(u32, u32, u32); 4]> =
-            self.target_ivs[ref_id][tlo..thi].iter().copied().collect();
+            contig_targets[tlo..thi].iter().copied().collect();
 
-        let (blo, bhi) = sweep_run(&self.bait_ivs[ref_id], &mut self.bait_cursor, start, end);
+        let contig_baits: &[(u32, u32, u32)] =
+            self.bait_intervals.get(ref_id).map_or(&[], Vec::as_slice);
+        let (blo, bhi) = sweep_run(contig_baits, &mut self.bait_cursor, start, end);
         let bait_hits: SmallVec<[(u32, u32); 4]> =
-            self.bait_ivs[ref_id][blo..bhi].iter().map(|&(s, e, _)| (s, e)).collect();
+            contig_baits[blo..bhi].iter().map(|&(s, e, _)| (s, e)).collect();
 
         // Skip the expanded-bait sweep when the read already overlaps a bait (then
         // it's on expanded bait too); its cursor catches up lazily on the next read
         // that needs it, since prunes are start-driven.
         let on_expanded_bait = if bait_hits.is_empty() {
-            let (elo, ehi) =
-                sweep_run(&self.expanded_bait_ivs[ref_id], &mut self.expanded_cursor, start, end);
+            let contig_expanded: &[(u32, u32, u32)] =
+                self.expanded_bait_intervals.get(ref_id).map_or(&[], Vec::as_slice);
+            let (elo, ehi) = sweep_run(contig_expanded, &mut self.expanded_cursor, start, end);
             ehi > elo
         } else {
             true
@@ -1745,6 +1760,50 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_run_returns_overlapping_contiguous_run() {
+        let ivs = [(10u32, 20u32, 0u32), (30, 40, 1), (50, 60, 2)];
+        let mut cursor = 0;
+        // [15, 35) overlaps targets 0 and 1.
+        assert_eq!(sweep_run(&ivs, &mut cursor, 15, 35), (0, 2));
+    }
+
+    #[test]
+    fn sweep_run_prunes_and_advances_cursor_monotonically() {
+        let ivs = [(10u32, 20u32, 0u32), (30, 40, 1), (50, 60, 2)];
+        let mut cursor = 0;
+        assert_eq!(sweep_run(&ivs, &mut cursor, 12, 18), (0, 1));
+        assert_eq!(cursor, 0, "target 0 (end 20 > 18) is still live, not pruned");
+        assert_eq!(sweep_run(&ivs, &mut cursor, 32, 38), (1, 2));
+        assert_eq!(cursor, 1, "target 0 pruned once read start passes its end");
+    }
+
+    #[test]
+    fn sweep_run_is_empty_in_gaps_and_past_the_end() {
+        let ivs = [(10u32, 20u32, 0u32), (30, 40, 1)];
+        let mut cursor = 0;
+        assert_eq!(sweep_run(&ivs, &mut cursor, 22, 28), (1, 1)); // read falls in the gap
+        let mut cursor = 0;
+        assert_eq!(sweep_run(&ivs, &mut cursor, 45, 50), (2, 2)); // read past all targets
+    }
+
+    #[test]
+    fn sweep_run_handles_empty_interval_list() {
+        let mut cursor = 0;
+        assert_eq!(sweep_run(&[], &mut cursor, 5, 10), (0, 0));
+    }
+
+    #[test]
+    fn bucket_by_contig_groups_by_ref_id_and_sorts_by_start() {
+        // Contig 0 given out of start order; contig 1 empty; contig 2 present.
+        let input = vec![(0usize, 50u32, 60u32, 5u32), (0, 10, 20, 1), (2, 100, 110, 9)];
+        let buckets = bucket_by_contig(3, input.into_iter());
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0], vec![(10, 20, 1), (50, 60, 5)]);
+        assert!(buckets[1].is_empty());
+        assert_eq!(buckets[2], vec![(100, 110, 9)]);
+    }
 
     #[test]
     fn test_compute_median_simple() {

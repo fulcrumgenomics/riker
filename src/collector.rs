@@ -106,12 +106,13 @@ pub fn drive_collector_single_threaded(
 
     let read_result = drive_records(reader, collector, progress, &header);
     progress.finish();
-    let finish_result = collector.finish();
 
-    // Read-loop error wins — it's the upstream cause and what the user
-    // most needs to see. Finish errors only surface if the loop ran clean.
+    // A read-loop error is fatal: skip finalization entirely so a failed run
+    // leaves no partial or misleading output on disk (matching `multi`'s
+    // all-or-nothing finalization — a collector's `finish()` typically writes
+    // output). `finish()` and its errors only surface on a clean pass.
     read_result?;
-    finish_result
+    collector.finish()
 }
 
 fn drive_records(

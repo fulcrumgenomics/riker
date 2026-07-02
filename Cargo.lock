@@ -1853,6 +1853,7 @@ dependencies = [
  "riker-ngs-derive",
  "rpmalloc",
  "rust-htslib",
+ "rust-lapper",
  "rustc-hash 2.1.2",
  "serde",
  "smallvec",
@@ -1916,6 +1917,15 @@ dependencies = [
  "regex",
  "thiserror 2.0.18",
  "url",
+]
+
+[[package]]
+name = "rust-lapper"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2274b9cc4f205bc0945b7be3e4fc1a102b0b7119ba6482faaedb9c4f76dde5d1"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

@@ -35,9 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses the kanal channel instead of crossbeam-channel, ~4% lower wall-clock on a
   12x WGS BAM at `--threads 6` (it avoids waking a worker that is about to pick
   up its batch by spinning). Output is unchanged.
+- **Faster `hybcap` (~1.5x wall, -26% CPU at `--threads 3`).** Its per-read
+  coverage and bait/target overlap paths were rewritten to exploit coordinate
+  order and the merged, non-overlapping interval sets — contiguous depth-slice
+  fills plus a cursor sweep, instead of per-base target search and three
+  per-read interval-tree queries. Output is byte-identical. **`hybcap` now
+  requires a coordinate-sorted BAM** and aborts with an error on an out-of-order
+  record (it was previously order-agnostic).
 
 ### Fixed
 
+- **A failed single-pass run no longer leaves partial output on disk.** The
+  single-threaded collector driver now skips finalization when the read loop
+  errors (matching `multi`'s all-or-nothing behavior); previously a mid-stream
+  error could still write a complete-looking but incomplete metrics file.
 - **`multi` output is now deterministic across thread counts.** Each collector
   is pinned to a single worker and receives batches in file order, so a
   parallel run is byte-identical to a single-threaded one; previously the
