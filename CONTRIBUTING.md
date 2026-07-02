@@ -374,6 +374,26 @@ style your files use.
 - Verify correctness after any optimization (diff outputs against a baseline and
   run the full test suite)
 
+### The `multi` work queue (kanal) and its soundness invariant
+
+`multi`'s reader→worker channels use [kanal](https://crates.io/crates/kanal)
+rather than crossbeam-channel: benchmarked ~4% faster wall-clock on a 12x WGS
+BAM at `--threads 6`, from kanal eliding the `unpark()` syscall when the
+receiver is still spinning (crossbeam wakes it unconditionally). kanal is
+**hard-pinned** (`kanal = "=0.1.1"`) with `default-features = false` (the async
+feature is unused, carries more unsafe, and is not vetted).
+
+kanal's speed comes from internal `unsafe` (raw-pointer payload encoding), so
+its soundness is a maintained invariant, not a one-time check. Version 0.1.1
+was vetted with Miri — the sync test suite plus a test mirroring `multi`'s exact
+usage (bounded channels of `Arc` batches + an unbounded recycle pool whose
+sender is cloned into each batch and sent back on `Drop`) — clean under both
+Stacked Borrows and Tree Borrows, and across 64 schedules (`-Zmiri-many-seeds`)
+with the data-race detector on. **Re-run that check before accepting any kanal
+bump.** A full `cargo miri test` on riker is not possible (htslib's C FFI can't
+run under Miri), so vet kanal standalone: check out the pinned version and run
+`cargo +nightly miri test` on its sync tests plus the usage-mirroring test.
+
 ## Releasing
 
 Releases are cut with [cargo-release]. Install it once with

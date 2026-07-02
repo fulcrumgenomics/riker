@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collector workers) rather than a bare worker count, and with no value given
   `multi` now uses up to four threads (clamped to the core count) instead of a
   fixed two. Existing `riker multi --threads N` invocations keep working.
+- **Faster `multi` at higher thread counts.** The reader→worker work queue now
+  uses the kanal channel instead of crossbeam-channel, ~4% lower wall-clock on a
+  12x WGS BAM at `--threads 6` (it avoids waking a worker that is about to pick
+  up its batch by spinning). Output is unchanged.
 
 ### Fixed
 

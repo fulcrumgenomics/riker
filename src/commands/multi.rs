@@ -27,18 +27,18 @@
 //!
 //! Reader and workers are connected through these channels:
 //!
-//! - `batch_pool` — an unbounded mpsc channel of empty `Vec<RikerRecord>`
+//! - `batch_pool` — an unbounded kanal channel of empty `Vec<RikerRecord>`
 //!   slots the reader pulls from (and which [`RecyclableBatch::drop`]
 //!   returns to). Slots are pre-allocated as the record variant the reader
 //!   writes into: `RikerRecord::Bam` for BAM, `RikerRecord::Fallback` for
 //!   SAM, `RikerRecord::Htslib` for CRAM.
-//! - one **ordered channel per worker group** — a bounded crossbeam queue
+//! - one **ordered channel per worker group** — a bounded kanal queue
 //!   of `Arc<RecyclableBatch>`. The reader wraps each filled batch in an
 //!   `Arc` and sends a clone to every group's channel; the owning worker
-//!   blocks on `recv()` — no polling, no condvar. Bounded one batch above
-//!   the pool's in-flight max so the recycling pool is the practical
-//!   backpressure.
-//! - `return` — the mpsc `return_tx`/`return_rx` captured inside each
+//!   blocks on `recv()` (kanal briefly spins, then parks — no busy-polling).
+//!   Bounded one batch above the pool's in-flight max so the recycling pool
+//!   is the practical backpressure.
+//! - `return` — the kanal `return_tx`/`return_rx` captured inside each
 //!   `RecyclableBatch`. When the last `Arc` reference drops (every group
 //!   has finished the batch), [`RecyclableBatch::drop`] sends the inner
 //!   `Vec` back to the pool.
@@ -92,11 +92,10 @@ use std::num::NonZero;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 
 use anyhow::{Result, anyhow};
 use clap::{Args, ValueEnum};
-use crossbeam_channel::{Receiver, Sender};
+use kanal::{Receiver, Sender};
 use noodles::sam::Header;
 
 use crate::collector::Collector;
@@ -491,7 +490,7 @@ type Batch = Arc<RecyclableBatch>;
 struct RecyclableBatch {
     records: Vec<RikerRecord>,
     len: usize,
-    return_tx: mpsc::Sender<Vec<RikerRecord>>,
+    return_tx: Sender<Vec<RikerRecord>>,
 }
 
 impl RecyclableBatch {
@@ -582,7 +581,7 @@ fn combined_requirements(collectors: &[Box<dyn Collector>]) -> RikerRecordRequir
 ///   is stateful) while still allowing different collectors' batches to
 ///   process in parallel across threads.
 /// - When the last `Arc<RecyclableBatch>` drops, its `Drop` returns the inner
-///   `Vec<RikerRecord>` to the reader's pool via an mpsc channel.
+///   `Vec<RikerRecord>` to the reader's pool via a kanal channel.
 ///
 /// `threads` is the worker count, so the pool spawns `threads` workers
 /// alongside the (uncounted) reader thread. Caller is responsible for
@@ -626,7 +625,7 @@ fn run_parallel(
     // Pool of reusable record-batch allocations (the backpressure). Slots
     // are pre-allocated as the variant the reader writes to. Unbounded so
     // `RecyclableBatch::drop` never blocks.
-    let (pool_tx, pool_rx) = mpsc::channel::<Vec<RikerRecord>>();
+    let (pool_tx, pool_rx) = kanal::unbounded::<Vec<RikerRecord>>();
     for _ in 0..NUM_BATCHES_POOLED {
         let mut vec: Vec<RikerRecord> = Vec::with_capacity(BATCH_SIZE);
         vec.resize_with(BATCH_SIZE, || reader.empty_record());
@@ -639,7 +638,7 @@ fn run_parallel(
     let mut group_senders: Vec<Sender<Batch>> = Vec::with_capacity(n_groups);
     let mut group_receivers: Vec<Receiver<Batch>> = Vec::with_capacity(n_groups);
     for _ in 0..n_groups {
-        let (tx, rx) = crossbeam_channel::bounded::<Batch>(NUM_BATCHES_POOLED + 1);
+        let (tx, rx) = kanal::bounded::<Batch>(NUM_BATCHES_POOLED + 1);
         group_senders.push(tx);
         group_receivers.push(rx);
     }
@@ -771,8 +770,8 @@ fn reader_thread_loop(
     reader: &mut AlignmentReader,
     header: &Header,
     group_senders: &[Sender<Batch>],
-    pool_tx: mpsc::Sender<Vec<RikerRecord>>,
-    pool_rx: mpsc::Receiver<Vec<RikerRecord>>,
+    pool_tx: Sender<Vec<RikerRecord>>,
+    pool_rx: Receiver<Vec<RikerRecord>>,
     requirements: &RikerRecordRequirements,
     poison: &AtomicBool,
 ) -> Result<()> {
