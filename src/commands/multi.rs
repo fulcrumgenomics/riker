@@ -430,6 +430,15 @@ impl InputKind {
 /// expensive and parallelizes well — favor read threads, staying serial-main at
 /// low budgets so a scarce thread decodes rather than idling as a worker. **SAM**
 /// can't decode in parallel, so everything goes to workers.
+///
+/// The budget counts **CPU-active** threads (decode workers + compute workers).
+/// A couple of I/O-bound threads run on top and are deliberately uncounted — the
+/// dispatch thread, and the multithreaded BGZF reader's own reader thread —
+/// because they spend nearly all their time parked on I/O and so don't
+/// oversubscribe the CPU. `--threads` is a soft target for the cores riker tries
+/// to saturate, not a hard cap on OS threads (see the `--threads` help in
+/// `main.rs`); this layout, over-budget threads and all, is the one benchmarking
+/// picked.
 fn plan_multi(total: NonZero<usize>, n_tools: usize, kind: InputKind) -> ThreadPlan {
     let cap = n_tools.max(1);
     let serial = ThreadPlan { decode_threads: 0, compute_workers: 0 };

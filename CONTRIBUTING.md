@@ -178,7 +178,7 @@ impl Command for MyCommand {
             self.reference.reference.as_deref(),
             plan.decode_threads,
         )?;
-        let mut collector = MyCollector::new(&self.input.input, &self.output.output, &self.options);
+        let mut collector = MyCollector::new(&self.output.output, &self.options);
         let mut progress = ProgressLogger::new("<name>", "reads", 5_000_000);
         drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
