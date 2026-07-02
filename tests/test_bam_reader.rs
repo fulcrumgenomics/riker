@@ -413,9 +413,10 @@ fn bam_records_identical_across_decode_thread_counts() -> Result<()> {
 }
 
 /// Indexed BAM region queries must return byte-identical records whether the
-/// reader is single-threaded (noodles `IndexedReader`) or multithreaded (a
-/// `Reader` over a `MultithreadedReader` seeking through a separately loaded
-/// index). Exercises the threaded indexed path end to end.
+/// reader decodes single-threaded or multithreaded. Both drive a plain
+/// `Reader` over a manually-loaded index (single-threaded, or over a
+/// `MultithreadedReader`), so this also guards that the two paths resolve the
+/// same index.
 #[test]
 fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
     let mut builder = coord_builder(&[("chr1", 2_000)]);
@@ -441,6 +442,38 @@ fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
     let multithreaded = collect(4)?;
     assert_eq!(single.len(), 5, "two pairs + one fragment overlap the query");
     assert_eq!(single, multithreaded, "multithreaded indexed query must match single-threaded");
+    Ok(())
+}
+
+/// A `.csi`-indexed BAM (no `.bai` present) must query correctly through both
+/// the single-threaded and multithreaded paths, exercising `load_bam_index`'s
+/// CSI branch — which resolves and boxes a `csi::Index` rather than a
+/// `bai::Index`.
+#[test]
+fn indexed_bam_query_works_with_csi_index() -> Result<()> {
+    let mut builder = coord_builder(&[("chr1", 2_000)]);
+    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
+    builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, Some(3));
+    builder.add_pair("pair2", 0, 1_200, 1_400, 200, 55, 60, false, false);
+    let bam = builder.to_temp_csi_indexed_bam()?;
+
+    let region: Region = "chr1".parse().expect("valid region");
+    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+
+    let collect = |decode_threads: usize| -> Result<Vec<Row>> {
+        let mut reader = IndexedAlignmentReader::open(bam.path(), None, decode_threads)?;
+        let mut rows = Vec::new();
+        reader.query_for_each(&region, &requirements, |record| {
+            rows.push(record_row(record));
+            Ok(())
+        })?;
+        Ok(rows)
+    };
+
+    let single = collect(0)?;
+    let multithreaded = collect(4)?;
+    assert_eq!(single.len(), 5, "two pairs + one fragment overlap the query");
+    assert_eq!(single, multithreaded, "CSI query must match across decode thread counts");
     Ok(())
 }
 

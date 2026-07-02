@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::{Command, resolve_threads};
+use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::intervals::{Interval, Intervals};
@@ -178,8 +178,7 @@ pub struct HybCap {
 
 impl Command for HybCap {
     fn execute(&self, threads: Option<u8>) -> Result<()> {
-        let plan =
-            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,
             self.reference.reference.as_deref(),
@@ -1284,11 +1283,10 @@ impl Collector for HybCapCollector {
 
     /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~140,
     /// the heaviest collector — dual bait+target per-base pileup. Measured on an
-    /// exome BAM (samply worker-compute) at ~2x `basic` per read, then placed on
-    /// the WGS-BAM hint scale by anchoring to the shared collectors (basic ->
-    /// 155, alignment -> 120; center ~140). Approximate — per-read cost varies
-    /// with read length across data sets — but its ordering as the heaviest is
-    /// robust.
+    /// exome BAM (samply worker-compute) at roughly 2x `basic` per read (basic's
+    /// hint is 76, alignment's 55), which lands it near 140 on the shared hint
+    /// scale. Approximate — per-read cost varies with read length across data
+    /// sets — but its ordering as the heaviest is robust.
     fn cost_hint(&self) -> u32 {
         140
     }

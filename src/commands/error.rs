@@ -14,12 +14,12 @@ use smallvec::SmallVec;
 use strum::EnumCount as _;
 
 use crate::collector::Collector;
-use crate::commands::command::{Command, resolve_threads};
+use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_6dp, write_tsv};
 use crate::progress::ProgressLogger;
-use crate::sam::alignment_reader::IndexedAlignmentReader;
+use crate::sam::alignment_reader::{IndexedAlignmentReader, append_extension};
 use crate::sam::mate_buffer::{MateAction, MateBuffer};
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
@@ -234,9 +234,7 @@ impl Error {
 /// Ensure the reference FASTA at `ref_path` has a sibling `.fai` index,
 /// erroring with a `samtools faidx` hint if it does not.
 fn validate_fasta_index(ref_path: &Path) -> Result<()> {
-    let mut p = ref_path.as_os_str().to_owned();
-    p.push(".fai");
-    let fai_path = PathBuf::from(p);
+    let fai_path = append_extension(ref_path, ".fai");
     if !fai_path.exists() {
         bail!(
             "FASTA index not found: expected {}\n\
@@ -258,8 +256,7 @@ impl Command for Error {
         let fasta = Fasta::from_path(ref_path)?;
 
         // Open indexed alignment file
-        let plan =
-            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let plan = self.thread_plan(threads);
         let mut alignment_reader =
             IndexedAlignmentReader::open(&self.input.input, Some(ref_path), plan.decode_threads)?;
         let header = alignment_reader.header().clone();

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 /// How a command spends its total thread budget: some threads decode input,
-/// the rest do parallel compute. Produced by [`Command::plan_threads`].
+/// the rest do parallel compute. Produced by [`Command::thread_plan`].
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadPlan {
     /// BGZF/CRAM decode workers handed to the reader, in addition to the
@@ -26,7 +26,7 @@ pub trait Command {
     /// `threads` is the toolkit-wide `--threads` value (`None` when unset) —
     /// the total OS-thread budget, counting the main thread. Each command
     /// resolves it against [`default_threads`](Command::default_threads) and
-    /// divides it via [`plan_threads`](Command::plan_threads).
+    /// divides it via [`thread_plan`](Command::thread_plan).
     ///
     /// # Errors
     /// Returns an error if the command fails.
@@ -39,12 +39,16 @@ pub trait Command {
         NonZero::<usize>::MIN
     }
 
-    /// Divide the resolved total budget between input decoding and compute.
-    /// The default hands the whole remainder to the reader because a
-    /// single-pass tool's own work runs on the calling thread; `multi`
-    /// overrides this with a format-aware split.
-    fn plan_threads(&self, total: NonZero<usize>, _input: &Path) -> ThreadPlan {
-        ThreadPlan { decode_threads: total.get() - 1, compute_workers: 1 }
+    /// Resolve `--threads` against [`default_threads`](Self::default_threads)
+    /// and split it into decode and compute threads. The default gives a
+    /// single-pass tool the whole remainder for input decoding — its own work
+    /// runs on the calling thread, so `compute_workers` stays `1`. A tool that
+    /// wants to parallelize its own work (or `multi`) overrides this to claim
+    /// `compute_workers`; an overriding tool can read whatever it needs
+    /// (input path, options) from `self`.
+    fn thread_plan(&self, threads: Option<u8>) -> ThreadPlan {
+        let total = resolve_threads(threads, self.default_threads()).get();
+        ThreadPlan { decode_threads: total - 1, compute_workers: 1 }
     }
 }
 
@@ -52,7 +56,7 @@ pub trait Command {
 /// [`default_threads`](Command::default_threads). The CLI value parser
 /// guarantees any provided value is `>= 1`.
 #[must_use]
-pub fn resolve_threads(threads: Option<u8>, default: NonZero<usize>) -> NonZero<usize> {
+pub(crate) fn resolve_threads(threads: Option<u8>, default: NonZero<usize>) -> NonZero<usize> {
     threads.and_then(|n| NonZero::new(usize::from(n))).unwrap_or(default)
 }
 
@@ -98,12 +102,13 @@ mod tests {
     }
 
     #[test]
-    fn default_plan_hands_the_whole_remainder_to_decoding() {
+    fn default_thread_plan_hands_the_whole_remainder_to_decoding() {
         // Single-pass tools compute on the calling thread and decode with the
         // rest, so decode_threads = total - 1 and compute stays at 1.
-        let plan = Dummy.plan_threads(nz(1), Path::new("x.bam"));
+        // Dummy's default budget is 1, so an unset `--threads` decodes serially.
+        let plan = Dummy.thread_plan(None);
         assert_eq!((plan.decode_threads, plan.compute_workers), (0, 1));
-        let plan = Dummy.plan_threads(nz(4), Path::new("x.bam"));
+        let plan = Dummy.thread_plan(Some(4));
         assert_eq!((plan.decode_threads, plan.compute_workers), (3, 1));
     }
 }

@@ -11,7 +11,7 @@ use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::{Command, resolve_threads};
+use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::counter::Counter;
 use crate::metrics::write_tsv;
@@ -104,8 +104,7 @@ impl Command for InsertSize {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output file cannot be written.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
-        let plan =
-            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,
             self.reference.reference.as_deref(),

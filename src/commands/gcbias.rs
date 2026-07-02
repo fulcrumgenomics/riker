@@ -15,7 +15,7 @@ use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
-use crate::commands::command::{Command, resolve_threads};
+use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
@@ -190,8 +190,7 @@ impl Command for GcBias {
     /// # Errors
     /// Returns an error if the BAM or reference cannot be read, or if output cannot be written.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
-        let plan =
-            self.plan_threads(resolve_threads(threads, self.default_threads()), &self.input.input);
+        let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,
             Some(&self.reference.reference),

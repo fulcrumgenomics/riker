@@ -52,31 +52,33 @@
 //! informational there.
 //!
 //! When the reader hits EOF it drops the group senders, each channel
-//! closes, and each worker finalizes its own collectors
-//! ([`Collector::finish`]) before exiting.
+//! closes, and each worker hands its collectors back to the main thread,
+//! which finalizes every group ([`Collector::finish`]) only once all
+//! workers and the reader have joined cleanly.
 //!
 //! ## Error propagation
 //!
 //! Channel disconnection handles the happy shutdown path. An `AtomicBool`
 //! poison flag handles the sad one.
 //!
-//! - A worker that gets `Err` from `accept_multiple` sets the flag before
-//!   returning (without finalizing), so the reader aborts on its next send
-//!   and sibling workers stop at their next batch instead of processing the
-//!   rest of the in-flight work.
-//! - If the reader itself errors it returns `Err`; the reader closure sets
-//!   the poison flag *before* dropping the group senders, so by the time a
-//!   worker is woken by the closed channel and reaches its post-EOF check the
-//!   flag is already visible and it skips finalization — no partial output.
+//! - A worker that gets `Err` from `accept_multiple` sets the flag and
+//!   returns the error, so the reader aborts on its next send and sibling
+//!   workers stop at their next batch instead of processing the rest of the
+//!   in-flight work.
+//! - If the reader itself errors it returns `Err`; it sets the poison flag
+//!   before dropping the group senders so any in-flight worker stops
+//!   promptly rather than processing a truncated stream.
 //!
-//! Errors are surfaced by `handle.join()` on the main thread — the
-//! reader's error wins if present, otherwise the first worker error.
+//! Errors are surfaced by `handle.join()` on the main thread — the reader's
+//! error wins if present, otherwise the first worker error. Finalization
+//! runs on the main thread *after* every worker and the reader have joined
+//! without error, so **a failed run leaves no partial output on disk**.
 //!
-//! All `poison` flag accesses use `Ordering::Relaxed`. Relaxed is
-//! sufficient because the flag is a standalone boolean read only through its
-//! own atomic (coherence guarantees a store becomes visible to later loads);
-//! it carries no other memory with it, and the reader-error ordering above is
-//! established by the channel close, not by the flag.
+//! All `poison` flag accesses use `Ordering::Relaxed`. Relaxed is sufficient
+//! because the flag is only a best-effort "stop early" signal and no longer
+//! guards output: no-partial-output is enforced by finalizing after the
+//! worker/reader joins — `join` is the happens-before edge that orders every
+//! `accept_multiple` before any `finish()` — not by the flag.
 //!
 //! ## Single-threaded path
 //!
@@ -110,7 +112,7 @@ use crate::commands::isize::{InsertSizeCollector, MultiIsizeOptions};
 use crate::commands::wgs::{MultiWgsOptions, WgsCollector};
 use crate::fasta::Fasta;
 use crate::progress::ProgressLogger;
-use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::alignment_reader::{AlignmentFormat, AlignmentReader, detect_format};
 use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
@@ -119,12 +121,12 @@ use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 /// Picked at 128 from a `batch ∈ {32,48,64,128} × pool ∈ {16,32,48,64} ×
 /// threads ∈ {2,4,8}` sweep on M1 Max and Graviton 3. Smaller batches
 /// (e.g. 32) win marginally at `--threads 2` but cause heavy sys-time
-/// blowup at higher thread counts: each batch acquires/releases the
-/// per-collector mutex, so small batches make many workers fight for the
-/// lock. 128 keeps each `accept_multiple` call long enough that mutex
-/// churn stays cheap, while the working set (`128 × 16 = 2048` records,
-/// ~1.5 MB for typical 150 bp WGS reads) still fits comfortably in L2 on
-/// M1 Max and shared L3 on Graviton 3.
+/// blowup at higher thread counts: each batch costs a channel send/recv per
+/// worker group plus the reader's fan-out clone, so small batches multiply
+/// that per-record overhead. 128 keeps each `accept_multiple` call long
+/// enough that the channel overhead stays cheap, while the working set
+/// (`128 × 16 = 2048` records, ~1.5 MB for typical 150 bp WGS reads) still
+/// fits comfortably in L2 on M1 Max and shared L3 on Graviton 3.
 const BATCH_SIZE: usize = 128;
 
 /// Number of pre-allocated batches in the recycling pool.
@@ -316,9 +318,10 @@ impl Command for Multi {
             }
         }
 
-        // Plan the thread layout, then open the reader (also needed to build
-        // interval maps for WGS) with its share of decode threads.
-        let plan = self.plan_threads(total, &self.input.input);
+        // Plan the thread layout from the already-deduped tool count, then
+        // open the reader (also needed to build interval maps for WGS) with
+        // its share of decode threads.
+        let plan = plan_multi(total, seen.len().max(1), InputKind::of(&self.input.input));
         let reader = AlignmentReader::open(
             &self.input.input,
             self.reference.reference.as_deref(),
@@ -345,21 +348,6 @@ impl Command for Multi {
     fn default_threads(&self) -> NonZero<usize> {
         let cores = std::thread::available_parallelism().unwrap_or(NonZero::<usize>::MIN);
         cores.min(NonZero::new(4).expect("4 is non-zero"))
-    }
-
-    /// Lay out the thread budget across reader-decode threads and compute
-    /// worker groups, tuned per input format — see [`plan_multi`].
-    fn plan_threads(&self, total: NonZero<usize>, input: &Path) -> ThreadPlan {
-        let n_tools = {
-            let mut seen = Vec::new();
-            for kind in &self.tools {
-                if !seen.contains(kind) {
-                    seen.push(*kind);
-                }
-            }
-            seen.len().max(1)
-        };
-        plan_multi(total, n_tools, InputKind::of(input))
     }
 }
 
@@ -414,22 +402,16 @@ enum InputKind {
 }
 
 impl InputKind {
-    /// Classify by extension. The reader does the authoritative format
-    /// detection; this only needs to be right enough to plan threads (a
-    /// misclassified SAM/BAM just means the reader ignores a decode count).
+    /// Classify by extension, reusing the reader's [`detect_format`]. The
+    /// reader does the authoritative detection at open time; this only needs
+    /// to be right enough to plan threads, so an unrecognized extension falls
+    /// back to `Bam` (a misclassified SAM/BAM just means the reader ignores a
+    /// decode count).
     fn of(path: &Path) -> Self {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-        if ext.eq_ignore_ascii_case("cram") {
-            Self::Cram
-        } else if ext.eq_ignore_ascii_case("sam")
-            || (ext.eq_ignore_ascii_case("gz")
-                && Path::new(path.file_stem().unwrap_or_default())
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("sam")))
-        {
-            Self::Sam
-        } else {
-            Self::Bam
+        match detect_format(path) {
+            Ok(AlignmentFormat::Cram) => Self::Cram,
+            Ok(AlignmentFormat::Sam | AlignmentFormat::GzippedSam) => Self::Sam,
+            Ok(AlignmentFormat::Bam) | Err(_) => Self::Bam,
         }
     }
 }
@@ -451,27 +433,27 @@ impl InputKind {
 fn plan_multi(total: NonZero<usize>, n_tools: usize, kind: InputKind) -> ThreadPlan {
     let cap = n_tools.max(1);
     let serial = ThreadPlan { decode_threads: 0, compute_workers: 0 };
-    let t = total.get();
-    match (kind, t) {
+    let budget = total.get();
+    match (kind, budget) {
         // Budget of 1 is always a single serial pass.
         (_, 1) => serial,
-        // t = 2, 3: dispatcher is counted; small per-format special cases.
+        // budget = 2, 3: dispatcher is counted; small per-format special cases.
         (InputKind::Cram, 2) => ThreadPlan { decode_threads: 1, compute_workers: 0 },
         (InputKind::Cram, 3) => ThreadPlan { decode_threads: 2, compute_workers: 0 },
         (_, 2) => ThreadPlan { decode_threads: 0, compute_workers: 1 },
         (_, 3) => ThreadPlan { decode_threads: 0, compute_workers: 2.min(cap) },
-        // t >= 4: the dispatcher becomes free; split the budget `t` into readers
+        // budget >= 4: the dispatcher becomes free; split the budget into readers
         // + workers, format-tuned by which dimension gets the odd thread.
-        (InputKind::Sam, _) => ThreadPlan { decode_threads: 0, compute_workers: t.min(cap) },
+        (InputKind::Sam, _) => ThreadPlan { decode_threads: 0, compute_workers: budget.min(cap) },
         (InputKind::Bam, _) => {
-            let workers = t.div_ceil(2).min(cap);
-            ThreadPlan { decode_threads: t - workers, compute_workers: workers }
+            let workers = budget.div_ceil(2).min(cap);
+            ThreadPlan { decode_threads: budget - workers, compute_workers: workers }
         }
         (InputKind::Cram, _) => {
-            // floor(t/2) workers (readers get the odd thread); any budget freed
+            // floor(budget/2) workers (readers get the odd thread); any budget freed
             // by the worker cap goes to reads, which CRAM decode makes good use of.
-            let workers = (t / 2).min(cap);
-            ThreadPlan { decode_threads: t - workers, compute_workers: workers }
+            let workers = (budget / 2).min(cap);
+            ThreadPlan { decode_threads: budget - workers, compute_workers: workers }
         }
     }
 }
@@ -567,40 +549,42 @@ fn combined_requirements(collectors: &[Box<dyn Collector>]) -> RikerRecordRequir
     collectors.iter().fold(RikerRecordRequirements::NONE, |acc, c| acc.union(c.field_needs()))
 }
 
-/// Run collectors in parallel with a dedicated reader thread and a shared
-/// worker pool.
+/// Run collectors in parallel with a dedicated reader thread and a pool of
+/// worker groups.
 ///
 /// Architecture:
-/// - One **reader thread** pulls empty [`RecyclableBatch`] slots from a
-///   pool, fills each batch via [`AlignmentReader::fill_record`], wraps
-///   it in an `Arc`, and fans it out onto a shared
-///   `(collector_idx, Batch)` work queue — one entry per collector.
-/// - `threads` **pool threads** block on the shared work queue. On receipt of
-///   a work item they lock that collector's mutex and call `accept_multiple`.
-///   The mutex serializes per-collector accepts (required since `Collector`
-///   is stateful) while still allowing different collectors' batches to
-///   process in parallel across threads.
-/// - When the last `Arc<RecyclableBatch>` drops, its `Drop` returns the inner
-///   `Vec<RikerRecord>` to the reader's pool via a kanal channel.
+/// - One **reader thread** pulls empty [`RecyclableBatch`] slots from a pool,
+///   fills each batch via [`AlignmentReader::fill_record`], wraps it in an
+///   `Arc`, and sends a clone to **every worker group's** ordered channel (one
+///   bounded kanal channel per group).
+/// - Each of the `workers` **groups** is owned by a single thread that blocks
+///   on its channel's `recv()` and calls `accept_multiple` on the collectors
+///   it owns. A collector lives in exactly one group, so there is no shared
+///   collector state and no per-collector lock; and because every group
+///   receives batches in the same order, each collector sees records in file
+///   order (deterministic output).
+/// - When the last `Arc<RecyclableBatch>` drops (every group has finished the
+///   batch), its `Drop` returns the inner `Vec<RikerRecord>` to the reader's
+///   pool via a kanal channel.
 ///
-/// `threads` is the worker count, so the pool spawns `threads` workers
-/// alongside the (uncounted) reader thread. Caller is responsible for
-/// ensuring `threads >= 1` and that the `--threads 1` serial case is
-/// routed to [`run_single_threaded`] instead — this path is used for
-/// `--threads >= 2`.
+/// `workers` is the number of groups to spawn (the compute-worker budget),
+/// alongside the (uncounted) reader thread; collectors are partitioned into
+/// `min(workers, n_collectors)` groups by [`partition_collectors`]. Caller
+/// ensures `workers >= 1` — a zero-worker (serial-main) plan is routed to
+/// [`run_single_threaded`] instead.
 ///
-/// Workers block on the MPMC work queue; the reader fans batches through
-/// it. Backpressure comes from the recycling pool (the reader blocks on
-/// `pool_rx.recv()` once `NUM_BATCHES_POOLED` batches are in flight).
-/// The work queue is bounded too, but at one batch worth above the
-/// pool's natural in-flight max, so it never blocks the reader in
-/// practice. No busy-polling, no `Condvar`.
+/// Backpressure comes from the recycling pool: the reader blocks on
+/// `pool_rx.recv()` once `NUM_BATCHES_POOLED` batches are in flight. Each group
+/// channel is bounded one batch above that, so it never blocks the reader in
+/// practice. No busy-polling. Finalization ([`Collector::finish`]) runs on the
+/// main thread after all groups and the reader join cleanly (see the module
+/// docs).
 fn run_parallel(
     mut reader: AlignmentReader,
     mut collectors: Vec<Box<dyn Collector>>,
-    threads: usize,
+    workers: usize,
 ) -> Result<()> {
-    debug_assert!(threads >= 1, "run_parallel requires at least 1 worker thread");
+    debug_assert!(workers >= 1, "run_parallel requires at least 1 worker group");
     // Clone the header up front so worker threads (which borrow it) and
     // the reader thread (which owns the AlignmentReader) don't fight over
     // it. Header.clone() is one shot at startup.
@@ -619,7 +603,7 @@ fn run_parallel(
     // lock contention — and the reader ships every batch to every group's
     // ordered channel, so each collector still sees records in file order
     // (deterministic output).
-    let groups = partition_collectors(collectors, threads);
+    let groups = partition_collectors(collectors, workers);
     let n_groups = groups.len();
 
     // Pool of reusable record-batch allocations (the backpressure). Slots
@@ -651,8 +635,8 @@ fn run_parallel(
         let poison_ref: &AtomicBool = &poison;
 
         // One worker per group; each owns its collectors and its receiver.
-        // Workers finalize their own collectors on clean EOF (see
-        // `group_worker_loop`).
+        // Workers do not finalize; on clean EOF they hand their collectors
+        // back for main-thread finalization (see `group_worker_loop`).
         let mut worker_handles = Vec::with_capacity(n_groups);
         for (group, rx) in groups.into_iter().zip(group_receivers) {
             worker_handles
@@ -672,12 +656,11 @@ fn run_parallel(
                 requirements_ref,
                 poison_ref,
             );
-            // Poison BEFORE closing the channels: dropping the senders is what
-            // wakes the workers out of `recv()`, so if we dropped first a
-            // worker could observe the closed channel, read `poison == false`,
-            // and finalize (writing output over a truncated record stream)
-            // before we set the flag. Setting it first guarantees every worker
-            // sees the poison at its post-EOF check.
+            // On a reader error, poison before dropping the senders so any
+            // in-flight worker stops at its next batch instead of processing
+            // the post-error remainder of a truncated stream. (No-partial-
+            // output is guaranteed regardless by main-thread finalization,
+            // which never runs when this `reader_result` is an error.)
             if reader_result.is_err() {
                 poison_ref.store(true, Ordering::Relaxed);
             }
@@ -686,17 +669,14 @@ fn run_parallel(
         });
 
         let reader_result = reader_handle.join().map_err(|_| anyhow!("reader thread panicked"))?;
-        if let Err(e) = reader_result {
-            for handle in worker_handles {
-                let _ = handle.join();
-            }
-            return Err(e);
-        }
 
+        // Join every worker, collecting the collectors each hands back
+        // (unfinalized) and the first error, if any.
         let mut first_error: Option<anyhow::Error> = None;
+        let mut finished_groups: Vec<Vec<Box<dyn Collector>>> = Vec::with_capacity(n_groups);
         for handle in worker_handles {
             match handle.join() {
-                Ok(Ok(())) => {}
+                Ok(Ok(group)) => finished_groups.push(group),
                 Ok(Err(e)) => {
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -710,8 +690,20 @@ fn run_parallel(
             }
         }
 
+        // All-or-nothing finalization: only run `finish()` — which writes the
+        // output files — once the reader AND every worker have completed
+        // cleanly. Checking both error sources before finalizing anything
+        // guarantees a failed run leaves no partial output on disk, and the
+        // worker joins above establish the happens-before edge that orders
+        // every `accept_multiple` before these `finish()` calls.
+        reader_result?;
         if let Some(e) = first_error {
             return Err(e);
+        }
+        for group in &mut finished_groups {
+            for collector in group {
+                collector.finish()?;
+            }
         }
         Ok(())
     })?;
@@ -742,8 +734,10 @@ fn partition_collectors(
         loads[lightest] += u64::from(cost);
         groups[lightest].push(collector);
     }
-    // Drop any empty groups (only possible if n_collectors < n_groups, which
-    // `min` already prevents, but keep it robust).
+    // Defensive only: with >= 1 collector, greedy LPT seeds each of the
+    // `n_groups <= n_collectors` groups exactly once, so none end up empty. The
+    // sole way to get an empty group is an empty `collectors` (n_groups == 1),
+    // which callers never pass.
     groups.retain(|g| !g.is_empty());
     groups
 }
@@ -824,10 +818,12 @@ fn reader_thread_loop(
 
 /// Group worker: owns a set of collectors and their shared ordered channel.
 /// For each batch it runs every owned collector in turn, then drops the
-/// batch (recycled once every group is done with it). On clean EOF (the
-/// reader closed the channel) it finalizes each owned collector — unless the
-/// run was poisoned by an error elsewhere, in which case it returns without
-/// finalizing so partial output isn't written.
+/// batch (recycled once every group is done with it). It does **not**
+/// finalize: on clean EOF it hands its collectors back to the main thread
+/// (which finalizes every group only once all workers and the reader have
+/// joined cleanly — see [`run_parallel`]), so a late error in a sibling
+/// group can never leave this group's output on disk. On a collector error
+/// it sets the poison flag and returns the error without finalizing.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "each worker owns its receiver + collector group; passing by \
@@ -838,10 +834,10 @@ fn group_worker_loop(
     mut group: Vec<Box<dyn Collector>>,
     header: &Header,
     poison: &AtomicBool,
-) -> Result<()> {
+) -> Result<Vec<Box<dyn Collector>>> {
     while let Ok(batch) = rx.recv() {
         if poison.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(group);
         }
         for collector in &mut group {
             if let Err(e) = collector.accept_multiple(batch.records(), header) {
@@ -850,14 +846,10 @@ fn group_worker_loop(
             }
         }
     }
-    // Channel closed = the reader finished. Finalize only if nothing errored.
-    if poison.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    for collector in &mut group {
-        collector.finish()?;
-    }
-    Ok(())
+    // Channel closed = the reader finished. Hand the collectors back
+    // unfinalized; the main thread finalizes all groups only if the whole
+    // run succeeded.
+    Ok(group)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -896,17 +888,35 @@ mod tests {
         }
     }
 
-    /// A failing collector inside `run_parallel` should propagate its
-    /// error out and not deadlock or panic. Asserts on both the error
-    /// type and that `run_parallel` actually returns (rather than
-    /// hanging forever waiting for the reader).
-    #[test]
-    fn run_parallel_propagates_collector_error() -> Result<()> {
-        use std::path::Path;
-        // Build a small in-memory BAM via the helpers crate. We rebuild
-        // the helper inline because helpers/ is only on the integration
-        // test target. A few hundred records is plenty to ensure the
-        // failing collector trips before EOF.
+    /// Collector that records whether `finish` was called, used to assert that
+    /// a poisoned run finalizes no one.
+    struct SpyCollector {
+        finished: Arc<AtomicBool>,
+    }
+
+    impl Collector for SpyCollector {
+        fn initialize(&mut self, _h: &Header) -> Result<()> {
+            Ok(())
+        }
+        fn accept(&mut self, _r: &RikerRecord, _h: &Header) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            self.finished.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "spy"
+        }
+        fn field_needs(&self) -> RikerRecordRequirements {
+            RikerRecordRequirements::NONE
+        }
+    }
+
+    /// Write a tiny temp BAM with `n` mapped records on chr1 for the
+    /// `run_parallel` tests. `helpers/` is only on the integration-test target,
+    /// so we build the BAM inline here.
+    fn tiny_bam(n: u32) -> Result<tempfile::NamedTempFile> {
         use noodles::bam;
         use noodles::sam::Header;
         use noodles::sam::alignment::RecordBuf;
@@ -924,28 +934,36 @@ mod tests {
             )
             .build();
         let tmp = tempfile::NamedTempFile::with_suffix(".bam")?;
-        {
-            let file = std::fs::File::create(tmp.path())?;
-            let mut writer = bam::io::Writer::new(std::io::BufWriter::new(file));
-            writer.write_header(&header)?;
-            let cigar: Cigar = [Op::new(Kind::Match, 50)].into_iter().collect();
-            for i in 0u32..2_000 {
-                let pos =
-                    noodles::core::Position::new(usize::try_from(i).unwrap() % 9_000 + 1).unwrap();
-                let record = RecordBuf::builder()
-                    .set_name(format!("r{i}").into_bytes())
-                    .set_flags(Flags::empty())
-                    .set_reference_sequence_id(0)
-                    .set_alignment_start(pos)
-                    .set_cigar(cigar.clone())
-                    .set_sequence(Sequence::from(vec![b'A'; 50]))
-                    .set_quality_scores(QualityScores::from(vec![30u8; 50]))
-                    .build();
-                writer.write_alignment_record(&header, &record)?;
-            }
+        let file = std::fs::File::create(tmp.path())?;
+        let mut writer = bam::io::Writer::new(std::io::BufWriter::new(file));
+        writer.write_header(&header)?;
+        let cigar: Cigar = [Op::new(Kind::Match, 50)].into_iter().collect();
+        for i in 0..n {
+            let pos =
+                noodles::core::Position::new(usize::try_from(i).unwrap() % 9_000 + 1).unwrap();
+            let record = RecordBuf::builder()
+                .set_name(format!("r{i}").into_bytes())
+                .set_flags(Flags::empty())
+                .set_reference_sequence_id(0)
+                .set_alignment_start(pos)
+                .set_cigar(cigar.clone())
+                .set_sequence(Sequence::from(vec![b'A'; 50]))
+                .set_quality_scores(QualityScores::from(vec![30u8; 50]))
+                .build();
+            writer.write_alignment_record(&header, &record)?;
         }
+        drop(writer);
+        Ok(tmp)
+    }
 
-        let reader = AlignmentReader::open(Path::new(tmp.path()), None, 0)?;
+    /// A failing collector inside `run_parallel` should propagate its
+    /// error out and not deadlock or panic. Asserts on both the error
+    /// type and that `run_parallel` actually returns (rather than
+    /// hanging forever waiting for the reader).
+    #[test]
+    fn run_parallel_propagates_collector_error() -> Result<()> {
+        let tmp = tiny_bam(2_000)?;
+        let reader = AlignmentReader::open(tmp.path(), None, 0)?;
         let collectors: Vec<Box<dyn Collector>> =
             vec![Box::new(FailingCollector { seen: 0, fail_after: 100 })];
 
@@ -955,6 +973,31 @@ mod tests {
         assert!(
             err.to_string().contains("synthetic failure"),
             "expected the failing collector's error, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// On a collector error, `run_parallel` must not finalize any *surviving*
+    /// worker group: finalization (which writes output) runs on the main
+    /// thread only after every worker joins cleanly. With two collectors in
+    /// two groups, a failure in one group must leave the other group's
+    /// `finish()` uncalled — regardless of how fast the surviving group drains.
+    #[test]
+    fn run_parallel_does_not_finalize_survivors_on_error() -> Result<()> {
+        let tmp = tiny_bam(2_000)?;
+        let reader = AlignmentReader::open(tmp.path(), None, 0)?;
+        let finished = Arc::new(AtomicBool::new(false));
+        let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(FailingCollector { seen: 0, fail_after: 100 }),
+            Box::new(SpyCollector { finished: Arc::clone(&finished) }),
+        ];
+
+        // 2 workers => partition_collectors puts each collector in its own group.
+        let result = run_parallel(reader, collectors, 2);
+        assert!(result.is_err(), "the failing collector must poison the run");
+        assert!(
+            !finished.load(Ordering::Relaxed),
+            "the surviving group's collector must not be finalized on a failed run"
         );
         Ok(())
     }

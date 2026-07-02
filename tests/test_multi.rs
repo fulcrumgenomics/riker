@@ -573,15 +573,14 @@ fn test_parallel_all_collectors() -> Result<()> {
     Ok(())
 }
 
-/// Run with more pool threads than collectors, across enough records to
-/// produce multiple batches. The MPMC work queue should still produce
-/// correct output; the extra workers simply block on `recv()` between
-/// batches.
+/// Run with a thread budget larger than the collector count, across enough
+/// records to produce multiple batches. With a single collector only one
+/// worker group is created regardless of the budget; the surplus threads go
+/// to BGZF decode (per `plan_multi`). Output must still match the serial path.
 #[test]
 fn test_parallel_more_threads_than_collectors() -> Result<()> {
-    // BATCH_SIZE is 256 inside multi.rs — build enough pairs to produce
-    // multiple batches so workers actually wake, compete for the mutex,
-    // and drain across multiple queue fills.
+    // BATCH_SIZE is 128 inside multi.rs — build enough pairs to produce
+    // several batches so the worker drains across multiple channel fills.
     let mut builder = SamBuilder::new();
     for i in 0..1000 {
         builder.add_pair(
@@ -603,10 +602,9 @@ fn test_parallel_more_threads_than_collectors() -> Result<()> {
     let single_prefix = single_dir.path().join("out");
     make_multi(bam.path(), &single_prefix, vec![CollectorKind::Isize]).execute(None)?;
 
-    // Parallel with --threads 4 (1 reader + 3 workers) but only 1
-    // collector — two workers are idle (blocked on the per-collector
-    // mutex) most of the time while one processes. Output must still
-    // match the serial path.
+    // Parallel with --threads 4 but only 1 collector: partition_collectors
+    // makes a single worker group, and plan_multi hands the surplus budget to
+    // BGZF decode threads. Output must still match the serial path.
     let parallel_dir = TempDir::new()?;
     let parallel_prefix = parallel_dir.path().join("out");
     make_multi(bam.path(), &parallel_prefix, vec![CollectorKind::Isize]).execute(Some(4))?;

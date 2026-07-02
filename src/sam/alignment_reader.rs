@@ -60,6 +60,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use noodles::core::Region;
+use noodles::csi::BinningIndex;
 use noodles::sam::Header;
 use noodles::{bam, sam};
 use rust_htslib::bam::Read as HtsRead;
@@ -284,28 +285,27 @@ pub struct IndexedAlignmentReader {
 
 /// Format-specific reader state for [`IndexedAlignmentReader`]. `Bam` is
 /// single-threaded noodles; `BamMt` is noodles with a multithreaded BGZF
-/// decoder plus a manually-loaded index (`decode_threads > 0`). The `Htslib`
-/// arm backs CRAM.
+/// decoder (`decode_threads > 0`). Both drive a plain `Reader` with a
+/// manually-loaded index so the index is resolved identically regardless of
+/// thread count. The `Htslib` arm backs CRAM.
+///
+/// The index is stored as `Box<dyn BinningIndex>` — `bam::bai::Index` and
+/// `csi::Index` are distinct concrete types, and `Reader::query` accepts any
+/// `BinningIndex` (including a boxed trait object, via
+/// `impl BinningIndex for Box<I>`), so one boxed value serves both.
 enum IndexedInner {
-    Bam(bam::io::IndexedReader<noodles_bgzf::io::Reader<File>>),
+    Bam {
+        reader: bam::io::Reader<noodles_bgzf::io::Reader<File>>,
+        index: Box<dyn BinningIndex>,
+    },
     // Boxed: a `Reader` over a `MultithreadedReader` is far larger than the
     // other variants (worker handles + channels), so box it to keep the enum
     // compact.
     BamMt {
         reader: Box<bam::io::Reader<noodles_bgzf::io::MultithreadedReader<File>>>,
-        index: BamIndex,
+        index: Box<dyn BinningIndex>,
     },
     Htslib(Box<rust_htslib::bam::IndexedReader>),
-}
-
-/// A loaded BAM index for the threaded noodles query path. `bam::bai::Index`
-/// and `csi::Index` are distinct concrete types (they parameterize the shared
-/// binning index differently) and `bam::io::Reader::query` takes a `Sized`
-/// `BinningIndex`, so we store whichever the file carries and dispatch on it at
-/// query time.
-enum BamIndex {
-    Bai(bam::bai::Index),
-    Csi(noodles::csi::Index),
 }
 
 impl IndexedAlignmentReader {
@@ -315,10 +315,10 @@ impl IndexedAlignmentReader {
     ///
     /// `decode_threads` is the number of BGZF/CRAM decode worker threads to
     /// run in addition to the calling thread. `0` reads single-threaded. For
-    /// BAM a non-zero count bypasses noodles' single-threaded `IndexedReader`
-    /// and drives a plain `Reader` over a `MultithreadedReader` with a
-    /// manually-loaded `.bai`/`.csi` index; for CRAM it sizes htslib's decode
-    /// pool.
+    /// BAM both counts drive a plain `Reader` (single-threaded, or over a
+    /// `MultithreadedReader`) with a manually-loaded `.bai`/`.csi` index, so
+    /// the index is resolved identically regardless of thread count; for CRAM
+    /// it sizes htslib's decode pool.
     ///
     /// # Errors
     /// Returns an error if the file or its index cannot be opened, the
@@ -330,17 +330,16 @@ impl IndexedAlignmentReader {
                 bail!("SAM files cannot be indexed; use a BAM or CRAM file: {}", path.display())
             }
             AlignmentFormat::Bam => {
-                validate_bam_index_exists(path)?;
+                let index_path = select_bam_index(path)?;
                 match NonZero::new(decode_threads) {
-                    // Default: single-threaded noodles indexed BAM.
+                    // Default: single-threaded noodles BAM with a manually
+                    // loaded index (same resolution as the threaded path).
                     None => {
-                        let mut reader = bam::io::indexed_reader::Builder::default()
-                            .build_from_path(path)
-                            .with_context(|| {
-                                format!("Failed to open indexed BAM: {}", path.display())
-                            })?;
+                        let file = File::open(path).with_context(|| open_context(path))?;
+                        let mut reader = bam::io::Reader::from(noodles_bgzf::io::Reader::new(file));
                         let header = reader.read_header().with_context(|| header_context(path))?;
-                        Ok(Self { inner: IndexedInner::Bam(reader), header })
+                        let index = load_bam_index_from(&index_path)?;
+                        Ok(Self { inner: IndexedInner::Bam { reader, index }, header })
                     }
                     // Multithreaded: drive a plain Reader over a
                     // MultithreadedReader, seeking via a separately loaded
@@ -352,7 +351,7 @@ impl IndexedAlignmentReader {
                             noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, file);
                         let mut reader = bam::io::Reader::from(mt);
                         let header = reader.read_header().with_context(|| header_context(path))?;
-                        let index = load_bam_index(path)?;
+                        let index = load_bam_index_from(&index_path)?;
                         let reader = Box::new(reader);
                         Ok(Self { inner: IndexedInner::BamMt { reader, index }, header })
                     }
@@ -413,21 +412,16 @@ impl IndexedAlignmentReader {
     {
         let header = &self.header;
         match &mut self.inner {
-            IndexedInner::Bam(reader) => {
+            IndexedInner::Bam { reader, index } => {
                 let query = reader
-                    .query(header, region)
+                    .query(header, index, region)
                     .with_context(|| format!("Failed to query BAM for region: {region}"))?;
                 drain_bam_query(query.records(), requirements, &mut f)?;
             }
             IndexedInner::BamMt { reader, index } => {
-                // Reader::query is 3-arg (index passed explicitly), unlike the
-                // single-threaded IndexedReader::query above; the two BamIndex
-                // variants are distinct concrete types so we dispatch here.
-                let query = match index {
-                    BamIndex::Bai(bai) => reader.query(header, bai, region),
-                    BamIndex::Csi(csi) => reader.query(header, csi, region),
-                }
-                .with_context(|| format!("Failed to query BAM for region: {region}"))?;
+                let query = reader
+                    .query(header, index, region)
+                    .with_context(|| format!("Failed to query BAM for region: {region}"))?;
                 drain_bam_query(query.records(), requirements, &mut f)?;
             }
             IndexedInner::Htslib(reader) => {
@@ -582,32 +576,78 @@ fn set_htslib_threads<R: HtsRead>(reader: &mut R, threads: usize, path: &Path) -
     })
 }
 
-/// Load the BAM index accompanying `path` for the threaded noodles query
-/// path, trying the same layouts [`validate_bam_index_exists`] accepts:
-/// `<file>.bai` (Picard sibling), `<file>.bam.bai` (samtools suffix), then
-/// `<file>.bam.csi`. The caller runs `validate_bam_index_exists` first, so at
-/// least one is expected to exist.
-fn load_bam_index(path: &Path) -> Result<BamIndex> {
-    let bai_sibling = path.with_extension("bai");
-    let bai_suffix = append_extension(path, ".bai");
-    let csi = append_extension(path, ".csi");
+/// The index-file layouts riker accepts for the BAM at `path`, in a fixed
+/// order: `<file>.bai` (Picard sibling), `<file>.bam.bai` (samtools suffix),
+/// `<file>.bam.csi` (large-contig). Shared by [`select_bam_index`] so
+/// selection and the "missing index" error can't drift.
+fn bam_index_candidates(path: &Path) -> [PathBuf; 3] {
+    [path.with_extension("bai"), append_extension(path, ".bai"), append_extension(path, ".csi")]
+}
 
-    if bai_sibling.exists() {
-        let index = bam::bai::fs::read(&bai_sibling)
-            .with_context(|| format!("Failed to read BAM index: {}", bai_sibling.display()))?;
-        return Ok(BamIndex::Bai(index));
+/// Choose which index to load for the BAM at `path`. When several accepted
+/// layouts are present, warn and pick the **most recently modified**, so a
+/// freshly re-indexed BAM is used even if a stale index of another form is
+/// still lying next to it. Errors (with a `samtools index` hint) if none
+/// exist — this doubles as the friendly pre-open check.
+fn select_bam_index(path: &Path) -> Result<PathBuf> {
+    let present: Vec<(PathBuf, std::time::SystemTime)> = bam_index_candidates(path)
+        .into_iter()
+        .filter_map(|candidate| {
+            std::fs::metadata(&candidate)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .map(|modified| (candidate, modified))
+        })
+        .collect();
+    pick_bam_index(path, present)
+}
+
+/// Pick the most-recently-modified index from the present `(path, mtime)`
+/// candidates, warning when there is more than one. Split from the filesystem
+/// enumeration in [`select_bam_index`] so the selection can be unit-tested with
+/// synthetic timestamps.
+fn pick_bam_index(
+    path: &Path,
+    mut present: Vec<(PathBuf, std::time::SystemTime)>,
+) -> Result<PathBuf> {
+    present.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    match present.as_slice() {
+        [] => {
+            let [sibling, suffix, csi] = bam_index_candidates(path);
+            bail!(
+                "BAM index not found. Expected one of:\n  {}\n  {}\n  {}\n\
+                 Run `samtools index {}` to create one.",
+                suffix.display(),
+                sibling.display(),
+                csi.display(),
+                path.display(),
+            )
+        }
+        [(chosen, _)] => Ok(chosen.clone()),
+        [(chosen, _), rest @ ..] => {
+            let ignored: Vec<String> = rest.iter().map(|(p, _)| p.display().to_string()).collect();
+            log::warn!(
+                "Multiple indexes present for {}; using the most recently modified ({}) \
+                 and ignoring: {}",
+                path.display(),
+                chosen.display(),
+                ignored.join(", "),
+            );
+            Ok(chosen.clone())
+        }
     }
-    if bai_suffix.exists() {
-        let index = bam::bai::fs::read(&bai_suffix)
-            .with_context(|| format!("Failed to read BAM index: {}", bai_suffix.display()))?;
-        return Ok(BamIndex::Bai(index));
+}
+
+/// Read a BAM index (`.bai` or `.csi`, distinguished by extension) from
+/// `index_path`, boxed as a trait object so both concrete types share one
+/// query path.
+fn load_bam_index_from(index_path: &Path) -> Result<Box<dyn BinningIndex>> {
+    let read_err = || format!("Failed to read BAM index: {}", index_path.display());
+    if index_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csi")) {
+        Ok(Box::new(noodles::csi::fs::read(index_path).with_context(read_err)?))
+    } else {
+        Ok(Box::new(bam::bai::fs::read(index_path).with_context(read_err)?))
     }
-    if csi.exists() {
-        let index = noodles::csi::fs::read(&csi)
-            .with_context(|| format!("Failed to read BAM index: {}", csi.display()))?;
-        return Ok(BamIndex::Csi(index));
-    }
-    bail!("BAM index not found for {}", path.display())
 }
 
 /// Drive a BAM region query's record iterator through a single reused scratch
@@ -728,7 +768,7 @@ fn parse_htslib_header(header_bytes: &[u8]) -> Result<Header> {
 
 /// Detected alignment file format based on extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AlignmentFormat {
+pub(crate) enum AlignmentFormat {
     Sam,
     GzippedSam,
     Bam,
@@ -738,7 +778,7 @@ enum AlignmentFormat {
 /// Detect the alignment format from a file extension.
 ///
 /// Recognizes `.sam`, `.sam.gz`, `.bam`, and `.cram` (case-insensitive).
-fn detect_format(path: &Path) -> Result<AlignmentFormat> {
+pub(crate) fn detect_format(path: &Path) -> Result<AlignmentFormat> {
     let ext = path.extension().and_then(|e| e.to_str());
 
     // Check for .sam.gz: extension is "gz" and the stem ends with ".sam"
@@ -763,39 +803,10 @@ fn detect_format(path: &Path) -> Result<AlignmentFormat> {
 
 /// Returns `path` with `suffix` (e.g. `".bai"`) appended after the
 /// existing extension. Used to derive index-file paths.
-fn append_extension(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn append_extension(path: &Path, suffix: &str) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(suffix);
     PathBuf::from(p)
-}
-
-/// Confirm that an index for `path` exists in one of the three layouts
-/// `samtools` writes:
-///
-/// - `<file>.bam.bai` (suffix appended) — `samtools index`'s default
-/// - `<file>.bai` (extension replaced — sibling) — Picard's default
-/// - `<file>.csi` (suffix appended) — large-contig index
-///
-/// `path.with_extension("bai")` gives the sibling form (replaces the
-/// existing `.bam` extension); `append_extension(_, ".bai")` gives the
-/// suffix form.
-fn validate_bam_index_exists(path: &Path) -> Result<()> {
-    let bai_sibling = path.with_extension("bai");
-    let bai_suffix = append_extension(path, ".bai");
-    let csi = append_extension(path, ".csi");
-
-    if bai_sibling.exists() || bai_suffix.exists() || csi.exists() {
-        return Ok(());
-    }
-
-    bail!(
-        "BAM index not found. Expected one of:\n  {}\n  {}\n  {}\n\
-         Run `samtools index {}` to create one.",
-        bai_suffix.display(),
-        bai_sibling.display(),
-        csi.display(),
-        path.display(),
-    );
 }
 
 /// Confirm that an index for the CRAM at `path` exists in either of
@@ -804,10 +815,9 @@ fn validate_bam_index_exists(path: &Path) -> Result<()> {
 /// - `<file>.cram.crai` (suffix appended) — `samtools index`'s default
 /// - `<file>.crai`      (extension replaced — sibling) — Picard's default
 ///
-/// Mirrors [`validate_bam_index_exists`]'s two-form check; htslib will
-/// happily open either, so rejecting one would surface a confusing
-/// "CRAM index not found" error for an index htslib would have used.
-/// The pre-check exists to give a friendlier error than htslib's
+/// htslib will happily open either, so rejecting one would surface a
+/// confusing "CRAM index not found" error for an index htslib would have
+/// used. The pre-check exists only to give a friendlier error than htslib's
 /// generic open failure.
 fn validate_cram_index_exists(path: &Path) -> Result<()> {
     let crai_sibling = path.with_extension("crai");
@@ -846,44 +856,58 @@ mod tests {
     }
 
     #[test]
-    fn validate_bam_index_finds_suffix_form() {
+    fn select_bam_index_finds_suffix_form() {
         // `samtools index` default: foo.bam → foo.bam.bai
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        touch(&dir.path().join("sample.bam.bai"));
-        validate_bam_index_exists(&bam).expect("should accept suffix-form .bam.bai");
+        let idx = dir.path().join("sample.bam.bai");
+        touch(&idx);
+        assert_eq!(select_bam_index(&bam).expect("should accept suffix-form .bam.bai"), idx);
     }
 
     #[test]
-    fn validate_bam_index_finds_sibling_form() {
+    fn select_bam_index_finds_sibling_form() {
         // Picard default: foo.bam → foo.bai
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        touch(&dir.path().join("sample.bai"));
-        validate_bam_index_exists(&bam).expect("should accept sibling-form .bai");
+        let idx = dir.path().join("sample.bai");
+        touch(&idx);
+        assert_eq!(select_bam_index(&bam).expect("should accept sibling-form .bai"), idx);
     }
 
     #[test]
-    fn validate_bam_index_finds_csi() {
+    fn select_bam_index_finds_csi() {
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        touch(&dir.path().join("sample.bam.csi"));
-        validate_bam_index_exists(&bam).expect("should accept .csi");
+        let idx = dir.path().join("sample.bam.csi");
+        touch(&idx);
+        assert_eq!(select_bam_index(&bam).expect("should accept .csi"), idx);
     }
 
     #[test]
-    fn validate_bam_index_missing_errors() {
+    fn select_bam_index_missing_errors() {
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        let err = validate_bam_index_exists(&bam).expect_err("missing index should fail");
+        let err = select_bam_index(&bam).expect_err("missing index should fail");
         let msg = err.to_string();
         assert!(msg.contains("BAM index not found"), "unexpected error: {msg}");
         assert!(msg.contains("sample.bam.bai"), "should mention suffix form: {msg}");
         assert!(msg.contains("sample.bai"), "should mention sibling form: {msg}");
+    }
+
+    #[test]
+    fn pick_bam_index_prefers_most_recently_modified() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let bam = Path::new("/data/sample.bam");
+        let older = (bam.with_extension("bai"), UNIX_EPOCH + Duration::from_secs(100));
+        let newer = (append_extension(bam, ".bai"), UNIX_EPOCH + Duration::from_secs(200));
+        // Insertion order must not matter; the newer mtime always wins.
+        assert_eq!(pick_bam_index(bam, vec![older.clone(), newer.clone()]).unwrap(), newer.0);
+        assert_eq!(pick_bam_index(bam, vec![newer.clone(), older.clone()]).unwrap(), newer.0);
     }
 
     #[test]
