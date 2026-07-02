@@ -475,18 +475,6 @@ impl BamRec {
         Ok(n)
     }
 
-    /// Replace the inner `bam::Record` with the supplied one and refresh
-    /// the cached scalars. Useful when the record is produced by a higher-
-    /// level iterator (e.g. `bam::io::indexed_reader::Reader::query`) that
-    /// already yields owned `bam::Record` values.
-    ///
-    /// # Errors
-    /// Returns an error if the record's scalars can't be validated.
-    pub(crate) fn install(&mut self, record: bam::Record) -> Result<()> {
-        self.inner = record;
-        self.refresh_cache()
-    }
-
     /// Decode the sequence bases into `self.sequence_buf` using the SIMD
     /// nibble decoder.
     pub(crate) fn decode_sequence(&mut self) {

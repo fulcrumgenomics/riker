@@ -412,11 +412,8 @@ fn bam_records_identical_across_decode_thread_counts() -> Result<()> {
     Ok(())
 }
 
-/// Indexed BAM region queries must return byte-identical records whether the
-/// reader decodes single-threaded or multithreaded. Both drive a plain
-/// `Reader` over a manually-loaded index (single-threaded, or over a
-/// `MultithreadedReader`), so this also guards that the two paths resolve the
-/// same index.
+/// Indexed BAM region queries must return byte-identical records whether
+/// htslib's decode pool is sized to 0 (single-threaded) or several threads.
 #[test]
 fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
     let mut builder = coord_builder(&[("chr1", 2_000)]);
@@ -445,10 +442,9 @@ fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
     Ok(())
 }
 
-/// A `.csi`-indexed BAM (no `.bai` present) must query correctly through both
-/// the single-threaded and multithreaded paths, exercising `load_bam_index`'s
-/// CSI branch — which resolves and boxes a `csi::Index` rather than a
-/// `bai::Index`.
+/// A `.csi`-indexed BAM (no `.bai` present) must query correctly — the `.csi`
+/// selected by [`select_bam_index`] is handed to htslib, which reads it — at
+/// both a zero and non-zero decode-thread count.
 #[test]
 fn indexed_bam_query_works_with_csi_index() -> Result<()> {
     let mut builder = coord_builder(&[("chr1", 2_000)]);
