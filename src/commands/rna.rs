@@ -2206,14 +2206,23 @@ fn encloses_inclusive(outer_start: u32, outer_end: u32, inner_start: u32, inner_
 
 /// Number of read bases in `blocks` that overlap the transcript's exons (1-based inclusive).
 /// Ported from fgbio `numReadBasesOverlappingTranscript`.
+///
+/// Exons are sorted by start and disjoint, so for each block we binary-search the first exon
+/// that can overlap and scan only until an exon starts past the block — an O(blocks + exons)
+/// merge-walk rather than the full O(blocks × exons) product (mirrors `overlap_with_intervals`).
 fn bases_overlapping_exons(blocks: &[(u32, u32)], exons: &[crate::gene_model::Exon]) -> u32 {
-    blocks
-        .iter()
-        .flat_map(|&(start, len)| {
-            let block_end = start + len - 1;
-            exons.iter().map(move |e| overlap_inclusive(start, block_end, e.start, e.end))
-        })
-        .sum()
+    let mut total = 0;
+    for &(start, len) in blocks {
+        let block_end = start + len - 1;
+        let first = exons.partition_point(|e| e.end < start);
+        for e in &exons[first..] {
+            if e.start > block_end {
+                break;
+            }
+            total += block_end.min(e.end) - start.max(e.start) + 1;
+        }
+    }
+    total
 }
 
 /// True if the 1-based position lies within any exon (1-based inclusive) of the slice.
