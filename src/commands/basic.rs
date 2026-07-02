@@ -79,6 +79,7 @@ impl Command for Basic {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output files cannot be written.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
+        super::common::validate_output_prefix(&self.output.output)?;
         let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,

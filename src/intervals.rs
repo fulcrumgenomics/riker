@@ -236,30 +236,34 @@ impl Intervals {
     }
 }
 
-/// Read the contents of a file as a UTF-8 string, transparently decompressing
-/// gzip/bgzip files detected by magic bytes.
-fn read_file_contents(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open interval file: {}", path.display()))?;
+/// Read the contents of a text file as a UTF-8 string, transparently decompressing
+/// gzip/bgzip files detected by their magic bytes. Shared by the interval and gene-model
+/// readers so the detection/decompression logic lives in one place.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened, read, or decompressed.
+pub(crate) fn read_file_contents(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 
     let mut magic = [0u8; 2];
     let bytes_read = file
         .read(&mut magic)
-        .with_context(|| format!("Failed to read interval file: {}", path.display()))?;
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
     // Reopen the file so the reader starts from the beginning.
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open interval file: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 
     let mut content = String::new();
     if bytes_read >= 2 && magic == GZIP_MAGIC {
         MultiGzDecoder::new(file)
             .read_to_string(&mut content)
-            .with_context(|| format!("Failed to decompress interval file: {}", path.display()))?;
+            .with_context(|| format!("Failed to decompress file: {}", path.display()))?;
     } else {
         std::io::BufReader::new(file)
             .read_to_string(&mut content)
-            .with_context(|| format!("Failed to read interval file: {}", path.display()))?;
+            .with_context(|| format!("Failed to read file: {}", path.display()))?;
     }
 
     Ok(content)

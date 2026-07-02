@@ -8,6 +8,7 @@ pub mod collector;
 pub mod commands;
 pub mod counter;
 pub mod fasta;
+pub mod gene_model;
 pub mod intervals;
 pub mod math;
 pub mod metrics;

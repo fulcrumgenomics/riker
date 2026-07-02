@@ -249,6 +249,8 @@ fn validate_fasta_index(ref_path: &Path) -> Result<()> {
 impl Command for Error {
     #[expect(clippy::cast_possible_truncation, reason = "contig lengths fit in u32")]
     fn execute(&self, threads: Option<u8>) -> Result<()> {
+        super::common::validate_output_prefix(&self.output.output)?;
+        // Upfront validation
         let ref_path = &self.options.reference;
         validate_fasta_index(ref_path)?;
 

@@ -83,6 +83,7 @@ fn make_multi(
         gcbias_opts,
         alignment_opts,
         error_opts,
+        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
     }
 }
 
@@ -106,6 +107,7 @@ fn make_multi_with_ref(
         gcbias_opts,
         alignment_opts,
         error_opts,
+        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
     }
 }
 
@@ -721,6 +723,7 @@ fn test_hybcap_via_multi() -> Result<()> {
         gcbias_opts,
         alignment_opts,
         error_opts,
+        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
     };
     multi.execute(None)?;
 

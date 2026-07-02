@@ -167,6 +167,7 @@ cargo build --release
 | `wgs` | Collect whole-genome coverage metrics | `picard CollectWgsMetrics` |
 | `gcbias` | Collect GC bias metrics | `picard CollectGcBiasMetrics` |
 | `hybcap` | Collect hybrid capture (bait/target) metrics | `picard CollectHsMetrics` |
+| `rna` | Collect RNA-seq metrics (read origin, base composition, gene detection, splice junctions, strand, coverage bias, transcript integrity, transcript-space insert size) | `picard CollectRnaSeqMetrics`, `fgbio EstimateRnaSeqInsertSize`, RSeQC, RNA-SeQC, Qualimap |
 | `multi` | Run multiple collectors in a single BAM pass | `picard CollectMultipleMetrics` |
 | `docs` | Print metric field documentation | -- |
 
@@ -227,6 +228,14 @@ riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed
 
 The input BAM must be coordinate-sorted.
 
+Collect RNA-seq metrics (the gene-model format — UCSC refFlat, GTF, or GFF3 — is auto-detected):
+
+```bash
+riker rna -i sample.bam -o out_prefix --gene-model gencode.gtf.gz
+riker rna -i sample.bam -o out_prefix --gene-model refFlat.txt.gz --ribosomal-intervals rRNA.interval_list
+riker rna -i sample.bam -o out_prefix --gene-model genes.gff3.gz --strand reverse
+```
+
 Run multiple collectors in a single pass:
 
 ```bash
@@ -277,161 +286,17 @@ Riker produces PDF plots using [kuva](https://github.com/Psy-Fer/kuva), and plai
 
 To see detailed documentation on the columns output in each file type run `riker docs`.
 
-## Key Differences vs. Picard
-
-Riker aims to produce metrics identical to Picard's equivalent tools. This section documents where there are known and expected functional differences in Riker vs. Picard.
-
-### Differences in alignment vs. CollectAlignmentSummaryMetrics
-
-#### `mean_aligned_read_length`
-
-**Picard** computes mean aligned read length over all PF reads, including unmapped reads which contribute zero to the sum. The denominator is `PF_READS`, so unmapped reads dilute the average toward zero.
-
-**riker** uses `aligned_reads` as the denominator, giving the mean length of reads that actually aligned.
-
-**Impact:** riker produces slightly higher values than Picard — typically ~0-2bp for WGS data with high alignment rates. The difference grows with the fraction of unmapped reads.
-
-#### `reads_improperly_paired` / `frac_reads_improperly_paired`
-
-**Picard** counts all mapped, paired, non-proper reads as improperly paired, including reads whose mate is unmapped (no `is_mate_unmapped()` guard).
-
-**riker** requires the mate to also be mapped before counting a read toward `aligned_reads_in_pairs` or `reads_improperly_paired`. This avoids inflating the improper-pair count with reads whose mate simply failed to align.
-
-**Impact:** riker reports fewer improperly paired reads than Picard. On typical WGS data the difference is usually small, in the single digit percent range. `aligned_reads_in_pairs` and `frac_reads_improperly_paired` are also affected.
-
-### Differences in hybcap vs. CollectHsMetrics.
-
-#### `frac_exc_overlap` (Picard: `PCT_EXC_OVERLAP`)
-
-riker reports a slightly lower `frac_exc_overlap` than Picard — typically below 1% relative difference (e.g. 0.032542 vs 0.032646 on a 1000G exome dataset).
-
-**Cause:** Picard's overlap-clipping function (`SAMUtils.getNumOverlappingAlignedBasesToClip()` in htsjdk) does not verify that the read and its mate are mapped to the same contig before computing the overlap. It compares `getMateAlignmentStart()` against `getAlignmentStart()` as raw integers regardless of reference sequence. For chimeric read pairs — where one end maps to a different chromosome — Picard may compute a spurious overlap when the mate's coordinate on a different contig happens to be within the range of the reads aligned coordinates.  See https://github.com/broadinstitute/picard/issues/2039.
-
-riker's equivalent function checks `reference_sequence_id != mate_reference_sequence_id` and returns 0 for chimeric pairs, correctly skipping overlap clipping when the reads are on different contigs.
-
-**Impact:** `frac_exc_overlap` and `frac_exc_off_target` are affected; the latter because bases now correctly *not* categorized as overlapping are usually excluded subsequently for being off-target. The magnitude depends on the fraction of chimeric read pairs in the data, but is usually very small. 
-
-#### Per-target GC content and GC dropout
-
-riker and Picard compute per-target GC fraction differently when a target's reference sequence contains ambiguous (N) bases.
-
-**Picard** counts N bases in the denominator but not the numerator: `gc_fraction = (G + C) / (A + T + G + C + N)`. This dilutes the GC fraction toward zero in proportion to the number of N bases in the target.
-
-**riker** treats N bases as maximally uncertain, contributing 0.5 to the GC numerator and 1.0 to the denominator: `gc_fraction = (G + C + 0.5 * N) / (A + T + G + C + N)`. A target that is entirely N bases reports a GC fraction of 0.5 (maximum uncertainty) rather than 0.0.
-
-Neither approach is fully correct — the true GC content of N bases is unknown — but riker's treatment avoids the bias toward low GC that Picard introduces. In practice the difference is only visible for targets where N bases make up a meaningful fraction of the reference sequence.
-
-**Impact:** Per-target GC values can differ for N-containing targets, which in turn affects the GC bias curve and the `at_dropout` and `gc_dropout` summary metrics. All other per-target and summary metrics are unaffected.
-
-### Differences in gcbias vs. CollectGcBiasMetrics
-
-#### Summary metrics schema and read accounting
-
-riker reworks the summary schema to make read accounting explicit and auditable. Picard's `GcBiasSummaryMetrics` exposes `ACCUMULATION_LEVEL`, `READS_USED`, `WINDOW_SIZE`, `TOTAL_CLUSTERS`, `ALIGNED_READS`, `AT_DROPOUT`, `GC_DROPOUT`, and `GC_NC_0_19 … GC_NC_80_100`, with `SAMPLE`/`LIBRARY`/`READ_GROUP` columns.
-
-**Dropped fields.** riker emits a single summary row for the whole file, so `ACCUMULATION_LEVEL`, `LIBRARY`, and `READ_GROUP` are omitted (consistent with riker's no-per-read-group convention). `READS_USED` is also dropped: where Picard emits *two* rows — `READS_USED=ALL` and `READS_USED=UNIQUE` — when handling duplicates, riker selects duplicate inclusion with `--exclude-duplicates` and emits one row.
-
-**Added fields.** riker adds an explicit read-accounting funnel:
-
-- `total_reads` — every record except secondary and QC-fail (includes unmapped, duplicate, supplementary, and low-MAPQ reads).
-- `aligned_reads` — the mapped subset of `total_reads`.
-- `filtered_reads` — aligned reads not used in the GC computation (excluded as duplicate/supplementary, low MAPQ, in an excluded interval, or lacking a valid GC window), derived as `aligned_reads` minus the total binned read starts.
-- `frac_filtered_reads` — `filtered_reads / aligned_reads`.
-
-So `total_reads ≥ aligned_reads ≥ (aligned_reads − filtered_reads)`, the last being the reads actually binned. Note Picard's `ALIGNED_READS` in its `UNIQUE` row *excludes* duplicates, whereas riker's `aligned_reads` always counts all mapped reads and reports the excluded portion via `filtered_reads`.
-
-**Renames** follow riker's global conventions: `GC_NC_x_y` → `gc_x_y_normcov`, and lowercase `frac_`-prefixed headers throughout.
-
-#### Read filtering
-
-**Picard** processes every record (`SinglePassSamProgram` applies no record filter), so `TOTAL_CLUSTERS` and `ALIGNED_READS` include secondary, supplementary, and QC-fail reads.
-
-**riker** discards secondary and QC-fail records entirely (counted nowhere), which avoids double-counting molecules represented by secondary alignments. Supplementary reads are included by default — they are real molecules — but can be dropped from the GC bins with `--exclude-supplementary`. Both tools count unmapped reads toward `total_clusters`/`TOTAL_CLUSTERS`, so riker matches Picard there.
-
-**Impact:** for files containing secondary or QC-fail reads, riker's `total_clusters` and `aligned_reads` are lower than Picard's by the count of those reads.
-
-#### Read-to-window GC binning (forward-strand offset)
-
-Both tools precompute, for every reference position, the %GC of the window starting there, then assign each read to a single %GC bin using the window at one computed position: the alignment start for forward-strand reads, and `alignment_end − window_size` for reverse-strand reads.
-
-Picard stores these per-window GC values in a 0-based array (`gc[i]` is the window covering reference bases `[i, i + windowSize)`) but, for forward reads, indexes it with `SAMRecord.getAlignmentStart()`, which is **1-based**. A forward read therefore lands on `gc[start]` — the window beginning one base 3′ of the read's actual leftmost aligned base. Reverse reads use `getAlignmentEnd() − scanWindowSize`, which resolves to the intended window, so they are unaffected.
-
-riker converts the alignment start to 0-based before indexing, so a forward read is binned by the window anchored exactly at its leftmost aligned base. riker's reverse-strand handling matches Picard's.
-
-**Impact:** forward-strand reads are binned by windows that sit one base apart between the two tools; reverse-strand reads agree. This affects every forward read — not only N-containing or flagged regions — so it is the one difference present even with default flags and an N-free reference. Near a local GC transition a read can fall into an adjacent integer %GC bin, producing a small, systematic shift in the detail GC curve and in the `at_dropout` / `gc_dropout` and normalized-coverage values derived from it.
-
-#### `--min-mapq` and `--exclude-intervals` (vs. Picard PR #2030)
-
-riker supports a `--min-mapq` threshold and an `--exclude-intervals` mask (BED or IntervalList) for skipping artifact regions such as poly-G stretches and adapter constructs. Released Picard's `CollectGcBiasMetrics` has neither; both correspond to the unreleased Picard PR [#2030](https://github.com/broadinstitute/picard/pull/2030), with two deliberate improvements over that PR:
-
-- **Exclusion fixes the denominator.** The PR removes excluded reads from the numerator but leaves the reference-window distribution (the denominator) untouched, creating a numerator/denominator asymmetry. riker drops both the read *and* the reference window at an excluded position, keeping normalization consistent.
-- **Exclusion is keyed on the read's computed start position**, not full-read overlap. This matches how reads are binned (by start position), is simpler, and lets users pad intervals when they want span semantics. (The PR uses `overlapsAny`.)
-
-Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per template**: each mate is evaluated independently, mirroring gcbias's per-read-start accounting, so one mate of a pair may be filtered while the other is still counted. riker does not drop a pair as a unit when only one mate fails a filter; widen the intervals to cover both mates, or pre-filter the BAM, if you need pair-level semantics.
-
-**Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema, read-filtering, and forward-strand binning differences above).
-
-### Differences in error vs. CollectSamErrorMetrics
-
-#### Reference N bases
-
-**Picard** counts bases at reference-N positions toward `TOTAL_BASES` (and may count them as errors since the read base does not match N).
-
-**riker** skips positions where the reference base is N, since errors cannot be meaningfully assessed without a known reference base.
-
-**Impact:** riker reports slightly fewer `total_bases` and `error_bases` than Picard. The difference is proportional to the number of reference-N positions covered by reads — typically negligible for well-assembled references.
-
-#### Mismatch `total_bases` includes insertion bases in Picard
-
-**Picard's** mismatch metric (`ERROR`) includes insertion bases in `TOTAL_BASES`. This happens because `BaseErrorCalculator.addBase()` increments `nBases` for both aligned (Match) bases and insertion bases, and `SimpleErrorCalculator` inherits this count as the denominator.
-
-**riker** counts only aligned bases in the mismatch `total_bases`. Insertion bases are counted separately in the indel metric.
-
-**Impact:** Picard's mismatch `TOTAL_BASES` is higher than riker's by the number of inserted bases passing filters. The mismatch `error_bases` (numerator) is identical between the two tools — only the denominator differs. riker's separation is arguably cleaner since insertion bases are not relevant to the substitution error rate.
-
-#### Insert size stratification
-
-**Picard** caps insert size at `readLength * 10` for the `INSERT_LENGTH` stratifier. Reads with larger absolute insert sizes (e.g., chimeric pairs) are binned at the cap value.
-
-**riker** excludes reads with absolute insert size above `--max-isize` (default 1000) from the `isize` stratifier entirely. These reads are still counted by all other stratifiers and in the `all` group. The threshold can be adjusted via `--max-isize`.
-
-**Impact:** Picard may have a large bin at the cap value containing chimeric reads, while riker omits them. Overall error rates are unaffected.
-
-#### Insertions at read start
-
-**Picard** counts insertions that occur before any aligned base in the read (e.g., CIGARs starting with `nI` or `nSnI`). The locus iterator attaches these to the preceding reference position.
-
-**riker** skips insertions that have no preceding aligned base (no anchor position), since there is no reference context for stratification.
-
-**Impact:** Picard reports slightly more insertions and inserted bases than riker. The difference is small — typically a few hundred events out of tens of thousands. Deletion counts are unaffected and match exactly between the tools.
-
-#### Q-score computation
-
-**Picard** computes Q-scores using a Bayesian prior: `Q = -10 * log10((errors + 0.001) / (total + 1))`, rounded to the nearest integer. The prior (configurable via `PRIOR_Q`, default 30) prevents infinite Q-scores when there are zero errors.
-
-**riker** computes Q-scores from the raw error rate: `Q = -10 * log10(errors / total)`, reported to two decimal places. When there are zero errors, a cap of Q99 is used.
-
-**Impact:** Q-scores differ slightly due to the prior and rounding. The underlying counts (numerator and denominator) are comparable; only the derived Q-score differs.
-
-#### Stratifiers not ported from Picard
-
-Picard's `CollectSamErrorMetrics` defines 32 stratifiers. riker ports 17 of them (`all`, `bq`, `mapq`, `cycle`, `read_num`, `strand`, `pair_orientation`, `isize`, `gc`, `read_base`, `ref_base`, `hp_len`, `pre_dinuc`, `post_dinuc`, `context_3bp`, `nm`, `indel_len`). The following Picard stratifiers are **not** available in riker:
-
-- `PAIR_PROPERNESS` — whether the read is in a proper pair
-- `HOMOPOLYMER` — the homopolymer base (A/C/G/T) at the current position
-- `BINNED_HOMOPOLYMER` — homopolymer length bucketed into bins
-- `BINNED_CYCLE` — machine cycle bucketed into bins
-- `SOFT_CLIPS` — number of soft-clipped bases in the read
-- `TWO_BASE_PADDED_CONTEXT` — 5-base context (2bp each side) (`Context3bp` is provided)
-- `CONSENSUS` — whether the read is a consensus/duplex read
-- `NS_IN_READ` — number of N bases in the read
-- `INSERTIONS_IN_READ` — number of insertion events in the read
-- `DELETIONS_IN_READ` — number of deletion events in the read
-- `INDELS_IN_READ` — number of indel events in the read
-- `FLOWCELL_TILE` — flowcell tile from the read name
-- `FLOWCELL_X` — flowcell X coordinate from the read name
-- `FLOWCELL_Y` — flowcell Y coordinate from the read name
-- `READ_GROUP` — the read group of the read
+## Differences vs. Picard and Other Tools
+
+Riker aims to reproduce the metrics of Picard — and the other tools it ports — as closely as
+possible. Where behavior intentionally differs (corrections of known bugs, or deliberate design
+choices), every difference is documented per command in **[ERRATA.md](ERRATA.md)**:
+
+- **[`alignment`](ERRATA.md#alignment)** — `mean_aligned_read_length` is over aligned (not all PF) reads; improper-pair counting requires a mapped mate.
+- **[`hybcap`](ERRATA.md#hybcap)** — chimeric-pair overlap clipping is fixed; per-target GC is N-aware.
+- **[`gcbias`](ERRATA.md#gcbias)** — explicit read-accounting schema, a forward-strand window-binning fix, and optional `--min-mapq` / `--exclude-intervals`.
+- **[`error`](ERRATA.md#error)** — reference-N positions skipped, mismatch denominator excludes insertions, raw-rate Q-scores, and 17 of Picard's 32 stratifiers ported.
+- **[`rna`](ERRATA.md#rna)** — a single-pass superset of Picard `CollectRnaSeqMetrics` + fgbio `EstimateRnaSeqInsertSize`, plus RSeQC / RNA-SeQC / Qualimap metrics (read origin, gene detection, splice junctions, transcript integrity (TIN), biotype); several Picard coverage/bias off-by-ones are corrected; coordinate-sorted input is required. Transcript-space insert size uses the `MC` (mate CIGAR) tag when present and otherwise estimates FR pairs from a spec-compliant `TLEN` (add `MC` with `samtools fixmate -m` for exact results). The biggest absolute difference from the reference tools is **TIN**, which riker reports ~14–16 points higher than RSeQC/RustQC (same shape, different scale — riker scores one well-covered transcript per gene); both track degradation equally well and riker is notably more depth-robust — see [docs/rna-integrity.md](docs/rna-integrity.md).
 
 ## Authors
 

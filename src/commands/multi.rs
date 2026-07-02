@@ -109,6 +109,7 @@ use crate::commands::error::{ErrorCollector, MultiErrorOptions};
 use crate::commands::gcbias::{GcBiasCollector, MultiGcBiasOptions};
 use crate::commands::hybcap::{HybCapCollector, MultiHybCapOptions};
 use crate::commands::isize::{InsertSizeCollector, MultiIsizeOptions};
+use crate::commands::rna::{MultiRnaOptions, RnaCollector};
 use crate::commands::wgs::{MultiWgsOptions, WgsCollector};
 use crate::fasta::Fasta;
 use crate::progress::ProgressLogger;
@@ -170,8 +171,9 @@ pub struct Multi {
     #[command(flatten)]
     pub reference: OptionalReferenceOptions,
 
-    /// Tools to run. Defaults to all except hybcap (which requires targets/baits).
-    /// The wgs and gcbias tools require --reference.
+    /// Tools to run. Defaults to alignment, basic, and isize (the tools needing no extra
+    /// inputs). The error, gcbias, and wgs tools require --reference; hybcap requires
+    /// --hybcap::targets/baits; rna requires --rna::gene-model.
     #[arg(
         long,
         num_args(1..),
@@ -191,6 +193,8 @@ pub struct Multi {
     pub hybcap_opts: MultiHybCapOptions,
     #[command(flatten)]
     pub isize_opts: MultiIsizeOptions,
+    #[command(flatten)]
+    pub rna_opts: MultiRnaOptions,
     #[command(flatten)]
     pub wgs_opts: MultiWgsOptions,
 }
@@ -271,6 +275,14 @@ impl Multi {
                         &opts,
                     )));
                 }
+                CollectorKind::Rna => {
+                    let opts = self.rna_opts.clone().validate()?;
+                    collectors.push(Box::new(RnaCollector::new(
+                        &self.input.input,
+                        &self.output.output,
+                        &opts,
+                    )));
+                }
                 CollectorKind::Wgs => {
                     let ref_path = self.reference.reference.as_ref().unwrap();
                     let reference = Fasta::from_path(ref_path)?;
@@ -292,6 +304,7 @@ impl Command for Multi {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or any collector fails.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
+        crate::commands::common::validate_output_prefix(&self.output.output)?;
         let total = resolve_threads(threads, self.default_threads());
 
         // Deduplicate the collector list while preserving order.
@@ -371,6 +384,8 @@ pub enum CollectorKind {
     HybCap,
     /// Insert size distribution metrics.
     Isize,
+    /// RNA-seq metrics (base composition, strand, coverage bias, transcript insert size).
+    Rna,
     /// Whole-genome sequencing coverage metrics.
     Wgs,
 }
@@ -384,6 +399,7 @@ impl fmt::Display for CollectorKind {
             CollectorKind::GcBias => write!(f, "gcbias"),
             CollectorKind::HybCap => write!(f, "hybcap"),
             CollectorKind::Isize => write!(f, "isize"),
+            CollectorKind::Rna => write!(f, "rna"),
             CollectorKind::Wgs => write!(f, "wgs"),
         }
     }

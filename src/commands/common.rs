@@ -1,7 +1,45 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
 
 pub const CORE_OPTIONS: &str = "Core Options";
 pub const EXTENDED_OPTIONS: &str = "Extended Options";
+
+/// Validate at startup that output files can be written for the given `-o`/`--output` prefix.
+///
+/// Commands derive every output path by appending a suffix to the prefix (see
+/// [`super::command::output_path`]), so the prefix's parent directory must exist and be
+/// writable. This is checked by creating and removing a probe file there. Calling this before
+/// the (potentially long) processing pass means an unwritable destination fails immediately
+/// rather than after the whole input has been read.
+///
+/// # Errors
+/// Returns an error if the prefix's parent directory does not exist, is not a directory, or
+/// cannot be written to.
+pub fn validate_output_prefix(prefix: &Path) -> Result<()> {
+    // `prefix.parent()` is `Some("")` for a bare filename (e.g. `out`) — treat that as the current
+    // directory — and `None` when the prefix is itself a root (`/`, `C:\`), where the directory to
+    // check is that root.
+    let dir = match prefix.parent() {
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => prefix,
+    };
+
+    let meta = std::fs::metadata(dir).with_context(|| {
+        format!("output directory '{}' does not exist or is inaccessible", dir.display())
+    })?;
+    if !meta.is_dir() {
+        bail!("output prefix parent '{}' is not a directory", dir.display());
+    }
+
+    // Permission bits alone are unreliable across platforms; probe by actually creating a file.
+    let probe = dir.join(format!(".riker-write-probe.{}", std::process::id()));
+    std::fs::File::create(&probe)
+        .with_context(|| format!("output directory '{}' is not writable", dir.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
 
 /// clap value parser that ensures a CLI argument refers to an existing,
 /// non-directory path.
@@ -69,6 +107,35 @@ pub struct OptionalReferenceOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_output_prefix_accepts_writable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Prefix is a stem inside an existing, writable directory.
+        let prefix = dir.path().join("sample");
+        assert!(validate_output_prefix(&prefix).is_ok());
+        // The probe file must not be left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "probe file should be cleaned up");
+    }
+
+    #[test]
+    fn validate_output_prefix_rejects_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("nonexistent_subdir").join("sample");
+        let err = validate_output_prefix(&prefix).unwrap_err().to_string();
+        assert!(err.contains("does not exist") || err.contains("inaccessible"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_output_prefix_rejects_file_as_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a_file");
+        std::fs::write(&file, b"x").unwrap();
+        // Using the file as if it were a directory for the prefix.
+        let prefix = file.join("sample");
+        assert!(validate_output_prefix(&prefix).is_err());
+    }
 
     #[test]
     fn parse_existing_file_accepts_regular_file() {
