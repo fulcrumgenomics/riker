@@ -102,7 +102,7 @@ fn run_error(
         },
     };
 
-    cmd.execute().expect("error command should succeed");
+    cmd.execute(None).expect("error command should succeed");
 
     // Leak the tempdir so files persist for assertions
     let path = prefix.clone();
@@ -568,7 +568,7 @@ fn run_error_with_bq(
         },
     };
 
-    cmd.execute().expect("error command should succeed");
+    cmd.execute(None).expect("error command should succeed");
     let path = prefix.clone();
     std::mem::forget(dir);
     path
@@ -1363,7 +1363,7 @@ fn test_stratifier_parse_error() {
         },
     };
 
-    let result = cmd.execute();
+    let result = cmd.execute(None);
     assert!(result.is_err(), "Expected error for invalid stratifier name");
 }
 
@@ -1681,7 +1681,7 @@ fn test_max_isize_exclusion() {
         },
     };
 
-    cmd.execute().expect("error command should succeed");
+    cmd.execute(None).expect("error command should succeed");
     let path = prefix.clone();
     std::mem::forget(dir);
 
@@ -1836,7 +1836,7 @@ fn test_cross_contig_orphan_not_processed_against_wrong_contig() {
             stratify_by: vec![],
         },
     };
-    cmd.execute().expect("error command should succeed");
+    cmd.execute(None).expect("error command should succeed");
 
     let mm: Vec<MismatchMetric> =
         read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();

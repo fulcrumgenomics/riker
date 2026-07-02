@@ -103,9 +103,13 @@ pub struct InsertSize {
 impl Command for InsertSize {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output file cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
         let mut collector =
             InsertSizeCollector::new(&self.input.input, &self.output.output, &self.options);
         let mut progress = ProgressLogger::new("isize", "reads", 5_000_000);
@@ -348,6 +352,13 @@ impl Collector for InsertSizeCollector {
 
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE
+    }
+
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~5 from a
+    /// samply worker-compute measurement on a 12x WGS BAM — insert-size
+    /// tallying is the lightest real collector.
+    fn cost_hint(&self) -> u32 {
+        5
     }
 }
 

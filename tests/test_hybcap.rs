@@ -70,7 +70,7 @@ fn opts(min_mapq: u8, min_bq: u8) -> HybCapOptions {
 
 /// Run hybcap and return the single metrics row.
 fn run_and_read(cmd: &HybCap) -> HybCapMetric {
-    cmd.execute().unwrap();
+    cmd.execute(None).unwrap();
     let metrics_path = PathBuf::from(format!("{}{METRICS_SUFFIX}", cmd.output.output.display()));
     let rows: Vec<HybCapMetric> = read_metrics_tsv(&metrics_path).unwrap();
     assert_eq!(rows.len(), 1);
@@ -848,7 +848,7 @@ fn test_per_target_coverage_output() {
     let mut options = opts(0, 0);
     options.per_target_coverage = true;
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
-    cmd.execute().unwrap();
+    cmd.execute(None).unwrap();
 
     let per_target_path = PathBuf::from(format!("{}{PER_TARGET_SUFFIX}", prefix.display()));
     let rows: Vec<PerTargetCoverage> = read_metrics_tsv(&per_target_path).unwrap();
@@ -895,7 +895,7 @@ fn test_per_base_coverage_output() {
     let mut options = opts(0, 0);
     options.per_base_coverage = Some(PerBaseCoverageFormat::Uncompressed);
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
-    cmd.execute().unwrap();
+    cmd.execute(None).unwrap();
 
     let per_base_path = PathBuf::from(format!("{}{PER_BASE_SUFFIX}", prefix.display()));
     let rows: Vec<PerBaseCoverage> = read_metrics_tsv(&per_base_path).unwrap();
@@ -943,7 +943,7 @@ fn test_per_base_coverage_output_compressed() {
     let mut options = opts(0, 0);
     options.per_base_coverage = Some(PerBaseCoverageFormat::Compressed);
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
-    cmd.execute().unwrap();
+    cmd.execute(None).unwrap();
 
     // The plain-text variant must not exist when compressed output is selected.
     let plain_path = PathBuf::from(format!("{}{PER_BASE_SUFFIX}", prefix.display()));
@@ -1915,7 +1915,7 @@ fn test_per_target_coordinates_are_one_based() {
     let mut options = opts(0, 0);
     options.per_target_coverage = true;
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
-    cmd.execute().unwrap();
+    cmd.execute(None).unwrap();
 
     let per_target_path = PathBuf::from(format!("{}{PER_TARGET_SUFFIX}", prefix.display()));
     let rows: Vec<PerTargetCoverage> = read_metrics_tsv(&per_target_path).unwrap();

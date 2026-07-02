@@ -50,6 +50,20 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    /// Number of cores riker should try to saturate.
+    ///
+    /// A whole-toolkit budget; riker may run a few more threads internally (e.g.
+    /// a dispatch thread) to keep those cores busy. Each command divides it
+    /// between decoding the input and its own work. Unset (the default) runs the
+    /// individual tools single-threaded; `multi` uses a small default pool.
+    ///
+    /// Gains are sub-linear and format-dependent — CRAM decode scales further
+    /// than BAM. As a rough guide the returns flatten past ~6 for BAM and ~8 for
+    /// CRAM, but the sweet spot is platform- and input-dependent, and
+    /// over-supplying threads can slow a run down; measure on your own data.
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
+    threads: Option<u8>,
+
     #[command(subcommand)]
     command: Subcommand,
 }
@@ -69,17 +83,17 @@ enum Subcommand {
 }
 
 impl Command for Subcommand {
-    fn execute(&self) -> Result<()> {
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
         match self {
-            Subcommand::Alignment(c) => c.execute(),
-            Subcommand::Basic(c) => c.execute(),
-            Subcommand::Docs(c) => c.execute(),
-            Subcommand::Error(c) => c.execute(),
-            Subcommand::Gcbias(c) => c.execute(),
-            Subcommand::Hybcap(c) => c.execute(),
-            Subcommand::Isize(c) => c.execute(),
-            Subcommand::Multi(c) => c.execute(),
-            Subcommand::Wgs(c) => c.execute(),
+            Subcommand::Alignment(c) => c.execute(threads),
+            Subcommand::Basic(c) => c.execute(threads),
+            Subcommand::Docs(c) => c.execute(threads),
+            Subcommand::Error(c) => c.execute(threads),
+            Subcommand::Gcbias(c) => c.execute(threads),
+            Subcommand::Hybcap(c) => c.execute(threads),
+            Subcommand::Isize(c) => c.execute(threads),
+            Subcommand::Multi(c) => c.execute(threads),
+            Subcommand::Wgs(c) => c.execute(threads),
         }
     }
 }
@@ -100,7 +114,7 @@ fn main() -> Result<()> {
     log::info!("Executing: {cmdline}");
 
     let start = Instant::now();
-    let result = cli.command.execute();
+    let result = cli.command.execute(cli.threads);
     let elapsed = start.elapsed();
     let minutes = elapsed.as_secs() / 60;
     let seconds = elapsed.as_secs() % 60;

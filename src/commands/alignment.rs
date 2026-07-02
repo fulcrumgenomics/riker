@@ -86,9 +86,13 @@ pub struct Alignment {
 impl Command for Alignment {
     /// # Errors
     /// Returns an error if the BAM cannot be read or the output cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
 
         let mut collector = AlignmentCollector::new(
             &self.input.input,
@@ -216,6 +220,12 @@ impl Collector for AlignmentCollector {
             // never read its content. Presence-only skips the per-record
             // `String(Vec<u8>)` allocation.
             .with_aux_tag_presence(*b"SA")
+    }
+
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~55 from
+    /// a samply worker-compute measurement on a 12x WGS BAM.
+    fn cost_hint(&self) -> u32 {
+        55
     }
 }
 

@@ -72,9 +72,10 @@ live in `src/metrics.rs`.
 
 ### Shared CLI Options
 
-Reusable option groups in `src/commands/common.rs` (`InputBamOptions`,
-`ReferenceOptions`, `OptionalReferenceOptions`, `IntervalOptions`,
-`DuplicateOptions`) are composed into commands via `#[command(flatten)]`.
+Reusable option groups in `src/commands/common.rs` (`InputOptions`,
+`OutputOptions`, `ReferenceOptions`, `OptionalReferenceOptions`) are composed
+into commands via `#[command(flatten)]`. Interval and duplicate-handling flags
+are declared per-command.
 
 ## Adding a New Command
 
@@ -163,25 +164,29 @@ impl Collector for MyCollector {
 }
 ```
 
-**`Command` impl** — the standalone execution path. Use `for_each_record` to
-iterate records with buffer reuse (avoids per-record allocation for BAM/SAM):
+**`Command` impl** — the standalone execution path. `thread_plan` splits the
+`--threads` budget; `AlignmentReader::open` takes the decode-thread share;
+`drive_collector_single_threaded` runs the collector's full
+`initialize`/`accept`/`finish` lifecycle over the reader:
 
 ```rust
 impl Command for MyCommand {
-    fn execute(&self) -> Result<()> {
-        let (mut reader, header) = AlignmentReader::new(&self.input.input, ...)?;
-        let mut collector = MyCollector::new(&self.output, &self.options);
-        collector.initialize(&header)?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
+        let mut collector = MyCollector::new(&self.output.output, &self.options);
         let mut progress = ProgressLogger::new("<name>", "reads", 5_000_000);
-        reader.for_each_record(&header, |record| {
-            progress.record_with(record, &header);
-            collector.accept(record, &header)
-        })?;
-        progress.finish();
-        collector.finish()
+        drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
     }
 }
 ```
+
+(To parallelize the command's own work when run singly, override
+`thread_plan` to claim `compute_workers` and handle the plan in `execute`.)
 
 ### 2. Register the command
 
@@ -192,7 +197,7 @@ impl Command for MyCommand {
   ```
 - Add a match arm in `impl Command for Subcommand::execute()`:
   ```rust
-  Subcommand::MyCmd(c) => c.execute(),
+  Subcommand::MyCmd(c) => c.execute(threads),
   ```
 
 ### 3. Integrate with the multi command
@@ -373,6 +378,26 @@ style your files use.
   cargo-flamegraph to identify actual hot paths
 - Verify correctness after any optimization (diff outputs against a baseline and
   run the full test suite)
+
+### The `multi` channels (kanal) and their soundness invariant
+
+`multi`'s reader→worker channels use [kanal](https://crates.io/crates/kanal)
+rather than crossbeam-channel: benchmarked ~4% faster wall-clock on a 12x WGS
+BAM at `--threads 6`, from kanal eliding the `unpark()` syscall when the
+receiver is still spinning (crossbeam wakes it unconditionally). kanal is
+**hard-pinned** (`kanal = "=0.1.1"`) with `default-features = false` (the async
+feature is unused, carries more unsafe, and is not vetted).
+
+kanal's speed comes from internal `unsafe` (raw-pointer payload encoding), so
+its soundness is a maintained invariant, not a one-time check. Version 0.1.1
+was vetted with Miri — the sync test suite plus a test mirroring `multi`'s exact
+usage (bounded channels of `Arc` batches + an unbounded recycle pool whose
+sender is cloned into each batch and sent back on `Drop`) — clean under both
+Stacked Borrows and Tree Borrows, and across 64 schedules (`-Zmiri-many-seeds`)
+with the data-race detector on. **Re-run that check before accepting any kanal
+bump.** A full `cargo miri test` on riker is not possible (htslib's C FFI can't
+run under Miri), so vet kanal standalone: check out the pinned version and run
+`cargo +nightly miri test` on its sync tests plus the usage-mirroring test.
 
 ## Releasing
 

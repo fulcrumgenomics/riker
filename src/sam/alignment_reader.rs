@@ -4,15 +4,16 @@
 //!
 //! ## Two types, not one
 //!
-//! Originally these were a single enum with an indexed/sequential
-//! variant per format. That broke down on the parallel reader path:
-//! noodles' `bam::io::IndexedReader` stores its index as
-//! `Box<dyn BinningIndex>`, which is not `Send`, so a single enum that
-//! could ever hold an indexed variant cannot be sent to a worker thread
-//! via `std::thread::scope::spawn`. Splitting keeps
-//! [`AlignmentReader`] unconditionally `Send` for the parallel pipeline
-//! while still letting [`IndexedAlignmentReader`] expose region queries
-//! to standalone callers (currently just `error`).
+//! [`AlignmentReader`] streams front-to-back; [`IndexedAlignmentReader`]
+//! answers region queries against an index. They stay separate types because
+//! the two access patterns want different backends. Sequential BAM is fastest
+//! through noodles (see below), but *indexed* access wants a persistent decode
+//! thread pool that survives seeks — which htslib provides and noodles'
+//! streaming `MultithreadedReader` does not (it joins and respawns its threads
+//! on every seek, which collapses under a many-small-region `--intervals`
+//! workload). So [`IndexedAlignmentReader`] reads both BAM and CRAM through
+//! htslib, and is reserved for the standalone callers that need queries
+//! (currently just `error`).
 //!
 //! ## Reading paths
 //!
@@ -35,19 +36,26 @@
 //! decoders run; on SAM noodles decodes eagerly so requirements are
 //! informational.
 //!
-//! ## CRAM via rust-htslib
+//! ## BAM via noodles; CRAM via rust-htslib
 //!
-//! CRAM reads go through `rust-htslib` rather than `noodles-cram`:
-//! benchmarks on a 3.1 GB exome CRAM showed htslib decoding ~3.8× faster
-//! than noodles-cram (1.05M vs 273k records/s). htslib also handles `.crai`
-//! indexing natively. SAM and BAM remain on noodles unchanged.
+//! BAM reads through noodles. With `decode_threads == 0` it uses a
+//! single-threaded BGZF reader (the default, lowest RSS); with a non-zero
+//! count it engages `noodles-bgzf`'s `MultithreadedReader` for parallel BGZF
+//! decompression at no meaningful RSS cost.
 //!
-//! htslib's textual SAM header is parsed into a `noodles::sam::Header` at
-//! open time so every collector and helper sees the same `Header` type
+//! CRAM reads through `rust-htslib` rather than `noodles-cram`: benchmarks on
+//! a 3.1 GB exome CRAM showed htslib decoding ~3.8× faster than noodles-cram
+//! (1.05M vs 273k records/s). htslib also handles `.crai` indexing natively.
+//! `decode_threads` sizes htslib's decode pool. SAM always stays on noodles
+//! single-threaded and ignores `decode_threads`.
+//!
+//! htslib's textual SAM header (CRAM) is parsed into a `noodles::sam::Header`
+//! at open time so every collector and helper sees the same `Header` type
 //! regardless of format.
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -81,16 +89,18 @@ pub struct AlignmentReader {
     header: Header,
 }
 
-/// Format-specific reader state for [`AlignmentReader`]. One variant per
-/// supported sequential format. The CRAM arm is `Box`-ed because
-/// `rust_htslib::bam::Reader` is large (a few hundred bytes of fields,
-/// dwarfing the noodles BAM/SAM readers); boxing keeps the enum small
-/// and avoids per-record copies during reader-handle moves.
+/// Format-specific reader state for [`AlignmentReader`]. `Bam` is
+/// single-threaded noodles; `BamMt` is noodles with a multithreaded BGZF
+/// decoder (`decode_threads > 0`). The `Htslib` arm backs CRAM; it is
+/// `Box`-ed because `rust_htslib::bam::Reader` is large (a few hundred bytes
+/// of fields, dwarfing the noodles BAM/SAM readers) and boxing keeps the enum
+/// small and avoids per-record copies during reader-handle moves.
 enum Inner {
     Sam(sam::io::Reader<BufReader<File>>),
     GzippedSam(Box<sam::io::Reader<BufReader<MultiGzDecoder<File>>>>),
     Bam(bam::io::Reader<noodles_bgzf::io::Reader<BufReader<File>>>),
-    Cram(Box<rust_htslib::bam::Reader>),
+    BamMt(bam::io::Reader<noodles_bgzf::io::MultithreadedReader<BufReader<File>>>),
+    Htslib(Box<rust_htslib::bam::Reader>),
 }
 
 impl AlignmentReader {
@@ -98,10 +108,16 @@ impl AlignmentReader {
     /// extension (`.sam`, `.sam.gz`, `.bam`, `.cram`). A reference FASTA
     /// is required for CRAM and ignored for the others.
     ///
+    /// `decode_threads` is the number of BGZF/CRAM decode worker threads to
+    /// run *in addition to* the calling thread (derived from `--threads` by
+    /// the command). `0` reads single-threaded (the default, lowest RSS). For
+    /// BAM, a non-zero count engages `noodles-bgzf`'s `MultithreadedReader`;
+    /// for CRAM it sizes htslib's decode pool. SAM ignores it.
+    ///
     /// # Errors
     /// Returns an error if the file cannot be opened, the header cannot
     /// be read, or a CRAM file is opened without a reference.
-    pub fn open(path: &Path, reference: Option<&Path>) -> Result<Self> {
+    pub fn open(path: &Path, reference: Option<&Path>, decode_threads: usize) -> Result<Self> {
         match detect_format(path)? {
             AlignmentFormat::Sam => {
                 let file = File::open(path).with_context(|| open_context(path))?;
@@ -118,10 +134,22 @@ impl AlignmentReader {
             AlignmentFormat::Bam => {
                 let file = File::open(path).with_context(|| open_context(path))?;
                 let buf = BufReader::with_capacity(BAM_READ_BUFFER_BYTES, file);
-                let bgzf_reader = noodles_bgzf::io::Reader::new(buf);
-                let mut reader = bam::io::Reader::from(bgzf_reader);
-                let header = reader.read_header().with_context(|| header_context(path))?;
-                Ok(Self { inner: Inner::Bam(reader), header })
+                match NonZero::new(decode_threads) {
+                    // Single-threaded plain BGZF reader (the default).
+                    None => {
+                        let mut reader = bam::io::Reader::from(noodles_bgzf::io::Reader::new(buf));
+                        let header = reader.read_header().with_context(|| header_context(path))?;
+                        Ok(Self { inner: Inner::Bam(reader), header })
+                    }
+                    // Parallel BGZF decompression via noodles-bgzf.
+                    Some(workers) => {
+                        let mt =
+                            noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, buf);
+                        let mut reader = bam::io::Reader::from(mt);
+                        let header = reader.read_header().with_context(|| header_context(path))?;
+                        Ok(Self { inner: Inner::BamMt(reader), header })
+                    }
+                }
             }
             AlignmentFormat::Cram => match reference {
                 Some(ref_path) => {
@@ -134,9 +162,10 @@ impl AlignmentReader {
                             path.display()
                         )
                     })?;
+                    set_htslib_threads(&mut reader, decode_threads, path)?;
                     let header = parse_htslib_header(reader.header().as_bytes())
                         .with_context(|| header_context(path))?;
-                    Ok(Self { inner: Inner::Cram(Box::new(reader)), header })
+                    Ok(Self { inner: Inner::Htslib(Box::new(reader)), header })
                 }
                 None => {
                     bail!("CRAM files require a reference FASTA (--reference): {}", path.display())
@@ -159,8 +188,8 @@ impl AlignmentReader {
     #[must_use]
     pub fn empty_record(&self) -> RikerRecord {
         match self.inner {
-            Inner::Bam(_) => RikerRecord::Bam(BamRec::new()),
-            Inner::Cram(_) => RikerRecord::Htslib(HtslibRec::new()),
+            Inner::Bam(_) | Inner::BamMt(_) => RikerRecord::Bam(BamRec::new()),
+            Inner::Htslib(_) => RikerRecord::Htslib(HtslibRec::new()),
             Inner::Sam(_) | Inner::GzippedSam(_) => RikerRecord::Fallback(FallbackRec::empty()),
         }
     }
@@ -187,17 +216,22 @@ impl AlignmentReader {
             (Inner::Bam(reader), RikerRecord::Bam(bam_rec)) => {
                 fill_bam_slot(reader, bam_rec, requirements)
             }
+            (Inner::BamMt(reader), RikerRecord::Bam(bam_rec)) => {
+                fill_bam_slot(reader, bam_rec, requirements)
+            }
             (Inner::Sam(reader), RikerRecord::Fallback(fb)) => {
                 fill_sam_slot(reader, &self.header, fb)
             }
             (Inner::GzippedSam(reader), RikerRecord::Fallback(fb)) => {
                 fill_sam_slot(reader, &self.header, fb)
             }
-            (Inner::Cram(reader), RikerRecord::Htslib(hts_rec)) => {
+            (Inner::Htslib(reader), RikerRecord::Htslib(hts_rec)) => {
                 fill_htslib_slot(reader.as_mut(), hts_rec, requirements)
             }
-            (Inner::Bam(_), _) => bail!("BAM reader requires a RikerRecord::Bam slot"),
-            (Inner::Cram(_), _) => bail!("CRAM reader requires a RikerRecord::Htslib slot"),
+            (Inner::Bam(_) | Inner::BamMt(_), _) => {
+                bail!("BAM reader requires a RikerRecord::Bam slot")
+            }
+            (Inner::Htslib(_), _) => bail!("htslib reader requires a RikerRecord::Htslib slot"),
             (Inner::Sam(_) | Inner::GzippedSam(_), _) => {
                 bail!("SAM reader requires a RikerRecord::Fallback slot")
             }
@@ -218,6 +252,7 @@ impl AlignmentReader {
         let header = &self.header;
         match &mut self.inner {
             Inner::Bam(reader) => Box::new(BamRikerRecordIter { reader, requirements }),
+            Inner::BamMt(reader) => Box::new(BamRikerRecordIter { reader, requirements }),
             Inner::Sam(reader) => Box::new(reader.record_bufs(header).map(|result| {
                 let buf = result.context("Failed to read SAM record")?;
                 Ok(RikerRecord::Fallback(FallbackRec::from_record_buf(buf)))
@@ -226,7 +261,7 @@ impl AlignmentReader {
                 let buf = result.context("Failed to read SAM record")?;
                 Ok(RikerRecord::Fallback(FallbackRec::from_record_buf(buf)))
             })),
-            Inner::Cram(reader) => {
+            Inner::Htslib(reader) => {
                 Box::new(HtslibRikerRecordIter { reader: reader.as_mut(), requirements })
             }
         }
@@ -235,70 +270,70 @@ impl AlignmentReader {
 
 // ─── IndexedAlignmentReader ─────────────────────────────────────────────────
 
-/// Indexed SAM/BAM/CRAM reader supporting region queries. Not `Send` —
-/// noodles stores the BAM index as `Box<dyn BinningIndex>`, which lacks
-/// a `Send` bound. Use [`AlignmentReader`] for sequential / parallel
-/// pipelines; this type is reserved for callers that need
-/// [`query`](Self::query) (currently just `error` standalone).
+/// Indexed BAM/CRAM reader supporting region queries, backed by htslib for
+/// both formats. htslib owns a persistent decode thread pool that is reused
+/// across every query and freed when the reader drops — unlike a
+/// per-seek-teardown streaming decoder, so it stays efficient even for the
+/// many-small-region (`--intervals`) access pattern. Not `Send`; use
+/// [`AlignmentReader`] for the sequential / parallel pipelines. This type is
+/// reserved for callers that need
+/// [`query_for_each`](Self::query_for_each) (currently just `error`
+/// standalone).
 ///
 /// Open via [`open`](Self::open). Only BAM (`.bai`/`.csi`) and CRAM
 /// (`.crai`) are supported; SAM has no widely-deployed index format.
 pub struct IndexedAlignmentReader {
-    inner: IndexedInner,
+    reader: Box<rust_htslib::bam::IndexedReader>,
     header: Header,
-}
-
-/// Format-specific reader state for [`IndexedAlignmentReader`].
-enum IndexedInner {
-    Bam(bam::io::IndexedReader<noodles_bgzf::io::Reader<File>>),
-    Cram(Box<rust_htslib::bam::IndexedReader>),
 }
 
 impl IndexedAlignmentReader {
     /// Open `path` with its index, enabling region queries via
-    /// [`query`](Self::query). A reference FASTA is required for CRAM
-    /// and ignored for BAM.
+    /// [`query_for_each`](Self::query_for_each). A reference FASTA is required
+    /// for CRAM and ignored for BAM. Both formats read through htslib.
+    ///
+    /// `decode_threads` sizes htslib's decode thread pool (in addition to the
+    /// calling thread); `0` reads single-threaded. The pool is persistent —
+    /// reused across every query rather than torn down per seek — so a large
+    /// `--intervals` panel doesn't pay repeated thread startup. For BAM the
+    /// index is chosen by [`select_bam_index`] (most-recent of the accepted
+    /// layouts) and handed to htslib explicitly.
     ///
     /// # Errors
     /// Returns an error if the file or its index cannot be opened, the
     /// format is not BAM/CRAM, or a CRAM file is opened without a
     /// reference.
-    pub fn open(path: &Path, reference: Option<&Path>) -> Result<Self> {
-        match detect_format(path)? {
+    pub fn open(path: &Path, reference: Option<&Path>, decode_threads: usize) -> Result<Self> {
+        let mut reader = match detect_format(path)? {
             AlignmentFormat::Sam | AlignmentFormat::GzippedSam => {
                 bail!("SAM files cannot be indexed; use a BAM or CRAM file: {}", path.display())
             }
             AlignmentFormat::Bam => {
-                validate_bam_index_exists(path)?;
-                let mut reader = bam::io::indexed_reader::Builder::default()
-                    .build_from_path(path)
-                    .with_context(|| format!("Failed to open indexed BAM: {}", path.display()))?;
-                let header = reader.read_header().with_context(|| header_context(path))?;
-                Ok(Self { inner: IndexedInner::Bam(reader), header })
+                let index_path = select_bam_index(path)?;
+                rust_htslib::bam::IndexedReader::from_path_and_index(path, index_path.as_path())
+                    .with_context(|| format!("Failed to open indexed BAM: {}", path.display()))?
             }
-            AlignmentFormat::Cram => match reference {
-                Some(ref_path) => {
-                    validate_cram_index_exists(path)?;
-                    let mut reader = rust_htslib::bam::IndexedReader::from_path(path)
-                        .with_context(|| {
-                            format!("Failed to open indexed CRAM: {}", path.display())
-                        })?;
-                    reader.set_reference(ref_path).with_context(|| {
-                        format!(
-                            "Failed to set CRAM reference {} on {}",
-                            ref_path.display(),
-                            path.display()
-                        )
-                    })?;
-                    let header = parse_htslib_header(reader.header().as_bytes())
-                        .with_context(|| header_context(path))?;
-                    Ok(Self { inner: IndexedInner::Cram(Box::new(reader)), header })
-                }
-                None => {
+            AlignmentFormat::Cram => {
+                let Some(ref_path) = reference else {
                     bail!("CRAM files require a reference FASTA (--reference): {}", path.display())
-                }
-            },
-        }
+                };
+                validate_cram_index_exists(path)?;
+                let mut reader = rust_htslib::bam::IndexedReader::from_path(path)
+                    .with_context(|| format!("Failed to open indexed CRAM: {}", path.display()))?;
+                reader.set_reference(ref_path).with_context(|| {
+                    format!(
+                        "Failed to set CRAM reference {} on {}",
+                        ref_path.display(),
+                        path.display()
+                    )
+                })?;
+                reader
+            }
+        };
+        set_htslib_threads(&mut reader, decode_threads, path)?;
+        let header = parse_htslib_header(reader.header().as_bytes())
+            .with_context(|| header_context(path))?;
+        Ok(Self { reader: Box::new(reader), header })
     }
 
     /// The parsed header.
@@ -328,48 +363,22 @@ impl IndexedAlignmentReader {
     where
         F: FnMut(&RikerRecord) -> Result<()>,
     {
-        let header = &self.header;
-        match &mut self.inner {
-            IndexedInner::Bam(reader) => {
-                let query = reader
-                    .query(header, region)
-                    .with_context(|| format!("Failed to query BAM for region: {region}"))?;
-                // One scratch slot for the whole region — install the
-                // next raw record, refresh, then hand a borrow to the
-                // callback. Cigar / quality / aux Vecs in the BamRec
-                // are reused across iterations.
-                let mut record = RikerRecord::Bam(BamRec::new());
-                for result in query.records() {
-                    let raw = result.context("Failed to read BAM record during query")?;
-                    let RikerRecord::Bam(ref mut bam_rec) = record else {
-                        unreachable!("scratch was constructed as RikerRecord::Bam");
-                    };
-                    bam_rec.install(raw)?;
-                    apply_requirements(bam_rec, requirements)?;
-                    f(&record)?;
-                }
+        fetch_htslib_region(self.reader.as_mut(), region)?;
+        let mut record = RikerRecord::Htslib(HtslibRec::new());
+        // The let-else inside the loop body looks redundant (scratch is always
+        // `Htslib`), but pulling the binding outside the loop would extend the
+        // `&mut hts_rec` borrow across `f(&record)` at the bottom and conflict
+        // with the immutable borrow there. Re-binding per iteration keeps each
+        // borrow scoped tightly enough that both can coexist.
+        loop {
+            let RikerRecord::Htslib(ref mut hts_rec) = record else {
+                unreachable!("scratch was constructed as RikerRecord::Htslib");
+            };
+            if !hts_rec.read_from(self.reader.as_mut())? {
+                break;
             }
-            IndexedInner::Cram(reader) => {
-                fetch_htslib_region(reader.as_mut(), region)?;
-                let mut record = RikerRecord::Htslib(HtslibRec::new());
-                // The let-else inside the loop body looks redundant
-                // (scratch is always `Htslib`), but pulling the binding
-                // outside the loop would extend the `&mut hts_rec`
-                // borrow across `f(&record)` at the bottom and conflict
-                // with the immutable borrow there. Re-binding per
-                // iteration keeps each borrow scoped tightly enough
-                // that both can coexist.
-                loop {
-                    let RikerRecord::Htslib(ref mut hts_rec) = record else {
-                        unreachable!("scratch was constructed as RikerRecord::Htslib");
-                    };
-                    if !hts_rec.read_from(reader.as_mut())? {
-                        break;
-                    }
-                    apply_requirements_htslib(hts_rec, requirements)?;
-                    f(&record)?;
-                }
-            }
+            apply_requirements_htslib(hts_rec, requirements)?;
+            f(&record)?;
         }
         Ok(())
     }
@@ -485,6 +494,84 @@ fn apply_requirements(bam_rec: &mut BamRec, requirements: &RikerRecordRequiremen
     Ok(())
 }
 
+/// Size the htslib decode/decompression thread pool on a rust-htslib
+/// reader. `threads` is the number of htslib worker threads in addition to
+/// the calling thread; `0` leaves htslib single-threaded. The generic bound
+/// makes it callable on either reader type.
+///
+/// # Errors
+/// Returns an error if htslib fails to create the thread pool.
+fn set_htslib_threads<R: HtsRead>(reader: &mut R, threads: usize, path: &Path) -> Result<()> {
+    if threads == 0 {
+        return Ok(());
+    }
+    reader.set_threads(threads).with_context(|| {
+        format!("Failed to set {threads} htslib decode threads on {}", path.display())
+    })
+}
+
+/// The index-file layouts riker accepts for the BAM at `path`, in a fixed
+/// order: `<file>.bai` (Picard sibling), `<file>.bam.bai` (samtools suffix),
+/// `<file>.bam.csi` (large-contig). Shared by [`select_bam_index`] so
+/// selection and the "missing index" error can't drift.
+fn bam_index_candidates(path: &Path) -> [PathBuf; 3] {
+    [path.with_extension("bai"), append_extension(path, ".bai"), append_extension(path, ".csi")]
+}
+
+/// Choose which index to load for the BAM at `path`. When several accepted
+/// layouts are present, warn and pick the **most recently modified**, so a
+/// freshly re-indexed BAM is used even if a stale index of another form is
+/// still lying next to it. Errors (with a `samtools index` hint) if none
+/// exist — this doubles as the friendly pre-open check.
+fn select_bam_index(path: &Path) -> Result<PathBuf> {
+    let present: Vec<(PathBuf, std::time::SystemTime)> = bam_index_candidates(path)
+        .into_iter()
+        .filter_map(|candidate| {
+            std::fs::metadata(&candidate)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .map(|modified| (candidate, modified))
+        })
+        .collect();
+    pick_bam_index(path, present)
+}
+
+/// Pick the most-recently-modified index from the present `(path, mtime)`
+/// candidates, warning when there is more than one. Split from the filesystem
+/// enumeration in [`select_bam_index`] so the selection can be unit-tested with
+/// synthetic timestamps.
+fn pick_bam_index(
+    path: &Path,
+    mut present: Vec<(PathBuf, std::time::SystemTime)>,
+) -> Result<PathBuf> {
+    present.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    match present.as_slice() {
+        [] => {
+            let [sibling, suffix, csi] = bam_index_candidates(path);
+            bail!(
+                "BAM index not found. Expected one of:\n  {}\n  {}\n  {}\n\
+                 Run `samtools index {}` to create one.",
+                suffix.display(),
+                sibling.display(),
+                csi.display(),
+                path.display(),
+            )
+        }
+        [(chosen, _)] => Ok(chosen.clone()),
+        [(chosen, _), rest @ ..] => {
+            let ignored: Vec<String> = rest.iter().map(|(p, _)| p.display().to_string()).collect();
+            log::warn!(
+                "Multiple indexes present for {}; using the most recently modified ({}) \
+                 and ignoring: {}",
+                path.display(),
+                chosen.display(),
+                ignored.join(", "),
+            );
+            Ok(chosen.clone())
+        }
+    }
+}
+
 /// Read one CRAM record into `hts_rec` and apply `requirements`. Used
 /// by the sequential [`AlignmentReader::fill_record`] path. The
 /// generic bound makes it callable on either rust-htslib reader type;
@@ -576,7 +663,7 @@ fn parse_htslib_header(header_bytes: &[u8]) -> Result<Header> {
 
 /// Detected alignment file format based on extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AlignmentFormat {
+pub(crate) enum AlignmentFormat {
     Sam,
     GzippedSam,
     Bam,
@@ -586,7 +673,7 @@ enum AlignmentFormat {
 /// Detect the alignment format from a file extension.
 ///
 /// Recognizes `.sam`, `.sam.gz`, `.bam`, and `.cram` (case-insensitive).
-fn detect_format(path: &Path) -> Result<AlignmentFormat> {
+pub(crate) fn detect_format(path: &Path) -> Result<AlignmentFormat> {
     let ext = path.extension().and_then(|e| e.to_str());
 
     // Check for .sam.gz: extension is "gz" and the stem ends with ".sam"
@@ -611,39 +698,10 @@ fn detect_format(path: &Path) -> Result<AlignmentFormat> {
 
 /// Returns `path` with `suffix` (e.g. `".bai"`) appended after the
 /// existing extension. Used to derive index-file paths.
-fn append_extension(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn append_extension(path: &Path, suffix: &str) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(suffix);
     PathBuf::from(p)
-}
-
-/// Confirm that an index for `path` exists in one of the three layouts
-/// `samtools` writes:
-///
-/// - `<file>.bam.bai` (suffix appended) — `samtools index`'s default
-/// - `<file>.bai` (extension replaced — sibling) — Picard's default
-/// - `<file>.csi` (suffix appended) — large-contig index
-///
-/// `path.with_extension("bai")` gives the sibling form (replaces the
-/// existing `.bam` extension); `append_extension(_, ".bai")` gives the
-/// suffix form.
-fn validate_bam_index_exists(path: &Path) -> Result<()> {
-    let bai_sibling = path.with_extension("bai");
-    let bai_suffix = append_extension(path, ".bai");
-    let csi = append_extension(path, ".csi");
-
-    if bai_sibling.exists() || bai_suffix.exists() || csi.exists() {
-        return Ok(());
-    }
-
-    bail!(
-        "BAM index not found. Expected one of:\n  {}\n  {}\n  {}\n\
-         Run `samtools index {}` to create one.",
-        bai_suffix.display(),
-        bai_sibling.display(),
-        csi.display(),
-        path.display(),
-    );
 }
 
 /// Confirm that an index for the CRAM at `path` exists in either of
@@ -652,10 +710,9 @@ fn validate_bam_index_exists(path: &Path) -> Result<()> {
 /// - `<file>.cram.crai` (suffix appended) — `samtools index`'s default
 /// - `<file>.crai`      (extension replaced — sibling) — Picard's default
 ///
-/// Mirrors [`validate_bam_index_exists`]'s two-form check; htslib will
-/// happily open either, so rejecting one would surface a confusing
-/// "CRAM index not found" error for an index htslib would have used.
-/// The pre-check exists to give a friendlier error than htslib's
+/// htslib will happily open either, so rejecting one would surface a
+/// confusing "CRAM index not found" error for an index htslib would have
+/// used. The pre-check exists only to give a friendlier error than htslib's
 /// generic open failure.
 fn validate_cram_index_exists(path: &Path) -> Result<()> {
     let crai_sibling = path.with_extension("crai");
@@ -694,44 +751,58 @@ mod tests {
     }
 
     #[test]
-    fn validate_bam_index_finds_suffix_form() {
+    fn select_bam_index_finds_suffix_form() {
         // `samtools index` default: foo.bam → foo.bam.bai
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        touch(&dir.path().join("sample.bam.bai"));
-        validate_bam_index_exists(&bam).expect("should accept suffix-form .bam.bai");
+        let idx = dir.path().join("sample.bam.bai");
+        touch(&idx);
+        assert_eq!(select_bam_index(&bam).expect("should accept suffix-form .bam.bai"), idx);
     }
 
     #[test]
-    fn validate_bam_index_finds_sibling_form() {
+    fn select_bam_index_finds_sibling_form() {
         // Picard default: foo.bam → foo.bai
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        touch(&dir.path().join("sample.bai"));
-        validate_bam_index_exists(&bam).expect("should accept sibling-form .bai");
+        let idx = dir.path().join("sample.bai");
+        touch(&idx);
+        assert_eq!(select_bam_index(&bam).expect("should accept sibling-form .bai"), idx);
     }
 
     #[test]
-    fn validate_bam_index_finds_csi() {
+    fn select_bam_index_finds_csi() {
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        touch(&dir.path().join("sample.bam.csi"));
-        validate_bam_index_exists(&bam).expect("should accept .csi");
+        let idx = dir.path().join("sample.bam.csi");
+        touch(&idx);
+        assert_eq!(select_bam_index(&bam).expect("should accept .csi"), idx);
     }
 
     #[test]
-    fn validate_bam_index_missing_errors() {
+    fn select_bam_index_missing_errors() {
         let dir = TempDir::new().unwrap();
         let bam = dir.path().join("sample.bam");
         touch(&bam);
-        let err = validate_bam_index_exists(&bam).expect_err("missing index should fail");
+        let err = select_bam_index(&bam).expect_err("missing index should fail");
         let msg = err.to_string();
         assert!(msg.contains("BAM index not found"), "unexpected error: {msg}");
         assert!(msg.contains("sample.bam.bai"), "should mention suffix form: {msg}");
         assert!(msg.contains("sample.bai"), "should mention sibling form: {msg}");
+    }
+
+    #[test]
+    fn pick_bam_index_prefers_most_recently_modified() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let bam = Path::new("/data/sample.bam");
+        let older = (bam.with_extension("bai"), UNIX_EPOCH + Duration::from_secs(100));
+        let newer = (append_extension(bam, ".bai"), UNIX_EPOCH + Duration::from_secs(200));
+        // Insertion order must not matter; the newer mtime always wins.
+        assert_eq!(pick_bam_index(bam, vec![older.clone(), newer.clone()]).unwrap(), newer.0);
+        assert_eq!(pick_bam_index(bam, vec![newer.clone(), older.clone()]).unwrap(), newer.0);
     }
 
     #[test]

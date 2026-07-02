@@ -435,52 +435,25 @@ impl SamBuilder {
     /// Returns an error if the BAM or index cannot be written.
     #[allow(dead_code)]
     pub fn to_temp_indexed_bam(&self) -> Result<NamedTempFile> {
-        use noodles::bam::{self as bam_crate, bai};
-        use noodles::csi::binning_index::Indexer;
-        use noodles::csi::binning_index::index::reference_sequence::bin::Chunk;
-        use noodles::sam::alignment::Record as _;
+        use noodles::bam::bai;
 
         let tmp = NamedTempFile::with_suffix(".bam")?;
         self.write_to_file(tmp.path())?;
+        let index: bai::Index = build_bam_index(tmp.path())?;
+        bai::fs::write(with_suffix(tmp.path(), ".bai"), &index)?;
+        Ok(tmp)
+    }
 
-        // Build the BAI index by reading through the BAM
-        let mut reader = bam_crate::io::Reader::new(std::fs::File::open(tmp.path())?);
-        let header = reader.read_header()?;
+    /// Write the BAM and a sibling `.bam.csi` index (the large-contig index
+    /// format) built by reading through it.
+    #[allow(dead_code)]
+    pub fn to_temp_csi_indexed_bam(&self) -> Result<NamedTempFile> {
+        use noodles::csi;
 
-        let mut indexer = Indexer::default();
-        let mut chunk_start = reader.get_ref().virtual_position();
-        let mut record = bam_crate::Record::default();
-
-        while reader.read_record(&mut record)? != 0 {
-            let chunk_end = reader.get_ref().virtual_position();
-
-            let alignment_context = match (
-                record.reference_sequence_id().transpose()?,
-                record.alignment_start().transpose()?,
-                record.alignment_end().transpose()?,
-            ) {
-                (Some(id), Some(start), Some(end)) => {
-                    let is_mapped = !record.flags().is_unmapped();
-                    Some((id, start, end, is_mapped))
-                }
-                _ => None,
-            };
-
-            let chunk = Chunk::new(chunk_start, chunk_end);
-            indexer.add_record(alignment_context, chunk)?;
-            chunk_start = chunk_end;
-        }
-
-        let index = indexer.build(header.reference_sequences().len());
-
-        // Write the BAI index
-        let bai_path = {
-            let mut p = tmp.path().as_os_str().to_owned();
-            p.push(".bai");
-            std::path::PathBuf::from(p)
-        };
-        bai::fs::write(bai_path, &index)?;
-
+        let tmp = NamedTempFile::with_suffix(".bam")?;
+        self.write_to_file(tmp.path())?;
+        let index: csi::Index = build_bam_index(tmp.path())?;
+        csi::fs::write(with_suffix(tmp.path(), ".csi"), &index)?;
         Ok(tmp)
     }
 
@@ -488,6 +461,49 @@ impl SamBuilder {
     pub fn header(&self) -> &Header {
         &self.header
     }
+}
+
+/// Build a binning index for `bam_path` by reading through it. Generic over the
+/// reference-sequence index type so it serves both BAI (`LinearIndex`) and CSI
+/// (`BinnedIndex`); the concrete type is chosen by the caller's annotation.
+fn build_bam_index<I>(bam_path: &Path) -> Result<noodles::csi::binning_index::Index<I>>
+where
+    I: noodles::csi::binning_index::index::reference_sequence::Index + Default,
+{
+    use noodles::bam as bam_crate;
+    use noodles::csi::binning_index::Indexer;
+    use noodles::csi::binning_index::index::reference_sequence::bin::Chunk;
+    use noodles::sam::alignment::Record as _;
+
+    let mut reader = bam_crate::io::Reader::new(std::fs::File::open(bam_path)?);
+    let header = reader.read_header()?;
+    let mut indexer: Indexer<I> = Indexer::default();
+    let mut chunk_start = reader.get_ref().virtual_position();
+    let mut record = bam_crate::Record::default();
+
+    while reader.read_record(&mut record)? != 0 {
+        let chunk_end = reader.get_ref().virtual_position();
+        let alignment_context = match (
+            record.reference_sequence_id().transpose()?,
+            record.alignment_start().transpose()?,
+            record.alignment_end().transpose()?,
+        ) {
+            (Some(id), Some(start), Some(end)) => {
+                Some((id, start, end, !record.flags().is_unmapped()))
+            }
+            _ => None,
+        };
+        indexer.add_record(alignment_context, Chunk::new(chunk_start, chunk_end))?;
+        chunk_start = chunk_end;
+    }
+    Ok(indexer.build(header.reference_sequences().len()))
+}
+
+/// `path` with `suffix` appended after the existing extension (e.g. `.bai`).
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    std::path::PathBuf::from(p)
 }
 
 impl Default for SamBuilder {

@@ -53,7 +53,9 @@ fn test_basic_coverage() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -81,7 +83,9 @@ fn test_n_bases_excluded() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -103,7 +107,9 @@ fn test_overlap_detection() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -127,7 +133,9 @@ fn test_mapq_exclusion() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -152,7 +160,9 @@ fn test_dup_exclusion() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -177,7 +187,9 @@ fn test_unpaired_excluded_by_default() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, false, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, false, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -205,7 +217,9 @@ fn test_unpaired_included_when_flag_set() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -231,7 +245,7 @@ fn test_coverage_cap() {
     let prefix = dir.path().join("out");
 
     // cap=3 → 5 reads per position, 2 excluded per position
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 3).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 3).execute(None).unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -254,7 +268,9 @@ fn test_coverage_histogram_file() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let cov: Vec<WgsCoverageEntry> =
         read_metrics_tsv(&dir.path().join(format!("out{COVERAGE_SUFFIX}"))).unwrap();
@@ -293,7 +309,9 @@ fn test_frac_bases_at_nx() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -321,7 +339,9 @@ fn test_fold_penalty() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -353,7 +373,7 @@ fn test_with_intervals() {
 
     let prefix = dir.path().join("out");
     make_cmd(bam.path(), refa.path(), &prefix, Some(bed_path), false, true, 20, 20, 250)
-        .execute()
+        .execute(None)
         .unwrap();
 
     let rows: Vec<WgsMetrics> =
@@ -400,7 +420,9 @@ fn test_baseq_exclusion() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
@@ -435,7 +457,7 @@ fn test_sd_coverage_uses_capped_depth() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 5).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 5).execute(None).unwrap();
 
     let rows: Vec<WgsMetrics> =
         read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();

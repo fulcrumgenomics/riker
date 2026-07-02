@@ -177,9 +177,13 @@ pub struct HybCap {
 }
 
 impl Command for HybCap {
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
         let sample = derive_sample(&self.input.input, reader.header());
 
         // Load reference if provided (needed for GC dropout)
@@ -1275,6 +1279,16 @@ impl Collector for HybCapCollector {
 
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE
+    }
+
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~140,
+    /// the heaviest collector — dual bait+target per-base pileup. Measured on an
+    /// exome BAM (samply worker-compute) at roughly 2x `basic` per read (basic's
+    /// hint is 76, alignment's 55), which lands it near 140 on the shared hint
+    /// scale. Approximate — per-read cost varies with read length across data
+    /// sets — but its ordering as the heaviest is robust.
+    fn cost_hint(&self) -> u32 {
+        140
     }
 }
 

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Toolkit-wide `--threads` option** for multithreaded input decoding — the
+  number of cores riker tries to saturate (it may spin a few more threads
+  internally to do so). It is a single, global budget (accepted before or after
+  the subcommand) that each command divides between decoding the input and its
+  own work. The single-pass tools (`wgs`, `alignment`, …) run their own work on
+  one thread and hand the rest to input decoding; `multi` lays the budget out
+  across decode threads, a dispatch thread, and parallel collector workers,
+  **tuned to the input format** (from benchmarking): BAM inflate is cheap so it
+  favors collector workers, while CRAM decode is expensive and parallelizes
+  well so it favors decode threads. BAM uses `noodles-bgzf`'s multithreaded BGZF
+  reader; CRAM sizes htslib's decode pool. Gains are sub-linear and flatten
+  past ~6 threads for BAM / ~8 for CRAM, but the sweet spot is platform- and
+  input-dependent. Left unset, the single-pass tools run single-threaded and
+  `multi` uses a small default pool.
+
+### Changed
+
+- **`multi --threads` is now the toolkit `--threads`.** It is reinterpreted as
+  the total thread budget (which `multi` divides between input decoding and
+  collector workers) rather than a bare worker count, and with no value given
+  `multi` now uses up to four threads (clamped to the core count) instead of a
+  fixed two. Existing `riker multi --threads N` invocations keep working.
+- **Faster `multi` at higher thread counts.** The reader→worker work queue now
+  uses the kanal channel instead of crossbeam-channel, ~4% lower wall-clock on a
+  12x WGS BAM at `--threads 6` (it avoids waking a worker that is about to pick
+  up its batch by spinning). Output is unchanged.
+
+### Fixed
+
+- **`multi` output is now deterministic across thread counts.** Each collector
+  is pinned to a single worker and receives batches in file order, so a
+  parallel run is byte-identical to a single-threaded one; previously the
+  per-record output order of some collectors could vary with the thread count.
+
 ## [0.3.0] - 2026-06-24
 
 ### Added

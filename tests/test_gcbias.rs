@@ -61,7 +61,7 @@ fn test_uniform_zero_gc() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -106,7 +106,7 @@ fn test_mixed_gc_regions() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -132,7 +132,7 @@ fn test_n_bases_exclude_windows() {
     let prefix = dir.path().join("out");
 
     // window_size=10 → windows that overlap the N stretch will have >4 Ns and be excluded
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -163,7 +163,7 @@ fn test_forward_vs_reverse_strand() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -193,7 +193,7 @@ fn test_duplicate_handling() {
     // Default (include duplicates): all three reads are used.
     let dir1 = TempDir::new().unwrap();
     let prefix1 = dir1.path().join("out");
-    make_cmd(bam.path(), refa.path(), &prefix1, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix1, false, 10, 20, false).execute(None).unwrap();
     let detail1: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir1.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     let summary1: Vec<GcBiasSummaryMetric> =
@@ -205,7 +205,7 @@ fn test_duplicate_handling() {
     // Exclude duplicates: the duplicate is still aligned, but filtered from the bins.
     let dir2 = TempDir::new().unwrap();
     let prefix2 = dir2.path().join("out");
-    make_cmd(bam.path(), refa.path(), &prefix2, true, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix2, true, 10, 20, false).execute(None).unwrap();
     let detail2: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir2.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     let summary2: Vec<GcBiasSummaryMetric> =
@@ -232,7 +232,7 @@ fn test_gc_dropout() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
@@ -257,7 +257,7 @@ fn test_at_dropout() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
@@ -276,7 +276,7 @@ fn test_empty_bam() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -313,7 +313,7 @@ fn test_multiple_contigs() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -379,7 +379,7 @@ fn test_read_filtering() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -413,7 +413,7 @@ fn test_paired_reads_cluster_counting() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
@@ -436,7 +436,7 @@ fn test_quintile_nc_uniform() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();
@@ -478,7 +478,7 @@ fn test_exclude_supplementary() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, true).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, true).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -531,7 +531,7 @@ fn test_exclude_intervals_drops_reads_and_windows() {
     // Baseline without exclusion: 31 windows, both reads used.
     let dir0 = TempDir::new().unwrap();
     let prefix0 = dir0.path().join("out");
-    make_cmd(bam.path(), refa.path(), &prefix0, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix0, false, 10, 20, false).execute(None).unwrap();
     let detail0: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir0.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
     assert_eq!(detail0[100].windows, 31, "31 all-G windows without exclusion");
@@ -542,7 +542,7 @@ fn test_exclude_intervals_drops_reads_and_windows() {
     let bed = dir.path().join("exclude.bed");
     std::fs::write(&bed, "chr1\t0\t10\n").unwrap();
     let prefix = dir.path().join("out");
-    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute().unwrap();
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -574,7 +574,7 @@ fn test_exclude_intervals_accepts_interval_list() {
     let il = dir.path().join("exclude.interval_list");
     std::fs::write(&il, "@SQ\tSN:chr1\tLN:40\nchr1\t1\t10\t+\texcl\n").unwrap();
     let prefix = dir.path().join("out");
-    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, il).execute().unwrap();
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, il).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -607,7 +607,7 @@ fn test_exclude_intervals_reverse_strand_uses_computed_start() {
     let bed = dir.path().join("exclude.bed");
     std::fs::write(&bed, "chr1\t0\t10\n").unwrap();
     let prefix = dir.path().join("out");
-    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute().unwrap();
+    make_cmd_with_excludes(bam.path(), refa.path(), &prefix, 10, bed).execute(None).unwrap();
 
     let detail: Vec<GcBiasDetailMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
@@ -641,7 +641,7 @@ fn test_unmapped_counts_in_total_not_aligned() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
-    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute().unwrap();
+    make_cmd(bam.path(), refa.path(), &prefix, false, 10, 20, false).execute(None).unwrap();
 
     let summary: Vec<GcBiasSummaryMetric> =
         read_metrics_tsv(&dir.path().join(format!("out{SUMMARY_SUFFIX}"))).unwrap();

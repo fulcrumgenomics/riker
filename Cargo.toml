@@ -43,12 +43,16 @@ bstr = "1"
 bytemuck = "1.25"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
-crossbeam-channel = "0.5"
 csv = "1"
 enum_dispatch = "0.3"
 env_logger = "0.11"
 fgoxide = "0.6"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
+# Hard-pinned (exact version): kanal is pre-1.0; the sync channel's speed comes
+# from internal unsafe, so we lock the exact code we Miri-vetted (Stacked +
+# Tree Borrows, many-seeds) and re-vet deliberately on any bump. default-features
+# = false drops the async feature (unused, more unsafe, not vetted).
+kanal = { version = "=0.1.1", default-features = false }
 kuva = { version = "0.2.0", features = ["pdf"] }
 log = "0"
 noodles = { version = "0.110", features = ["bam", "bcf", "cram", "fasta", "sam", "bgzf", "core", "vcf", "csi", "tabix"] }
@@ -85,6 +89,14 @@ panic = "abort"
 [profile.dist]
 inherits = "release"
 incremental = false
+
+# Local profiling profile for samply/atos. Identical codegen to `release`
+# but keeps DWARF debug info so native frames symbolicate to function names.
+# Not used for distribution; `release`/`dist` stay lean. Build with
+# `cargo build --profile profiling` -> target/profiling/riker.
+[profile.profiling]
+inherits = "release"
+debug = true
 
 # x86_64 release binaries are packaged with `cargo multivers` into a single
 # launcher that embeds the variants below and dispatches to the highest

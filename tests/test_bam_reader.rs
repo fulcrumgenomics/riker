@@ -5,14 +5,61 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
-use helpers::SamBuilder;
-use riker_lib::sam::alignment_reader::AlignmentReader;
+use helpers::{SamBuilder, coord_builder};
+use noodles::core::Region;
+use riker_lib::sam::alignment_reader::{AlignmentReader, IndexedAlignmentReader};
 use riker_lib::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use tempfile::NamedTempFile;
 
+/// The comparable fields of one record: name, flags, start, end, mapq, cigar
+/// length, sequence, quality scores, and the NM aux tag. Used to assert that
+/// two readers surface byte-identical records.
+type Row = (
+    Option<Vec<u8>>,
+    u16,
+    Option<usize>,
+    Option<usize>,
+    Option<u8>,
+    usize,
+    Vec<u8>,
+    Vec<u8>,
+    Option<i64>,
+);
+
+/// Project a `RikerRecord` onto its comparable [`Row`].
+fn record_row(record: &RikerRecord) -> Row {
+    (
+        record.name().map(|n| n.to_vec()),
+        record.flags().bits(),
+        record.alignment_start().map(|p| p.get()),
+        record.alignment_end().map(|p| p.get()),
+        record.mapping_quality().map(|q| q.get()),
+        record.cigar_len(),
+        record.sequence().to_vec(),
+        record.quality_scores().to_vec(),
+        record.aux_tag(*b"NM").and_then(|v| v.as_int()),
+    )
+}
+
+/// Read every record from `path` sequentially with the given decode-thread
+/// count, projecting each to a [`Row`].
+fn collect_stream_rows(
+    path: &Path,
+    requirements: &RikerRecordRequirements,
+    decode_threads: usize,
+) -> Result<Vec<Row>> {
+    let mut reader = AlignmentReader::open(path, None, decode_threads)?;
+    let mut record = reader.empty_record();
+    let mut rows = Vec::new();
+    while reader.fill_record(requirements, &mut record)? {
+        rows.push(record_row(&record));
+    }
+    Ok(rows)
+}
+
 #[test]
 fn test_open_nonexistent_file() {
-    match AlignmentReader::open(Path::new("/no/such/file.bam"), None) {
+    match AlignmentReader::open(Path::new("/no/such/file.bam"), None, 0) {
         Err(e) => {
             let msg = e.to_string();
             assert!(msg.contains("/no/such/file.bam"), "error should contain path, got: {msg}");
@@ -28,7 +75,7 @@ fn test_open_invalid_bam() -> Result<()> {
     tmp.flush()?;
 
     assert!(
-        AlignmentReader::open(tmp.path(), None).is_err(),
+        AlignmentReader::open(tmp.path(), None, 0).is_err(),
         "opening garbage data as BAM should fail"
     );
     Ok(())
@@ -47,7 +94,7 @@ fn test_bamrec_roundtrip_preserves_scalars() -> Result<()> {
     builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
     let bam = builder.to_temp_bam()?;
 
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
 
     let mut record = reader.empty_record();
@@ -87,7 +134,7 @@ fn test_bamrec_alignment_end_matches_cigar_span() -> Result<()> {
     builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
     let bam = builder.to_temp_bam()?;
 
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let mut record = reader.empty_record();
     assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
 
@@ -117,7 +164,7 @@ fn test_cram_roundtrip_via_fill_record() -> Result<()> {
     builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, None);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
 
     let requirements = RikerRecordRequirements::NONE;
     let mut record = reader.empty_record();
@@ -180,7 +227,7 @@ fn test_cram_drives_through_collector() -> Result<()> {
     builder.add_pair("p2", 0, 300, 400, 200, 60, 50, false, false);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
     let mut collector = Counter { n: 0 };
     let mut progress = ProgressLogger::new("test", "reads", 1_000_000);
     drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)?;
@@ -223,7 +270,7 @@ fn test_drive_collector_does_not_finish_after_failed_initialize() -> Result<()> 
     let mut builder = SamBuilder::new();
     builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
     let bam = builder.to_temp_bam()?;
-    let mut reader = AlignmentReader::open(bam.path(), None)?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let mut collector = FailingInit { finish_called: false };
     let mut progress = ProgressLogger::new("test", "reads", 1_000_000);
 
@@ -251,7 +298,7 @@ fn test_cram_fill_record_decodes_sequence_and_aux() -> Result<()> {
     builder.add_pair("pair1", 0, 200, 400, 200, 60, 50, false, false);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
     let mut record = reader.empty_record();
 
@@ -291,7 +338,7 @@ fn test_htslibrec_alignment_end_matches_cigar_span() -> Result<()> {
     builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
     let cram = builder.to_temp_cram(refa.path())?;
 
-    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()))?;
+    let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
     let mut record = reader.empty_record();
     assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
 
@@ -318,7 +365,7 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
     builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
     let sam = builder.to_temp_sam()?;
 
-    let mut reader = AlignmentReader::open(sam.path(), None)?;
+    let mut reader = AlignmentReader::open(sam.path(), None, 0)?;
 
     let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
     let mut record = reader.empty_record();
@@ -341,5 +388,105 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
         }
     }
     assert_eq!(count, 3, "expected one fragment + one pair (=3 records)");
+    Ok(())
+}
+
+/// Reading a BAM single-threaded (`decode_threads == 0`, plain noodles BGZF)
+/// and multithreaded (`decode_threads > 0`, noodles-bgzf `MultithreadedReader`)
+/// must surface byte-identical records. This is the core correctness guarantee
+/// for the parallel BAM decode path.
+#[test]
+fn bam_records_identical_across_decode_thread_counts() -> Result<()> {
+    let mut builder = SamBuilder::new();
+    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
+    builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
+    builder.add_pair("pair2", 0, 700, 900, 200, 55, 60, false, false);
+    let bam = builder.to_temp_bam()?;
+
+    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+    let single = collect_stream_rows(bam.path(), &requirements, 0)?;
+    let multithreaded = collect_stream_rows(bam.path(), &requirements, 4)?;
+
+    assert_eq!(single.len(), 5, "two pairs + one fragment = 5 records");
+    assert_eq!(single, multithreaded, "multithreaded BAM decode must match single-threaded");
+    Ok(())
+}
+
+/// Indexed BAM region queries must return byte-identical records whether
+/// htslib's decode pool is sized to 0 (single-threaded) or several threads.
+#[test]
+fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
+    let mut builder = coord_builder(&[("chr1", 2_000)]);
+    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
+    builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, Some(3));
+    builder.add_pair("pair2", 0, 1_200, 1_400, 200, 55, 60, false, false);
+    let bam = builder.to_temp_indexed_bam()?;
+
+    let region: Region = "chr1".parse().expect("valid region");
+    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+
+    let collect = |decode_threads: usize| -> Result<Vec<Row>> {
+        let mut reader = IndexedAlignmentReader::open(bam.path(), None, decode_threads)?;
+        let mut rows = Vec::new();
+        reader.query_for_each(&region, &requirements, |record| {
+            rows.push(record_row(record));
+            Ok(())
+        })?;
+        Ok(rows)
+    };
+
+    let single = collect(0)?;
+    let multithreaded = collect(4)?;
+    assert_eq!(single.len(), 5, "two pairs + one fragment overlap the query");
+    assert_eq!(single, multithreaded, "multithreaded indexed query must match single-threaded");
+    Ok(())
+}
+
+/// A `.csi`-indexed BAM (no `.bai` present) must query correctly — the `.csi`
+/// selected by [`select_bam_index`] is handed to htslib, which reads it — at
+/// both a zero and non-zero decode-thread count.
+#[test]
+fn indexed_bam_query_works_with_csi_index() -> Result<()> {
+    let mut builder = coord_builder(&[("chr1", 2_000)]);
+    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
+    builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, Some(3));
+    builder.add_pair("pair2", 0, 1_200, 1_400, 200, 55, 60, false, false);
+    let bam = builder.to_temp_csi_indexed_bam()?;
+
+    let region: Region = "chr1".parse().expect("valid region");
+    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+
+    let collect = |decode_threads: usize| -> Result<Vec<Row>> {
+        let mut reader = IndexedAlignmentReader::open(bam.path(), None, decode_threads)?;
+        let mut rows = Vec::new();
+        reader.query_for_each(&region, &requirements, |record| {
+            rows.push(record_row(record));
+            Ok(())
+        })?;
+        Ok(rows)
+    };
+
+    let single = collect(0)?;
+    let multithreaded = collect(4)?;
+    assert_eq!(single.len(), 5, "two pairs + one fragment overlap the query");
+    assert_eq!(single, multithreaded, "CSI query must match across decode thread counts");
+    Ok(())
+}
+
+/// SAM has no BGZF layer, so `decode_threads` is meaningless and must be
+/// silently ignored — the same records come back regardless of the value.
+#[test]
+fn sam_ignores_decode_threads() -> Result<()> {
+    let mut builder = SamBuilder::new();
+    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
+    builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
+    let sam = builder.to_temp_sam()?;
+
+    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+    let unset = collect_stream_rows(sam.path(), &requirements, 0)?;
+    let with_threads = collect_stream_rows(sam.path(), &requirements, 4)?;
+
+    assert_eq!(unset.len(), 3, "one pair + one fragment = 3 records");
+    assert_eq!(unset, with_threads, "decode_threads must not affect SAM reads");
     Ok(())
 }

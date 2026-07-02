@@ -81,7 +81,7 @@ Tool versions:
 | HG00188   | 37.5 GB| 30× | 8:14       | 1:46:16 (46:36 + 59:40) | **12.9×** | 1.48 GB   | 5.24 GB         |
 | HG02675   | 41.1 GB| 30× | 8:45       | 1:51:55 (51:13 + 60:42) | **12.8×** | 1.47 GB   | 5.20 GB         |
 
-Riker was tested with a single invocation of `riker multi --tools wgs gcbias alignment basic isize --threads 4`.
+Riker was tested with a single invocation of `riker --threads 4 multi --tools wgs gcbias alignment basic isize`.
 Picard was run twice, once for `CollectWgsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
 
 "Picard peak RSS" is the larger of the two sequential JVM runs — typically dominated by `CollectWgsMetrics`, which scales with genome size + coverage.
@@ -114,7 +114,7 @@ Hybcap measurements are the mean of three GIAB Ashkenazi trio samples (HG002, HG
 |---              |---      |---          |---         |---                       |---        |---        |---              |
 | AJ trio (mean)  | ~9.8 GB | Agilent v5  | 1:45       | 22:07 (7:57 + 14:09)     | **12.6×** | 0.99 GB   | 3.23 GB         |
 
-Riker was tested with a single invocation of `riker multi --tools hybcap alignment basic isize --threads 4`.
+Riker was tested with a single invocation of `riker --threads 4 multi --tools hybcap alignment basic isize`.
 Picard was run twice, once for `CollectHsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
 
 "Picard peak RSS" is the larger of the two sequential JVM runs — dominated by `CollectHsMetrics` on the hybcap trio.
@@ -232,10 +232,37 @@ riker multi \
   -i sample.bam \
   -r ref.fa \
   -o out_prefix \
-  --tools alignment isize basic hypcap \
+  --tools alignment isize basic hybcap \
   --hybcap::baits baits.bed \
   --hybcap::targets targets.bed
 ```
+
+### Threads
+
+Riker takes a single, whole-toolkit `--threads` budget. It's a global option, so
+it works either before or after the subcommand:
+
+```bash
+riker --threads 4 wgs -i sample.bam -r ref.fa -o out_prefix
+riker multi --threads 4 -i sample.bam -r ref.fa -o out_prefix --tools wgs gcbias basic alignment isize
+```
+
+`--threads` is the number of cores riker will try to saturate; it may spin a
+few more threads internally (e.g. a dispatch thread) to keep them busy. Each
+command spends the budget as it sees fit. The single-pass tools (`wgs`,
+`alignment`, …) run their own work on one thread and hand the remainder to
+input decoding; `multi` lays it out across input-decode threads, a dispatch
+thread, and parallel collector workers, tuned to the input format. Left unset,
+the single-pass tools run single-threaded and `multi` uses a small default pool.
+
+The payoff is format-dependent: **BAM** inflate is cheap, so `multi` is
+compute-bound and leans on collector workers; **CRAM** decode is expensive and
+parallelizes well, so it leans on decode threads (and CRAM peak memory rises
+with thread count, especially for the heavier `archive`/`small` codecs, while
+BAM stays essentially flat). Gains are sub-linear — as a rough guide returns
+flatten past ~6 threads for BAM and ~8 for CRAM — but the sweet spot is
+platform- and input-dependent, and over-supplying threads can slow a run down,
+so it's worth measuring on your own data.
 
 ## Output Format
 
@@ -386,14 +413,13 @@ Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per temp
 
 #### Stratifiers not ported from Picard
 
-Picard's `CollectSamErrorMetrics` defines 32 stratifiers. riker ports 15 of them (`all`, `bq`, `mapq`, `cycle`, `read_num`, `strand`, `pair_orientation`, `isize`, `gc`, `read_base`, `ref_base`, `hp_len`, `pre_dinuc`, `post_dinuc`, `context_3bp`). The following Picard stratifiers are **not** available in riker:
+Picard's `CollectSamErrorMetrics` defines 32 stratifiers. riker ports 17 of them (`all`, `bq`, `mapq`, `cycle`, `read_num`, `strand`, `pair_orientation`, `isize`, `gc`, `read_base`, `ref_base`, `hp_len`, `pre_dinuc`, `post_dinuc`, `context_3bp`, `nm`, `indel_len`). The following Picard stratifiers are **not** available in riker:
 
 - `PAIR_PROPERNESS` — whether the read is in a proper pair
 - `HOMOPOLYMER` — the homopolymer base (A/C/G/T) at the current position
 - `BINNED_HOMOPOLYMER` — homopolymer length bucketed into bins
 - `BINNED_CYCLE` — machine cycle bucketed into bins
 - `SOFT_CLIPS` — number of soft-clipped bases in the read
-- `MISMATCHES_IN_READ` — total mismatches in the read (`nm` is similar)
 - `TWO_BASE_PADDED_CONTEXT` — 5-base context (2bp each side) (`Context3bp` is provided)
 - `CONSENSUS` — whether the read is a consensus/duplex read
 - `NS_IN_READ` — number of N bases in the read

@@ -78,9 +78,13 @@ pub struct Basic {
 impl Command for Basic {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output files cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader =
-            AlignmentReader::open(&self.input.input, self.reference.reference.as_deref())?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            self.reference.reference.as_deref(),
+            plan.decode_threads,
+        )?;
         let mut collector = BasicCollector::new(&self.input.input, &self.output.output);
         let mut progress = ProgressLogger::new("basic", "reads", 5_000_000);
         drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
@@ -588,6 +592,14 @@ impl Collector for BasicCollector {
 
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE.with_sequence()
+    }
+
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]); ~76 from
+    /// a samply worker-compute measurement on a 12x WGS BAM — its three
+    /// per-base passes (base distribution + quality by cycle + quality
+    /// distribution) make it one of the heaviest collectors.
+    fn cost_hint(&self) -> u32 {
+        76
     }
 }
 

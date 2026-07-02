@@ -19,7 +19,7 @@ use crate::commands::common::{InputOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_6dp, write_tsv};
 use crate::progress::ProgressLogger;
-use crate::sam::alignment_reader::IndexedAlignmentReader;
+use crate::sam::alignment_reader::{IndexedAlignmentReader, append_extension};
 use crate::sam::mate_buffer::{MateAction, MateBuffer};
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
@@ -231,30 +231,34 @@ impl Error {
     }
 }
 
+/// Ensure the reference FASTA at `ref_path` has a sibling `.fai` index,
+/// erroring with a `samtools faidx` hint if it does not.
+fn validate_fasta_index(ref_path: &Path) -> Result<()> {
+    let fai_path = append_extension(ref_path, ".fai");
+    if !fai_path.exists() {
+        bail!(
+            "FASTA index not found: expected {}\n\
+             Run `samtools faidx {}` to create it.",
+            fai_path.display(),
+            ref_path.display(),
+        );
+    }
+    Ok(())
+}
+
 impl Command for Error {
     #[expect(clippy::cast_possible_truncation, reason = "contig lengths fit in u32")]
-    fn execute(&self) -> Result<()> {
-        // Upfront validation
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
         let ref_path = &self.options.reference;
-        let fai_path = {
-            let mut p = ref_path.as_os_str().to_owned();
-            p.push(".fai");
-            PathBuf::from(p)
-        };
-        if !fai_path.exists() {
-            bail!(
-                "FASTA index not found: expected {}\n\
-                 Run `samtools faidx {}` to create it.",
-                fai_path.display(),
-                ref_path.display(),
-            );
-        }
+        validate_fasta_index(ref_path)?;
 
         // Open reference
         let fasta = Fasta::from_path(ref_path)?;
 
         // Open indexed alignment file
-        let mut alignment_reader = IndexedAlignmentReader::open(&self.input.input, Some(ref_path))?;
+        let plan = self.thread_plan(threads);
+        let mut alignment_reader =
+            IndexedAlignmentReader::open(&self.input.input, Some(ref_path), plan.decode_threads)?;
         let header = alignment_reader.header().clone();
 
         // Build sequence dictionary
@@ -1092,6 +1096,16 @@ impl Collector for ErrorCollector {
     fn field_needs(&self) -> RikerRecordRequirements {
         // Reads sequence bases + quality scores + the NM aux tag.
         RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM")
+    }
+
+    /// Per-base covariate stratification makes this by far the heaviest
+    /// collector: with the default `--stratify-by` set it measured ~100x `wgs`
+    /// per read (~22 us/read on a 12x WGS BAM). Its cost swings ~40x with the
+    /// stratifier set, so rather than a faithful (huge, config-specific) value,
+    /// this is set well above every other collector — enough to guarantee
+    /// `error` is always packed onto its own worker.
+    fn cost_hint(&self) -> u32 {
+        500
     }
 }
 

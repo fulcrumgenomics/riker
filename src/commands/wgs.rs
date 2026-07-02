@@ -134,8 +134,13 @@ pub struct Wgs {
 impl Command for Wgs {
     /// # Errors
     /// Returns an error if the BAM or reference cannot be read, or if output cannot be written.
-    fn execute(&self) -> Result<()> {
-        let mut reader = AlignmentReader::open(&self.input.input, Some(&self.reference.reference))?;
+    fn execute(&self, threads: Option<u8>) -> Result<()> {
+        let plan = self.thread_plan(threads);
+        let mut reader = AlignmentReader::open(
+            &self.input.input,
+            Some(&self.reference.reference),
+            plan.decode_threads,
+        )?;
         let reference = Fasta::from_path(&self.reference.reference)?;
 
         let mut collector =
@@ -742,6 +747,16 @@ impl Collector for WgsCollector {
 
     fn field_needs(&self) -> RikerRecordRequirements {
         RikerRecordRequirements::NONE
+    }
+
+    /// Relative per-record worker cost (see [`Collector::cost_hint`]). Anchor
+    /// value for the scale; from a samply worker-compute measurement
+    /// (`accept`+`finish` inclusive, input decode excluded) on a 12x WGS BAM.
+    /// Coverage pileup (per-base CIGAR walk + mate-overlap dedup + per-contig
+    /// finalize) is one of the heaviest per-record kernels, so wgs earns its
+    /// own worker when the budget allows.
+    fn cost_hint(&self) -> u32 {
+        70
     }
 }
 

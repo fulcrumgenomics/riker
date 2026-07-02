@@ -8,16 +8,16 @@ use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 /// Trait implemented by each metric collector.
 ///
 /// Each collector stores its own configuration (output paths, reference handle, thresholds)
-/// as fields set at construction time. The trait methods only receive the BAM header and
-/// records, enabling the `multi` command to share a single BAM pass across collectors.
+/// as fields set at construction time. The trait methods only receive the header and
+/// records, enabling the `multi` command to share a single input pass across collectors.
 pub trait Collector: Send {
-    /// Called once with the BAM header before any records are processed.
+    /// Called once with the header before any records are processed.
     ///
     /// # Errors
     /// Returns an error if the header is invalid for this collector's configuration.
     fn initialize(&mut self, header: &Header) -> Result<()>;
 
-    /// Called once per record in the BAM file.
+    /// Called once per record.
     ///
     /// # Errors
     /// Returns an error if the record cannot be processed.
@@ -60,6 +60,17 @@ pub trait Collector: Send {
     /// when adding a new collector. Return
     /// [`RikerRecordRequirements::NONE`] if no expensive fields are needed.
     fn field_needs(&self) -> RikerRecordRequirements;
+
+    /// Relative per-record processing cost, used only by `multi` to balance
+    /// collectors across worker threads (heaviest collectors get their own
+    /// worker). This is a self-reported hint, not a hard number — the
+    /// scheduler compares hints, so only the ratios matter. Default `1`
+    /// (a light, accumulate-only collector). Collectors with expensive
+    /// per-record kernels (e.g. coverage pileup) should override with a
+    /// larger value.
+    fn cost_hint(&self) -> u32 {
+        1
+    }
 }
 
 /// Drive a single reader through a single collector's full lifecycle:
