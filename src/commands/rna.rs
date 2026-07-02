@@ -34,6 +34,7 @@
 //! - **Coverage-vs-position bins**: Picard's per-percent windows overlap at boundaries; we
 //!   sample 101 non-overlapping normalized positions.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -640,7 +641,7 @@ impl RnaCollector {
     /// Accumulate the strand 2×2 table and the R1/R2-transcript-strand template counts for a
     /// read that overlaps exactly one gene locus and at least one exon. Ports the strand and
     /// template logic of Picard `RnaSeqMetricsCollector.acceptRecord`.
-    fn tally_strand(&mut self, record: &RikerRecord, locus_idx: u32) {
+    fn tally_strand(&mut self, record: &RikerRecord, locus_idx: u32, mate_align: &MateAlign) {
         let model = self.gene_model.as_ref().expect("gene model loaded");
         let locus = model.locus(locus_idx);
         let flags = record.flags();
@@ -667,7 +668,7 @@ impl RnaCollector {
                 (false, 0, 0)
             } else {
                 let mate_start = position_u32(record.mate_alignment_start());
-                let mate_end = mate_alignment_end(record, mate_start);
+                let mate_end = mate_end_or_tlen(record, mate_start, mate_align);
                 let proper = record.reference_sequence_id() == record.mate_reference_sequence_id()
                     && get_pair_orientation(record) == Some(PairOrientation::Fr);
                 (proper, start.min(mate_start), end.max(mate_end))
@@ -690,49 +691,59 @@ impl RnaCollector {
     /// Resolve the mate read's reference span (see [`tally_insert_size`]). Returns `None` when the
     /// pair should be skipped: the MC path counts once at the first segment; the MC-less fallback
     /// handles only FR pairs at the forward read with a spec-compliant TLEN.
-    fn resolve_mate_span(
+    fn resolve_mate_span<'a>(
         &mut self,
         record: &RikerRecord,
         rec_start: u32,
         mate_start: u32,
         rec_mapped: u32,
-    ) -> Option<MateSpan> {
+        mate_align: &'a MateAlign,
+    ) -> Option<MateSpan<'a>> {
         let flags = record.flags();
-        if let Some(mc) = mate_cigar(record) {
-            if !flags.is_first_segment() {
-                return None; // exact path counts each pair once, at the first segment
+        match mate_align {
+            MateAlign::Parsed { blocks, end } => {
+                if !flags.is_first_segment() {
+                    return None; // exact path counts each pair once, at the first segment
+                }
+                let mapped = blocks.iter().map(|(_, l)| *l).sum();
+                Some(MateSpan {
+                    blocks: Cow::Borrowed(blocks.as_slice()),
+                    end: *end,
+                    mapped,
+                    approximate: false,
+                })
             }
-            let (blocks, end) = mate_alignment_blocks(&mc, mate_start)?;
-            let mapped = blocks.iter().map(|(_, l)| *l).sum();
-            Some(MateSpan { blocks, end, mapped, approximate: false })
-        } else {
-            if !self.mc_missing_warned {
-                log::warn!(
-                    "rna: some read pairs lack the MC (mate CIGAR) tag; transcript-space insert \
-                     size for FR pairs is estimated from the TLEN field (non-FR pairs are \
-                     skipped). Run e.g. `samtools fixmate -m` to add MC for exact results. This \
-                     warning is shown once."
-                );
-                self.mc_missing_warned = true;
+            // MC present but unparseable → skip the pair, matching the prior `?` on the parse.
+            MateAlign::Malformed => None,
+            MateAlign::Absent => {
+                if !self.mc_missing_warned {
+                    log::warn!(
+                        "rna: some read pairs lack the MC (mate CIGAR) tag; transcript-space \
+                         insert size for FR pairs is estimated from the TLEN field (non-FR pairs \
+                         are skipped). Run e.g. `samtools fixmate -m` to add MC for exact results. \
+                         This warning is shown once."
+                    );
+                    self.mc_missing_warned = true;
+                }
+                // FR pairs only, at the forward (leftmost, not reverse) read so the mate's right
+                // end is recoverable from TLEN; a degenerate (zero) TLEN is skipped, not guessed.
+                if flags.is_reverse_complemented()
+                    || !matches!(get_pair_orientation(record), Some(PairOrientation::Fr))
+                    || record.template_length() == 0
+                {
+                    return None;
+                }
+                let mate_end = tlen_fragment_end(rec_start, mate_start, record.template_length());
+                if mate_end < mate_start {
+                    return None;
+                }
+                Some(MateSpan {
+                    blocks: Cow::Owned(vec![(mate_start, mate_end - mate_start + 1)]),
+                    end: mate_end,
+                    mapped: rec_mapped, // proxy: assume the mate's read length matches this read's
+                    approximate: true,
+                })
             }
-            // FR pairs only, at the forward (leftmost, not reverse) read so the mate's right end is
-            // recoverable from TLEN; a degenerate (zero) TLEN is skipped rather than guessed.
-            if flags.is_reverse_complemented()
-                || !matches!(get_pair_orientation(record), Some(PairOrientation::Fr))
-                || record.template_length() == 0
-            {
-                return None;
-            }
-            let mate_end = tlen_fragment_end(rec_start, mate_start, record.template_length());
-            if mate_end < mate_start {
-                return None;
-            }
-            Some(MateSpan {
-                blocks: vec![(mate_start, mate_end - mate_start + 1)],
-                end: mate_end,
-                mapped: rec_mapped, // proxy: assume the mate's read length matches this read's
-                approximate: true,
-            })
         }
     }
 
@@ -758,6 +769,7 @@ impl RnaCollector {
         record: &RikerRecord,
         ref_id: usize,
         rec_blocks: &[(u32, u32)],
+        mate_align: &MateAlign,
         overlaps: &[u32],
     ) {
         let flags = record.flags();
@@ -775,7 +787,9 @@ impl RnaCollector {
         let mate_start = position_u32(record.mate_alignment_start());
         let rec_mapped: u32 = rec_blocks.iter().map(|(_, l)| *l).sum();
 
-        let Some(mate) = self.resolve_mate_span(record, rec_start, mate_start, rec_mapped) else {
+        let Some(mate) =
+            self.resolve_mate_span(record, rec_start, mate_start, rec_mapped, mate_align)
+        else {
             return;
         };
 
@@ -1336,7 +1350,12 @@ impl RnaCollector {
     /// `rrna_fragment_fraction`, tallying the read's aligned bases as ribosomal if so.
     /// Ports Picard's fragment-overlap rRNA test with the union-overlap and `MC`-fragment-end
     /// fixes.
-    fn classify_ribosomal(&mut self, record: &RikerRecord, ref_id: usize) -> bool {
+    fn classify_ribosomal(
+        &mut self,
+        record: &RikerRecord,
+        ref_id: usize,
+        mate_align: &MateAlign,
+    ) -> bool {
         let ribosomal = self.ribosomal.as_ref().expect("ribosomal source present");
         let flags = record.flags();
         let start = position_u32(record.alignment_start());
@@ -1349,7 +1368,7 @@ impl RnaCollector {
             return false; // chimeric / half-mapped: no fragment interval (Picard)
         } else {
             let mate_start = position_u32(record.mate_alignment_start());
-            let mate_end = mate_alignment_end(record, mate_start);
+            let mate_end = mate_end_or_tlen(record, mate_start, mate_align);
             (start.min(mate_start), end.max(mate_end))
         };
 
@@ -1452,8 +1471,13 @@ impl Collector for RnaCollector {
             return Ok(());
         }
 
+        // Mate CIGAR alignment, parsed once here (only for same-contig mapped pairs) and shared by
+        // the ribosomal, strand, and insert-size paths, each of which otherwise re-parsed the MC
+        // tag independently.
+        let mate_align = parse_mate_align(record, ref_id);
+
         // Ribosomal fragment classification (early-return if the fragment is ribosomal).
-        if self.ribosomal.is_some() && self.classify_ribosomal(record, ref_id) {
+        if self.ribosomal.is_some() && self.classify_ribosomal(record, ref_id, &mate_align) {
             if !flags.is_supplementary() {
                 self.ribosomal_reads += 1;
             }
@@ -1494,11 +1518,11 @@ impl Collector for RnaCollector {
 
         // Strand + template-strand metrics for single-locus exon-overlapping reads.
         if !flags.is_supplementary() && overlaps_exon && loci.len() == 1 {
-            self.tally_strand(record, loci[0]);
+            self.tally_strand(record, loci[0], &mate_align);
         }
 
         // Transcript-space insert size (own filters; counts each pair once).
-        self.tally_insert_size(record, ref_id, &rec_blocks, &loci);
+        self.tally_insert_size(record, ref_id, &rec_blocks, &mate_align, &loci);
         Ok(())
     }
 
@@ -1950,13 +1974,27 @@ struct CoverageMetrics {
     five_to_three: f64,
 }
 
+/// The mate read's reference alignment parsed once per read from its `MC` (mate CIGAR) tag, then
+/// shared by ribosomal classification, strand tallying, and insert size — each of which previously
+/// re-parsed the tag independently (up to three CIGAR parses + allocations per read). Computed only
+/// for reads whose mate is mapped to the same contig (see [`parse_mate_align`]); every other read
+/// gets [`MateAlign::Absent`], for which the consumers fall back exactly as before.
+enum MateAlign {
+    /// The `MC` tag is not present on the record (or the read is not a same-contig mapped pair).
+    Absent,
+    /// The `MC` tag is present but could not be parsed.
+    Malformed,
+    /// The `MC` tag parsed into its M/=/X alignment blocks and 1-based inclusive reference end.
+    Parsed { blocks: Vec<(u32, u32)>, end: u32 },
+}
+
 /// The mate read's resolved reference span for insert-size tallying. `blocks` are its M/=/X
-/// alignment blocks — the exact CIGAR blocks with `MC`, or a single whole-footprint block in the
-/// TLEN fallback; `end` is its 1-based inclusive reference end; `mapped` is the denominator for the
-/// exon-overlap fraction; `approximate` flags the MC-less fallback (which adds the
-/// both-ends-in-an-exon requirement before a transcript qualifies).
-struct MateSpan {
-    blocks: Vec<(u32, u32)>,
+/// alignment blocks — borrowed from the read's [`MateAlign`] on the exact `MC` path, or a single
+/// synthesized whole-footprint block in the TLEN fallback; `end` is its 1-based inclusive reference
+/// end; `mapped` is the denominator for the exon-overlap fraction; `approximate` flags the MC-less
+/// fallback (which adds the both-ends-in-an-exon requirement before a transcript qualifies).
+struct MateSpan<'a> {
+    blocks: Cow<'a, [(u32, u32)]>,
     end: u32,
     mapped: u32,
     approximate: bool,
@@ -2127,20 +2165,40 @@ fn mate_cigar(record: &RikerRecord) -> Option<Vec<u8>> {
     record.aux_tag(MC_TAG)?.as_str().map(|s| s.to_vec())
 }
 
+/// Parse the mate CIGAR once per read into a [`MateAlign`], shared by the ribosomal, strand, and
+/// insert-size paths. Only reads whose mate is mapped to the same contig (`ref_id`) parse the `MC`
+/// tag; anything else returns [`MateAlign::Absent`] without touching the aux data. Each consumer
+/// falls back for `Absent`/`Malformed` exactly as it did when it parsed `MC` itself.
+fn parse_mate_align(record: &RikerRecord, ref_id: usize) -> MateAlign {
+    let flags = record.flags();
+    if !flags.is_segmented()
+        || flags.is_mate_unmapped()
+        || record.mate_reference_sequence_id() != Some(ref_id)
+    {
+        return MateAlign::Absent;
+    }
+    let mate_start = position_u32(record.mate_alignment_start());
+    match mate_cigar(record) {
+        None => MateAlign::Absent,
+        Some(mc) => match mate_alignment_blocks(&mc, mate_start) {
+            Some((blocks, end)) => MateAlign::Parsed { blocks, end },
+            None => MateAlign::Malformed,
+        },
+    }
+}
+
 /// Reference end (1-based inclusive) used to bound the fragment span for the ribosomal and
 /// strand-template checks (both callers take `read_end.max(this)`).
 ///
-/// Prefers the exact mate end from the `MC` tag. When `MC` is absent it falls back to the
-/// TLEN-derived fragment end — `min(read_start, mate_start) + |TLEN| - 1`, exactly Picard's
-/// `CoordMath.getEnd(fragmentStart, abs(inferredInsertSize))` — never the read's own length.
-/// A missing/zero `TLEN` is degenerate (as in Picard); we return `mate_start` so the mate
-/// contributes only a single base rather than an underflowed span. (Transcript-space insert
-/// size, by contrast, requires `MC` and never reaches this fallback.)
-fn mate_alignment_end(record: &RikerRecord, mate_start: u32) -> u32 {
-    if let Some((_, ref_end)) =
-        mate_cigar(record).and_then(|mc| mate_alignment_blocks(&mc, mate_start))
-    {
-        return ref_end;
+/// Prefers the exact mate end from the precomputed `MC` alignment. When `MC` is absent or
+/// unparseable it falls back to the TLEN-derived fragment end — `min(read_start, mate_start) +
+/// |TLEN| - 1`, exactly Picard's `CoordMath.getEnd(fragmentStart, abs(inferredInsertSize))` —
+/// never the read's own length. A missing/zero `TLEN` is degenerate (as in Picard); we return
+/// `mate_start` so the mate contributes only a single base rather than an underflowed span.
+/// (Transcript-space insert size, by contrast, requires `MC` and never reaches this fallback.)
+fn mate_end_or_tlen(record: &RikerRecord, mate_start: u32, mate_align: &MateAlign) -> u32 {
+    if let MateAlign::Parsed { end, .. } = mate_align {
+        return *end;
     }
     tlen_fragment_end(position_u32(record.alignment_start()), mate_start, record.template_length())
 }
