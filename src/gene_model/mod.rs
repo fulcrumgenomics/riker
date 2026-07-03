@@ -301,8 +301,9 @@ pub struct BaseClassCounts {
 
 // ─── Transcript ──────────────────────────────────────────────────────────────
 
-/// A single transcript: its span, optional coding region, and exons. Exons are
-/// stored in genomic order (sorted by start). All coordinates are 1-based inclusive.
+/// A single transcript: its span, optional coding region, and exons. Exons are stored in genomic
+/// order (sorted by start) and pairwise disjoint (see `normalize_exons`). All coordinates are
+/// 1-based inclusive.
 pub struct Transcript {
     /// Transcript name / id.
     pub name: String,
@@ -314,7 +315,7 @@ pub struct Transcript {
     pub cds_start: Option<u32>,
     /// 1-based inclusive coding end, or `None` for non-coding transcripts.
     pub cds_end: Option<u32>,
-    /// Exons in genomic order (sorted by start).
+    /// Exons in genomic order (sorted by start), pairwise disjoint.
     pub exons: Vec<Exon>,
 }
 
@@ -578,15 +579,13 @@ fn build_locus(
         .into_iter()
         .map(|tx| {
             let name = tx.name();
-            let mut exons = tx.exons;
-            exons.sort_by_key(|e| (e.start, e.end));
             Transcript {
                 name,
                 start: tx.start,
                 end: tx.end,
                 cds_start: tx.cds_start,
                 cds_end: tx.cds_end,
-                exons,
+                exons: normalize_exons(tx.exons),
             }
         })
         .collect();
@@ -619,6 +618,24 @@ fn build_locus(
         exon_union: merge_intervals(exon_intervals),
         coding_union: merge_intervals(coding_intervals),
     })
+}
+
+/// Sort a transcript's exons by start and coalesce any that overlap into a sorted, pairwise-disjoint
+/// list. A transcript's exons are the disjoint spliced segments, so on real annotations this only
+/// sorts; it exists to normalize malformed or duplicate exon records (from hand-edited or
+/// pipeline-merged gene models) whose overlap would otherwise break the disjointness that
+/// `bases_overlapping_exons` relies on. Exons that merely touch (`end + 1 == start`) are already
+/// disjoint and left as separate exons.
+fn normalize_exons(mut exons: Vec<Exon>) -> Vec<Exon> {
+    exons.sort_by_key(|e| (e.start, e.end));
+    let mut disjoint: Vec<Exon> = Vec::with_capacity(exons.len());
+    for exon in exons {
+        match disjoint.last_mut() {
+            Some(last) if exon.start <= last.end => last.end = last.end.max(exon.end),
+            _ => disjoint.push(exon),
+        }
+    }
+    disjoint
 }
 
 /// Classify each alignment block (`(start, len)`, 1-based) against the sorted, disjoint
@@ -987,5 +1004,28 @@ mod tests {
         // Empty sets interspersed are skipped without affecting the result.
         let sets: [&[(u32, u32)]; 3] = [&[], &[(100, 200)], &[]];
         assert_eq!(union_of_sorted_disjoint(sets.iter().copied()), vec![(100, 200)]);
+    }
+
+    #[test]
+    fn normalize_exons_sorts_and_coalesces_overlaps() {
+        let ex = |s, e| Exon { start: s, end: e };
+
+        // Already-disjoint exons given out of order are only sorted, not merged.
+        assert_eq!(
+            normalize_exons(vec![ex(300, 400), ex(100, 200)]),
+            vec![ex(100, 200), ex(300, 400)]
+        );
+
+        // Exons that merely touch (end + 1 == start) stay separate.
+        assert_eq!(
+            normalize_exons(vec![ex(100, 150), ex(151, 200)]),
+            vec![ex(100, 150), ex(151, 200)]
+        );
+
+        // Overlapping, nested, shared-endpoint, and duplicate exons all coalesce.
+        assert_eq!(normalize_exons(vec![ex(100, 200), ex(150, 300)]), vec![ex(100, 300)]);
+        assert_eq!(normalize_exons(vec![ex(100, 500), ex(200, 300)]), vec![ex(100, 500)]);
+        assert_eq!(normalize_exons(vec![ex(100, 150), ex(150, 200)]), vec![ex(100, 200)]);
+        assert_eq!(normalize_exons(vec![ex(100, 200), ex(100, 200)]), vec![ex(100, 200)]);
     }
 }
