@@ -65,7 +65,7 @@ use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::record_utils::derive_sample;
-use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
+use crate::sam::riker_record::{AuxValue, RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 use smallvec::SmallVec;
 
@@ -2173,10 +2173,6 @@ fn rec_introns(record: &RikerRecord, min_intron: u32) -> CigarBlocks {
 }
 
 /// The `MC` (mate CIGAR) tag value as bytes, if present.
-fn mate_cigar(record: &RikerRecord) -> Option<Vec<u8>> {
-    record.aux_tag(MC_TAG)?.as_str().map(|s| s.to_vec())
-}
-
 /// Parse the mate CIGAR once per read into a [`MateAlign`], shared by the ribosomal, strand, and
 /// insert-size paths. Only reads whose mate is mapped to the same contig (`ref_id`) parse the `MC`
 /// tag; anything else returns [`MateAlign::Absent`] without touching the aux data. Each consumer
@@ -2189,13 +2185,16 @@ fn parse_mate_align(record: &RikerRecord, ref_id: usize) -> MateAlign {
     {
         return MateAlign::Absent;
     }
+    // Take the MC bytes by value out of the decoded aux value rather than copying them again — the
+    // store already owns a copy, so a borrow-and-`to_vec` would allocate a redundant second one.
+    // A missing MC tag (or a non-string one) is treated as absent, exactly as before.
+    let Some(AuxValue::String(mc)) = record.aux_tag(MC_TAG) else {
+        return MateAlign::Absent;
+    };
     let mate_start = position_u32(record.mate_alignment_start());
-    match mate_cigar(record) {
-        None => MateAlign::Absent,
-        Some(mc) => match mate_alignment_blocks(&mc, mate_start) {
-            Some((blocks, end)) => MateAlign::Parsed { blocks, end },
-            None => MateAlign::Malformed,
-        },
+    match mate_alignment_blocks(&mc, mate_start) {
+        Some((blocks, end)) => MateAlign::Parsed { blocks, end },
+        None => MateAlign::Malformed,
     }
 }
 
