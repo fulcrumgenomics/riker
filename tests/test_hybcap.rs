@@ -211,6 +211,100 @@ fn add_single_record(
     builder.add_record(record);
 }
 
+// ─── Input requirements ────────────────────────────────────────────────────────
+
+/// hybcap requires coordinate-sorted input. A BAM whose header declares a
+/// non-coordinate sort order is refused up front (before any processing), leaving
+/// no output.
+#[test]
+fn coordinate_unsorted_input_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let bait_path = dir.path().join("baits.bed");
+    let target_path = dir.path().join("targets.bed");
+    write_bed(&bait_path, &[("chr1", 0, 1000)]);
+    write_bed(&target_path, &[("chr1", 0, 1000)]);
+
+    // Declares @HD SO:unsorted.
+    let mut bld =
+        SamBuilder::with_contigs(&[("chr1".to_string(), 10_000)]).sort_order(SortOrder::Unsorted);
+    let qual = vec![30u8; 100];
+    let cigar = [Op::new(Kind::Match, 100)];
+    add_single_record(&mut bld, "r1", 0, 100, &cigar, &qual, 20, Flags::empty());
+
+    let bam = bld.to_temp_bam().unwrap();
+    let prefix = dir.path().join("out");
+    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+
+    let err = cmd.execute(None).expect_err("non-coordinate-sorted input should be rejected");
+    assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
+
+    // Rejected before any output is written.
+    let metrics = PathBuf::from(format!("{}{METRICS_SUFFIX}", prefix.display()));
+    assert!(!metrics.exists(), "rejected run wrote a metrics file: {}", metrics.display());
+}
+
+/// A BAM that *declares* `@HD SO:coordinate` but has out-of-order records (mislabeled)
+/// passes the header check, so the runtime monotonicity guard must catch it during
+/// processing — here via a decreasing reference id — and, per the all-or-nothing
+/// driver, leave no partial output. This exercises the guard's read-loop error path.
+#[test]
+fn coordinate_mislabeled_out_of_order_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let bait_path = dir.path().join("baits.bed");
+    let target_path = dir.path().join("targets.bed");
+    write_bed(&bait_path, &[("chr1", 0, 1000), ("chr2", 0, 1000)]);
+    write_bed(&target_path, &[("chr1", 0, 1000), ("chr2", 0, 1000)]);
+
+    // Header lies: declares coordinate sort, but records are written chr2-then-chr1
+    // (default Unsorted write order preserves insertion order).
+    let mut bld =
+        SamBuilder::with_contigs(&[("chr1".to_string(), 10_000), ("chr2".to_string(), 10_000)])
+            .declare_coordinate_sorted();
+    let qual = vec![30u8; 100];
+    let cigar = [Op::new(Kind::Match, 100)];
+    add_single_record(&mut bld, "on_chr2", 1, 100, &cigar, &qual, 20, Flags::empty());
+    add_single_record(&mut bld, "on_chr1", 0, 100, &cigar, &qual, 20, Flags::empty());
+
+    let bam = bld.to_temp_bam().unwrap();
+    let prefix = dir.path().join("out");
+    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+
+    let err = cmd.execute(None).expect_err("mislabeled out-of-order input should be rejected");
+    assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
+
+    // Read-loop error must leave no partial output (driver all-or-nothing).
+    let metrics = PathBuf::from(format!("{}{METRICS_SUFFIX}", prefix.display()));
+    assert!(!metrics.exists(), "rejected run wrote a metrics file: {}", metrics.display());
+}
+
+/// Coverage on a later contig is attributed to that contig's targets — i.e. the
+/// per-contig sweep cursors reset on a contig change. The chr1 read here sits
+/// past chr1's first target, advancing the target cursor; if the cursor were not
+/// reset for chr2, the stale index would run off chr2's shorter list and drop
+/// chr2's coverage (on_target_bases would be only 100 instead of 200).
+#[test]
+fn multi_contig_coverage_is_attributed_per_contig() {
+    let dir = TempDir::new().unwrap();
+    let bait_path = dir.path().join("baits.bed");
+    let target_path = dir.path().join("targets.bed");
+    // chr1 has two targets; the read hits the second, pruning the first.
+    write_bed(&bait_path, &[("chr1", 0, 100), ("chr1", 200, 300), ("chr2", 0, 100)]);
+    write_bed(&target_path, &[("chr1", 0, 100), ("chr1", 200, 300), ("chr2", 0, 100)]);
+
+    let mut bld = coord_builder(&[("chr1", 10_000), ("chr2", 10_000)]);
+    let qual = vec![30u8; 100];
+    let cigar = [Op::new(Kind::Match, 100)];
+    add_single_record(&mut bld, "r_chr1", 0, 201, &cigar, &qual, 20, Flags::empty()); // chr1:[200,300)
+    add_single_record(&mut bld, "r_chr2", 1, 1, &cigar, &qual, 20, Flags::empty()); // chr2:[0,100)
+
+    let bam = bld.to_temp_bam().unwrap();
+    let prefix = dir.path().join("out");
+    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+    let m = run_and_read(&cmd);
+
+    assert_eq!(m.on_target_bases, 200, "both reads' 100 on-target bases must be counted");
+}
+
 // ─── Tests ported from Picard ─────────────────────────────────────────────────
 
 /// Port of Picard test #1: Two 100bp reads with different base qualities.

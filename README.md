@@ -225,6 +225,8 @@ riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed
 riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed -r ref.fa
 ```
 
+The input BAM must be coordinate-sorted.
+
 Run multiple collectors in a single pass:
 
 ```bash

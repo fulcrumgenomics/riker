@@ -11,7 +11,8 @@ use noodles::sam::alignment::record::{
 };
 use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
 use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
-use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
+use noodles::sam::header::record::value::{Map, map::Header as HeaderMap, map::ReferenceSequence};
 use serde::de::DeserializeOwned;
 use std::io::BufWriter;
 use std::num::NonZeroUsize;
@@ -59,11 +60,39 @@ impl SamBuilder {
         Self { header: builder.build(), records: Vec::new(), sort_order: SortOrder::Unsorted }
     }
 
-    /// Set the sort order for the BAM file written by `to_temp_bam` / `write_to_file`.
+    /// Set the sort order for the BAM written by `to_temp_bam` / `write_to_file`. Also
+    /// stamps the matching `@HD SO` header tag so tools that require a declared sort
+    /// order (e.g. `hybcap`, `rna`) accept the file.
     #[allow(dead_code)]
     pub fn sort_order(mut self, order: SortOrder) -> Self {
         self.sort_order = order;
+        let so: &[u8] = match order {
+            SortOrder::Unsorted => b"unsorted",
+            SortOrder::Coordinate => b"coordinate",
+            SortOrder::QueryName => b"queryname",
+        };
+        self.stamp_sort_order(so);
         self
+    }
+
+    /// Stamp `@HD SO:coordinate` in the header WITHOUT reordering records, for building
+    /// a deliberately mislabeled BAM that exercises a tool's runtime order guard.
+    #[allow(dead_code)]
+    pub fn declare_coordinate_sorted(mut self) -> Self {
+        self.stamp_sort_order(b"coordinate");
+        self
+    }
+
+    /// Set the `@HD SO` value, creating the `@HD` map if absent. Mutates in place so
+    /// all other header state is preserved — `@RG`/`@PG`/`@CO` live outside the `@HD`
+    /// map, so rebuilding the header (the earlier approach) silently dropped them.
+    #[allow(dead_code)]
+    fn stamp_sort_order(&mut self, so: &[u8]) {
+        self.header
+            .header_mut()
+            .get_or_insert_with(|| Map::<HeaderMap>::builder().build().expect("valid @HD header"))
+            .other_fields_mut()
+            .insert(SORT_ORDER, so.to_vec().into());
     }
 
     /// Add a properly paired FR read pair.

@@ -9,7 +9,7 @@ type, and the open questions to resolve when we come back to this.
 After landing the pooled `RecordBuf` recycling (PR on `tf_multi_recordbuf_pool_proto`)
 and the crossbeam MPMC work queue (same branch), `riker multi --tools wgs`
 on a 12× 1KG BAM (~313M reads, 18GB) runs in **~3:01 wall** with **225s user
-time**. Sampling profile (`samply`, `bench-prof` profile with LTO off):
+time**. Sampling profile (`samply`, `profiling` profile with LTO off):
 
 | Thread            | CPU     | Top cost                                                   |
 |-------------------|---------|------------------------------------------------------------|

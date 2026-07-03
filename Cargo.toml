@@ -90,14 +90,6 @@ panic = "abort"
 inherits = "release"
 incremental = false
 
-# Local profiling profile for samply/atos. Identical codegen to `release`
-# but keeps DWARF debug info so native frames symbolicate to function names.
-# Not used for distribution; `release`/`dist` stay lean. Build with
-# `cargo build --profile profiling` -> target/profiling/riker.
-[profile.profiling]
-inherits = "release"
-debug = true
-
 # x86_64 release binaries are packaged with `cargo multivers` into a single
 # launcher that embeds the variants below and dispatches to the highest
 # match at startup. Variants:
@@ -146,7 +138,7 @@ pre-release-replacements = [
 ]
 
 # Profile that matches release perf closely but keeps symbol + line info for
-# samply/perf. Use via `cargo build --profile bench-prof`.
+# samply/perf. Use via `cargo build --profile profiling`.
 #
 # `lto = false` overrides the release default of `thin` LTO: thin LTO reorders
 # and merges function bodies across crates so aggressively that sampled PCs
@@ -160,7 +152,7 @@ pre-release-replacements = [
 # the minimal `debug = 1` symbol table, which makes atos / samply / Firefox
 # Profiler attribute samples to the right source line inside generic / inlined
 # functions.
-[profile.bench-prof]
+[profile.profiling]
 inherits = "release"
 lto = false
 debug = 2
