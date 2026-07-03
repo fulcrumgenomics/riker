@@ -21,6 +21,7 @@ use riker_lib::commands::isize::{
     InsertSizeMetric, METRICS_SUFFIX as ISIZE_SUFFIX, MultiIsizeOptions,
 };
 use riker_lib::commands::multi::{CollectorKind, Multi};
+use riker_lib::commands::rna::{METRICS_SUFFIX as RNA_METRICS_SUFFIX, RnaOptions, RnaSeqMetric};
 use riker_lib::commands::wgs::{
     COVERAGE_SUFFIX as WGS_COVERAGE_SUFFIX, METRICS_SUFFIX as WGS_SUFFIX, MultiWgsOptions, Wgs,
     WgsMetrics, WgsOptions,
@@ -83,6 +84,7 @@ fn make_multi(
         gcbias_opts,
         alignment_opts,
         error_opts,
+        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
     }
 }
 
@@ -106,6 +108,7 @@ fn make_multi_with_ref(
         gcbias_opts,
         alignment_opts,
         error_opts,
+        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
     }
 }
 
@@ -205,6 +208,52 @@ fn test_alignment_only() -> Result<()> {
     let alignment_metrics: Vec<AlignmentSummaryMetric> = read_metrics_tsv(&alignment_path)?;
     let pair = alignment_metrics.iter().find(|m| m.category == "pair").unwrap();
     assert_eq!(pair.total_reads, 10);
+
+    Ok(())
+}
+
+#[test]
+fn test_rna_through_multi_writes_metrics() -> Result<()> {
+    // rna is wired into multi (CollectorKind::Rna + MultiRnaOptions); exercise that path
+    // end-to-end so an integration break in build_collectors/execute is caught. rna needs a
+    // coordinate-sorted input and a gene model.
+    let mut b = SamBuilder::with_contigs(&[("chr1".to_string(), 100_000)])
+        .sort_order(SortOrder::Coordinate);
+    b.add_unpaired("coding", 0, 1500, 60, 100, false, false, false, None);
+    b.add_unpaired("utr", 0, 1000, 60, 100, false, false, false, None);
+    b.add_unpaired("intron", 0, 2400, 60, 100, false, false, false, None);
+    let bam = b.to_temp_bam()?;
+
+    // Two-exon coding gene MYGENE on chr1 (refFlat, 0-based half-open).
+    let gm = tempfile::NamedTempFile::new()?;
+    std::fs::write(
+        gm.path(),
+        "MYGENE\tNM_1\tchr1\t+\t999\t4000\t1499\t3500\t2\t999,2999,\t2000,4000,\n",
+    )?;
+
+    let dir = TempDir::new()?;
+    let prefix = dir.path().join("out");
+    let (wgs_opts, isize_opts, hybcap_opts, gcbias_opts, alignment_opts, error_opts) =
+        default_per_tool_opts();
+    let multi = Multi {
+        input: InputOptions { input: bam.path().to_path_buf() },
+        output: OutputOptions { output: prefix.clone() },
+        reference: OptionalReferenceOptions { reference: None },
+        tools: vec![CollectorKind::Rna],
+        wgs_opts,
+        isize_opts,
+        hybcap_opts,
+        gcbias_opts,
+        alignment_opts,
+        error_opts,
+        rna_opts: RnaOptions { gene_model: gm.path().to_path_buf(), ..Default::default() }.into(),
+    };
+    multi.execute(None)?;
+
+    let metrics: Vec<RnaSeqMetric> =
+        read_metrics_tsv(&PathBuf::from(format!("{}{RNA_METRICS_SUFFIX}", prefix.display())))?;
+    assert_eq!(metrics.len(), 1, "rna via multi should write exactly one summary row");
+    assert_eq!(metrics[0].mapped_reads, 3, "all three mapped reads should be counted");
 
     Ok(())
 }
@@ -721,6 +770,7 @@ fn test_hybcap_via_multi() -> Result<()> {
         gcbias_opts,
         alignment_opts,
         error_opts,
+        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
     };
     multi.execute(None)?;
 

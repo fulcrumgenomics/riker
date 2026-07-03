@@ -23,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past ~6 threads for BAM / ~8 for CRAM, but the sweet spot is platform- and
   input-dependent. Left unset, the single-pass tools run single-threaded and
   `multi` uses a small default pool.
+- **`rna`** command: RNA-seq QC metrics computed in a single pass — a port of
+  Picard `CollectRnaSeqMetrics` (base composition: coding / UTR / intronic /
+  intergenic / ribosomal; strand specificity; transcript 5'/3' coverage bias and
+  CV) together with fgbio `EstimateRnaSeqInsertSize` (insert size in transcript
+  space, introns collapsed), extended with read-level genomic origin (exonic /
+  intronic / intergenic / ambiguous / ribosomal reads), gene detection, splice-junction
+  annotation (known / partial-novel / novel, at observation and distinct-junction level),
+  transcript integrity (TIN: median / mean / stddev), and a per-biotype read-count file —
+  metrics informed by RSeQC, RNA-SeQC, and Qualimap. Accepts a gene model as UCSC refFlat, GTF, or GFF3
+  (GENCODE / Ensembl / RefSeq), auto-detected from file contents, with contig-name
+  reconciliation (`chr` add/strip, `MT`↔`chrM`, RefSeq accession → common name).
+  Strandedness is auto-detected by default (`--strand auto`); ribosomal territory
+  is the union of biotype-derived rRNA genes and an optional `--ribosomal-intervals`
+  file (BED or IntervalList). Writes `.rna-metrics.txt`, `.rna-biotype.txt` (+`.pdf`),
+  `.rna-gene-expression.pdf`, `.rna-coverage.pdf`, and `.rna-insert-size.txt` /
+  `-histogram.txt` (+`.pdf`).
+  Tunable via `--genes-detected-min-reads` (5), `--junction-min-intron` (50), and
+  `--tin-min-coverage` (10). Requires a
+  coordinate-sorted input; the `MC` (mate CIGAR) tag is required for the insert-size
+  metrics. Several Picard/fgbio behaviors are corrected and documented (top-1000
+  transcript selection, ribosomal-overlap union, non-overlapping coverage bins,
+  short-transcript bias exclusion, MC-derived fragment end, and an enclosure-based
+  insert-size acceptance rule) — see the "Differences in rna" section of the README.
 
 ### Changed
 
@@ -42,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-read interval-tree queries. Output is byte-identical. **`hybcap` now
   requires a coordinate-sorted BAM** and aborts with an error on an out-of-order
   record (it was previously order-agnostic).
+- **All commands validate output writability at startup** (fail-fast): the output
+  prefix's parent directory is checked for existence and writability before reading
+  any input, so a misspelled or unwritable output path fails immediately instead of
+  after a full pass over the data.
 
 ### Fixed
 

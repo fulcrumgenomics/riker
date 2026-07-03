@@ -87,6 +87,7 @@ impl Command for Alignment {
     /// # Errors
     /// Returns an error if the BAM cannot be read or the output cannot be written.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
+        super::common::validate_output_prefix(&self.output.output)?;
         let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,

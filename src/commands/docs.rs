@@ -14,6 +14,9 @@ use crate::commands::error::{IndelMetric, MismatchMetric, OverlappingMismatchMet
 use crate::commands::gcbias::{GcBiasDetailMetric, GcBiasSummaryMetric};
 use crate::commands::hybcap::{HybCapMetric, PerBaseCoverage, PerTargetCoverage};
 use crate::commands::isize::{InsertSizeHistogramEntry, InsertSizeMetric};
+use crate::commands::rna::{
+    RnaBiotypeMetric, RnaInsertSizeHistogramEntry, RnaInsertSizeMetric, RnaSeqMetric,
+};
 use crate::commands::wgs::{WgsCoverageEntry, WgsMetrics};
 use crate::metrics::{render_metric_docs_markdown, render_metric_docs_text};
 
@@ -64,6 +67,14 @@ impl Command for Docs {
                 writeln!(out)?;
                 render_metric_docs_text::<InsertSizeHistogramEntry>(&mut out)?;
                 writeln!(out)?;
+                render_metric_docs_text::<RnaSeqMetric>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_text::<RnaBiotypeMetric>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_text::<RnaInsertSizeMetric>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_text::<RnaInsertSizeHistogramEntry>(&mut out)?;
+                writeln!(out)?;
                 render_metric_docs_text::<MeanQualityByCycleMetric>(&mut out)?;
                 writeln!(out)?;
                 render_metric_docs_text::<QualityScoreDistributionMetric>(&mut out)?;
@@ -96,6 +107,14 @@ impl Command for Docs {
                 render_metric_docs_markdown::<InsertSizeMetric>(&mut out)?;
                 writeln!(out)?;
                 render_metric_docs_markdown::<InsertSizeHistogramEntry>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_markdown::<RnaSeqMetric>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_markdown::<RnaBiotypeMetric>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_markdown::<RnaInsertSizeMetric>(&mut out)?;
+                writeln!(out)?;
+                render_metric_docs_markdown::<RnaInsertSizeHistogramEntry>(&mut out)?;
                 writeln!(out)?;
                 render_metric_docs_markdown::<MeanQualityByCycleMetric>(&mut out)?;
                 writeln!(out)?;

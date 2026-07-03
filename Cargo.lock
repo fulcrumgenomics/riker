@@ -1850,6 +1850,7 @@ dependencies = [
  "noodles",
  "noodles-bgzf",
  "num-traits",
+ "percent-encoding",
  "riker-ngs-derive",
  "rpmalloc",
  "rust-htslib",

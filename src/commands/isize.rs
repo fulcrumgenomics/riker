@@ -2,10 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use kuva::plot::LinePlot;
-use kuva::render::layout::Layout;
-use kuva::render::plots::Plot;
-use kuva::render::render_utils::compute_tick_step;
 use noodles::sam::Header;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
@@ -15,7 +11,9 @@ use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use crate::counter::Counter;
 use crate::metrics::write_tsv;
-use crate::plotting::{FG_BLUE, FG_GREEN, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
+use crate::plotting::{
+    FG_BLUE, FG_GREEN, FG_TEAL, InsertSizeSeries, write_insert_size_histogram_pdf,
+};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
@@ -104,6 +102,7 @@ impl Command for InsertSize {
     /// # Errors
     /// Returns an error if the BAM file cannot be read or the output file cannot be written.
     fn execute(&self, threads: Option<u8>) -> Result<()> {
+        super::common::validate_output_prefix(&self.output.output)?;
         let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,
@@ -167,66 +166,18 @@ impl InsertSizeCollector {
     /// orientation.  A legend is shown when more than one orientation is plotted.
     /// Returns immediately (without writing a file) when no orientations qualify.
     fn plot_histogram(&self) -> Result<()> {
-        let total = self.fr.total() + self.rf.total() + self.tandem.total();
-
-        let orientations: [(&str, &str, &Counter<u64>); 3] = [
-            ("FR", FG_BLUE, &self.fr),
-            ("RF", FG_GREEN, &self.rf),
-            ("TANDEM", FG_TEAL, &self.tandem),
+        let series = [
+            InsertSizeSeries { name: "FR", color: FG_BLUE, histogram: &self.fr },
+            InsertSizeSeries { name: "RF", color: FG_GREEN, histogram: &self.rf },
+            InsertSizeSeries { name: "TANDEM", color: FG_TEAL, histogram: &self.tandem },
         ];
-
-        let mut plots: Vec<Plot> = Vec::new();
-        let mut data_x_max: f64 = 0.0;
-        for (name, color, hist) in &orientations {
-            let count = hist.total();
-            if count == 0 || (total > 0 && below_min_frac(count, total, self.min_frac)) {
-                continue;
-            }
-            let (median, mad) = hist.median_and_mad();
-            let trim_max = median + self.deviations * mad;
-            let xy: Vec<(f64, f64)> = hist
-                .sorted()
-                .into_iter()
-                .take_while(|&(k, _)| k as f64 <= trim_max)
-                .map(|(x, y)| (x as f64, y as f64))
-                .collect();
-            if let Some(&(x, _)) = xy.last() {
-                data_x_max = data_x_max.max(x);
-            }
-            plots.push(Plot::Line(
-                LinePlot::new()
-                    .with_data(xy)
-                    .with_color(*color)
-                    .with_fill()
-                    .with_fill_opacity(0.3)
-                    .with_legend(*name),
-            ));
-        }
-
-        if plots.is_empty() {
-            return Ok(());
-        }
-
-        // Snap the x-axis max up to a clean multiple of kuva's chosen tick step
-        // so the last major gridline lands on the axis edge. Without this, kuva's
-        // tick generator floors `axis_max` to the nearest step and the gap
-        // between the last labeled tick and the axis is ungridded.
-        let x_tick_step = compute_tick_step(0.0, data_x_max, 10);
-        let x_axis_max = (data_x_max / x_tick_step).ceil() * x_tick_step;
-
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
-            .with_title(&self.plot_title)
-            .with_x_label("Insert Size (bp)")
-            .with_y_label("Read Pairs")
-            .with_x_axis_min(0.0)
-            .with_x_axis_max(x_axis_max)
-            .with_x_tick_step(x_tick_step)
-            .with_minor_ticks(5)
-            .with_show_minor_grid(true);
-
-        write_plot_pdf(plots, layout, &self.plot_path)
+        write_insert_size_histogram_pdf(
+            &self.plot_path,
+            &self.plot_title,
+            &series,
+            self.min_frac,
+            self.deviations,
+        )
     }
 }
 

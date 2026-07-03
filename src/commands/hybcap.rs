@@ -181,6 +181,7 @@ pub struct HybCap {
 
 impl Command for HybCap {
     fn execute(&self, threads: Option<u8>) -> Result<()> {
+        super::common::validate_output_prefix(&self.output.output)?;
         let plan = self.thread_plan(threads);
         let mut reader = AlignmentReader::open(
             &self.input.input,
