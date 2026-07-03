@@ -213,9 +213,9 @@ fn add_single_record(
 
 // ─── Input requirements ────────────────────────────────────────────────────────
 
-/// hybcap requires coordinate-sorted input (its interval sweep assumes reads
-/// arrive in reference/position order). An out-of-order record must produce a
-/// clear error rather than silently yielding wrong metrics.
+/// hybcap requires coordinate-sorted input. A BAM whose header declares a
+/// non-coordinate sort order is refused up front (before any processing), leaving
+/// no output.
 #[test]
 fn coordinate_unsorted_input_is_rejected() {
     let dir = TempDir::new().unwrap();
@@ -224,43 +224,42 @@ fn coordinate_unsorted_input_is_rejected() {
     write_bed(&bait_path, &[("chr1", 0, 1000)]);
     write_bed(&target_path, &[("chr1", 0, 1000)]);
 
-    // Unsorted builder preserves insertion order: add a read at pos 500 followed
-    // by one at pos 100, so the second regresses in position.
+    // Declares @HD SO:unsorted.
     let mut bld =
         SamBuilder::with_contigs(&[("chr1".to_string(), 10_000)]).sort_order(SortOrder::Unsorted);
     let qual = vec![30u8; 100];
     let cigar = [Op::new(Kind::Match, 100)];
-    add_single_record(&mut bld, "late", 0, 500, &cigar, &qual, 20, Flags::empty());
-    add_single_record(&mut bld, "early", 0, 100, &cigar, &qual, 20, Flags::empty());
+    add_single_record(&mut bld, "r1", 0, 100, &cigar, &qual, 20, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
 
-    let err = cmd.execute(None).expect_err("coordinate-unsorted input should be rejected");
-    let msg = err.to_string();
-    assert!(msg.contains("coordinate-sorted"), "unexpected error message: {msg}");
+    let err = cmd.execute(None).expect_err("non-coordinate-sorted input should be rejected");
+    assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
 
-    // A rejected run must leave no partial output on disk (all-or-nothing): the
-    // driver skips finalization when the read loop errors.
+    // Rejected before any output is written.
     let metrics = PathBuf::from(format!("{}{METRICS_SUFFIX}", prefix.display()));
     assert!(!metrics.exists(), "rejected run wrote a metrics file: {}", metrics.display());
 }
 
-/// The sort-order guard fires on a decreasing reference id (contig), not only on
-/// a position regression within one contig.
+/// A BAM that *declares* `@HD SO:coordinate` but has out-of-order records (mislabeled)
+/// passes the header check, so the runtime monotonicity guard must catch it during
+/// processing — here via a decreasing reference id — and, per the all-or-nothing
+/// driver, leave no partial output. This exercises the guard's read-loop error path.
 #[test]
-fn coordinate_unsorted_across_contigs_is_rejected() {
+fn coordinate_mislabeled_out_of_order_is_rejected() {
     let dir = TempDir::new().unwrap();
     let bait_path = dir.path().join("baits.bed");
     let target_path = dir.path().join("targets.bed");
     write_bed(&bait_path, &[("chr1", 0, 1000), ("chr2", 0, 1000)]);
     write_bed(&target_path, &[("chr1", 0, 1000), ("chr2", 0, 1000)]);
 
-    // Unsorted: a chr2 (ref_id 1) read followed by a chr1 (ref_id 0) read.
+    // Header lies: declares coordinate sort, but records are written chr2-then-chr1
+    // (default Unsorted write order preserves insertion order).
     let mut bld =
         SamBuilder::with_contigs(&[("chr1".to_string(), 10_000), ("chr2".to_string(), 10_000)])
-            .sort_order(SortOrder::Unsorted);
+            .declare_coordinate_sorted();
     let qual = vec![30u8; 100];
     let cigar = [Op::new(Kind::Match, 100)];
     add_single_record(&mut bld, "on_chr2", 1, 100, &cigar, &qual, 20, Flags::empty());
@@ -270,8 +269,12 @@ fn coordinate_unsorted_across_contigs_is_rejected() {
     let prefix = dir.path().join("out");
     let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
 
-    let err = cmd.execute(None).expect_err("contig-decreasing input should be rejected");
+    let err = cmd.execute(None).expect_err("mislabeled out-of-order input should be rejected");
     assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
+
+    // Read-loop error must leave no partial output (driver all-or-nothing).
+    let metrics = PathBuf::from(format!("{}{METRICS_SUFFIX}", prefix.display()));
+    assert!(!metrics.exists(), "rejected run wrote a metrics file: {}", metrics.display());
 }
 
 /// Coverage on a later contig is attributed to that contig's targets — i.e. the

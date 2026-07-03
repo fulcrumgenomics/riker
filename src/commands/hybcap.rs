@@ -5,6 +5,7 @@ use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::Op;
 use noodles::sam::alignment::record::cigar::op::Kind;
+use noodles::sam::header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER};
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -928,6 +929,16 @@ impl HybCapCollector {
 
 impl Collector for HybCapCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
+        // The interval sweep requires coordinate-sorted input; refuse anything else
+        // up front (before loading intervals or computing per-target GC). The
+        // per-read guard in accept() is the backstop for a BAM whose header claims
+        // coordinate sort but isn't.
+        ensure!(
+            is_coordinate_sorted(header),
+            "hybcap requires a coordinate-sorted BAM/CRAM (@HD SO:coordinate); \
+             sort with `samtools sort`"
+        );
+
         let dict = SequenceDictionary::from(header);
 
         // Compute genome size from sequence dictionary
@@ -1679,6 +1690,14 @@ fn sweep_run(ivs: &[(u32, u32, u32)], cursor: &mut usize, start: u32, end: u32) 
         hi += 1;
     }
     (lo, hi)
+}
+
+/// True if the header declares coordinate sort order (`@HD SO:coordinate`).
+fn is_coordinate_sorted(header: &Header) -> bool {
+    header
+        .header()
+        .and_then(|hdr| hdr.other_fields().get(&SORT_ORDER))
+        .is_some_and(|so| AsRef::<[u8]>::as_ref(so) == COORDINATE)
 }
 
 // ─── Histogram helper functions ───────────────────────────────────────────────

@@ -11,7 +11,8 @@ use noodles::sam::alignment::record::{
 };
 use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
 use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
-use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
+use noodles::sam::header::record::value::{Map, map::Header as HeaderMap, map::ReferenceSequence};
 use serde::de::DeserializeOwned;
 use std::io::BufWriter;
 use std::num::NonZeroUsize;
@@ -59,11 +60,41 @@ impl SamBuilder {
         Self { header: builder.build(), records: Vec::new(), sort_order: SortOrder::Unsorted }
     }
 
-    /// Set the sort order for the BAM file written by `to_temp_bam` / `write_to_file`.
+    /// Set the sort order for the BAM written by `to_temp_bam` / `write_to_file`. Also
+    /// stamps the matching `@HD SO` header tag so tools that require a declared sort
+    /// order (e.g. `hybcap`, `rna`) accept the file.
     #[allow(dead_code)]
     pub fn sort_order(mut self, order: SortOrder) -> Self {
         self.sort_order = order;
+        let so: &[u8] = match order {
+            SortOrder::Unsorted => b"unsorted",
+            SortOrder::Coordinate => b"coordinate",
+            SortOrder::QueryName => b"queryname",
+        };
+        self.stamp_sort_order(so);
         self
+    }
+
+    /// Stamp `@HD SO:coordinate` in the header WITHOUT reordering records, for building
+    /// a deliberately mislabeled BAM that exercises a tool's runtime order guard.
+    #[allow(dead_code)]
+    pub fn declare_coordinate_sorted(mut self) -> Self {
+        self.stamp_sort_order(b"coordinate");
+        self
+    }
+
+    /// Rebuild the header with the given `@HD SO` value, preserving reference sequences.
+    #[allow(dead_code)]
+    fn stamp_sort_order(&mut self, so: &[u8]) {
+        let hd = Map::<HeaderMap>::builder()
+            .insert(SORT_ORDER, so.to_vec())
+            .build()
+            .expect("valid @HD header");
+        let mut builder = Header::builder().set_header(hd);
+        for (name, ref_seq) in self.header.reference_sequences() {
+            builder = builder.add_reference_sequence(name.clone(), ref_seq.clone());
+        }
+        self.header = builder.build();
     }
 
     /// Add a properly paired FR read pair.
