@@ -83,18 +83,16 @@ impl SamBuilder {
         self
     }
 
-    /// Rebuild the header with the given `@HD SO` value, preserving reference sequences.
+    /// Set the `@HD SO` value, creating the `@HD` map if absent. Mutates in place so
+    /// all other header state is preserved — `@RG`/`@PG`/`@CO` live outside the `@HD`
+    /// map, so rebuilding the header (the earlier approach) silently dropped them.
     #[allow(dead_code)]
     fn stamp_sort_order(&mut self, so: &[u8]) {
-        let hd = Map::<HeaderMap>::builder()
-            .insert(SORT_ORDER, so.to_vec())
-            .build()
-            .expect("valid @HD header");
-        let mut builder = Header::builder().set_header(hd);
-        for (name, ref_seq) in self.header.reference_sequences() {
-            builder = builder.add_reference_sequence(name.clone(), ref_seq.clone());
-        }
-        self.header = builder.build();
+        self.header
+            .header_mut()
+            .get_or_insert_with(|| Map::<HeaderMap>::builder().build().expect("valid @HD header"))
+            .other_fields_mut()
+            .insert(SORT_ORDER, so.to_vec().into());
     }
 
     /// Add a properly paired FR read pair.
