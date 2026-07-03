@@ -164,15 +164,14 @@ impl GeneModel {
                 )
             }
             many => {
-                let coding = merge_intervals(
-                    many.iter()
-                        .flat_map(|&i| self.loci[i as usize].coding_union.iter().copied())
-                        .collect(),
+                // Each locus's coding/exon unions are already sorted and disjoint, so union them
+                // with a merge rather than concatenate-and-sort. The spans (one interval per locus)
+                // are few and unsorted, so a plain sort-merge is cheapest there.
+                let coding = union_of_sorted_disjoint(
+                    many.iter().map(|&i| self.loci[i as usize].coding_union.as_slice()),
                 );
-                let exon = merge_intervals(
-                    many.iter()
-                        .flat_map(|&i| self.loci[i as usize].exon_union.iter().copied())
-                        .collect(),
+                let exon = union_of_sorted_disjoint(
+                    many.iter().map(|&i| self.loci[i as usize].exon_union.as_slice()),
                 );
                 let span = merge_intervals(
                     many.iter()
@@ -665,14 +664,59 @@ fn overlap_with_intervals(block_start: u32, block_end: u32, intervals: &[(u32, u
 fn merge_intervals(mut intervals: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     intervals.sort_unstable();
     let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
-    for (start, end) in intervals {
-        match merged.last_mut() {
-            // Coalesce when overlapping or directly adjacent (end + 1 == start).
-            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
-        }
+    for interval in intervals {
+        push_coalesced(&mut merged, interval);
     }
     merged
+}
+
+/// Union of several already-sorted, disjoint interval sets into one sorted, disjoint set — the same
+/// result as [`merge_intervals`] on their concatenation, but without the `O(n log n)` sort, since
+/// each input set is already ordered. Used on the hot multi-locus classification path, where each
+/// overlapping gene contributes its pre-merged exon/coding union.
+fn union_of_sorted_disjoint<'a>(sets: impl Iterator<Item = &'a [(u32, u32)]>) -> Vec<(u32, u32)> {
+    let mut acc: Vec<(u32, u32)> = Vec::new();
+    for set in sets {
+        if acc.is_empty() {
+            acc.extend_from_slice(set);
+        } else if !set.is_empty() {
+            acc = merge_two_sorted_disjoint(&acc, set);
+        }
+    }
+    acc
+}
+
+/// Merge two already-sorted, disjoint interval sets into one, coalescing overlapping or adjacent
+/// intervals. Both inputs must be sorted by start and internally disjoint.
+fn merge_two_sorted_disjoint(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].0 <= b[j].0 {
+            push_coalesced(&mut merged, a[i]);
+            i += 1;
+        } else {
+            push_coalesced(&mut merged, b[j]);
+            j += 1;
+        }
+    }
+    for &interval in &a[i..] {
+        push_coalesced(&mut merged, interval);
+    }
+    for &interval in &b[j..] {
+        push_coalesced(&mut merged, interval);
+    }
+    merged
+}
+
+/// Append `interval` to an ascending run of disjoint intervals, coalescing it into the last one
+/// when they overlap or are directly adjacent (`end + 1 == start`). `merged` must already be sorted
+/// and `interval.0` must be `>=` every start already pushed.
+fn push_coalesced(merged: &mut Vec<(u32, u32)>, interval: (u32, u32)) {
+    match merged.last_mut() {
+        Some(last) if interval.0 <= last.1 + 1 => last.1 = last.1.max(interval.1),
+        _ => merged.push(interval),
+    }
 }
 
 /// Resolve a gene-model contig name to a BAM `ref_id`, trying common naming variants:
@@ -907,5 +951,41 @@ mod tests {
         assert_eq!(overlap_with_intervals(150, 350, &intervals), 51 + 51); // [150,200]+[300,350]
         assert_eq!(overlap_with_intervals(210, 290, &intervals), 0); // intronic gap
         assert_eq!(overlap_with_intervals(50, 60, &intervals), 0); // before all
+    }
+
+    #[test]
+    fn merge_two_sorted_disjoint_interleaves_and_coalesces() {
+        // Interleaved, non-touching intervals keep both, in order.
+        assert_eq!(
+            merge_two_sorted_disjoint(&[(100, 200), (500, 600)], &[(300, 400)]),
+            vec![(100, 200), (300, 400), (500, 600)]
+        );
+        // Overlapping across the two sets coalesce into one.
+        assert_eq!(merge_two_sorted_disjoint(&[(100, 200)], &[(150, 300)]), vec![(100, 300)]);
+        // Directly adjacent (end + 1 == start) coalesce, matching merge_intervals.
+        assert_eq!(merge_two_sorted_disjoint(&[(100, 200)], &[(201, 300)]), vec![(100, 300)]);
+        // A duplicate interval present in both sets is deduplicated.
+        assert_eq!(merge_two_sorted_disjoint(&[(100, 200)], &[(100, 200)]), vec![(100, 200)]);
+    }
+
+    #[test]
+    fn union_of_sorted_disjoint_matches_merge_intervals() {
+        // The k-way union of pre-sorted sets equals sorting-and-merging their concatenation.
+        let sets: [&[(u32, u32)]; 3] =
+            [&[(100, 150), (400, 500)], &[(120, 200), (600, 700)], &[(180, 190)]];
+        let via_union = union_of_sorted_disjoint(sets.iter().copied());
+        let via_sort = merge_intervals(sets.iter().flat_map(|s| s.iter().copied()).collect());
+        assert_eq!(via_union, via_sort);
+        assert_eq!(via_union, vec![(100, 200), (400, 500), (600, 700)]);
+    }
+
+    #[test]
+    fn union_of_sorted_disjoint_handles_empty_and_single_sets() {
+        let empty: [&[(u32, u32)]; 0] = [];
+        assert!(union_of_sorted_disjoint(empty.iter().copied()).is_empty());
+
+        // Empty sets interspersed are skipped without affecting the result.
+        let sets: [&[(u32, u32)]; 3] = [&[], &[(100, 200)], &[]];
+        assert_eq!(union_of_sorted_disjoint(sets.iter().copied()), vec![(100, 200)]);
     }
 }
