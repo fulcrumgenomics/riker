@@ -76,6 +76,10 @@ use smallvec::SmallVec;
 /// touch the heap; spills to the heap only for reads spanning more than four blocks.
 type CigarBlocks = SmallVec<[(u32, u32); 4]>;
 
+/// The gene loci overlapping one read, from the coordinate sweep. Inline-backed: most reads fall
+/// in zero or one locus and never touch the heap; only reads over four overlapping genes spill.
+type LociVec = SmallVec<[u32; 4]>;
+
 // ─── Output file suffixes ──────────────────────────────────────────────────────
 
 /// Suffix for the summary metrics file.
@@ -550,7 +554,7 @@ impl RnaCollector {
         ref_id: usize,
         read_start: u32,
         read_end: u32,
-        out: &mut Vec<u32>,
+        out: &mut LociVec,
     ) -> Result<()> {
         let model = self.gene_model.as_ref().expect("gene model loaded");
         if self.sweep_ref != Some(ref_id) {
@@ -1496,7 +1500,7 @@ impl Collector for RnaCollector {
         // strand tallying, and insert size.
         let start = position_u32(record.alignment_start());
         let end = position_u32(record.alignment_end());
-        let mut loci = Vec::new();
+        let mut loci = LociVec::new();
         self.overlapping_loci(ref_id, start, end, &mut loci)?;
 
         // This read's CIGAR alignment blocks, parsed once here and shared by base classification
