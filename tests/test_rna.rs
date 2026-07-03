@@ -666,6 +666,65 @@ fn insert_size_collapses_introns() {
     );
 }
 
+#[test]
+fn insert_size_skips_pair_with_malformed_mc() {
+    // A present-but-unparseable MC tag (MateAlign::Malformed) must skip the pair for insert size —
+    // it must not fall through to the TLEN estimate the way a truly absent MC does.
+    let attrs =
+        "gene_id \"G\"; transcript_id \"T\"; gene_name \"G\"; gene_type \"protein_coding\";";
+    let gm = temp_with(&format!(
+        "chr1\tx\texon\t1000\t2000\t.\t+\t.\t{attrs}\n\
+         chr1\tx\texon\t4000\t5000\t.\t+\t.\t{attrs}\n"
+    ));
+
+    // Same FR pair as `insert_size_collapses_introns`, but with a garbage MC on both mates.
+    let mut r1 = rna_mate(
+        "p",
+        1500,
+        &[(Kind::Match, 50)],
+        false,
+        true,
+        4451,
+        &[(Kind::Match, 50)],
+        true,
+        3050,
+    );
+    let mut r2 = rna_mate(
+        "p",
+        4451,
+        &[(Kind::Match, 50)],
+        true,
+        false,
+        1500,
+        &[(Kind::Match, 50)],
+        false,
+        -3050,
+    );
+    for r in [&mut r1, &mut r2] {
+        r.data_mut().insert((*b"MC").into(), DataValue::String(b"not-a-cigar".to_vec().into()));
+    }
+    let mut b = builder();
+    b.add_record(r1);
+    b.add_record(r2);
+    let bam = b.to_temp_bam().unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+    Rna {
+        input: InputOptions { input: bam.path().to_path_buf() },
+        output: OutputOptions { output: prefix },
+        reference: OptionalReferenceOptions { reference: None },
+        options: RnaOptions { gene_model: gm.path().to_path_buf(), ..Default::default() },
+    }
+    .execute(None)
+    .unwrap();
+
+    let isize: Vec<RnaInsertSizeMetric> =
+        read_metrics_tsv(&dir.path().join(format!("out{ISIZE_SUFFIX}"))).unwrap();
+    let fr = isize.iter().find(|m| m.pair_orientation == "FR").unwrap();
+    assert_eq!(fr.read_pairs, 0, "a malformed MC tag must skip the pair, not estimate from TLEN");
+}
+
 fn two_exon_isize_model() -> NamedTempFile {
     // Gene with exons [1000,2000] and [4000,5000] (intron 2001..3999).
     let attrs =

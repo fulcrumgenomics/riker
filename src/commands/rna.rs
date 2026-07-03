@@ -46,6 +46,7 @@ use noodles::sam::header::record::value::map::header::{sort_order::COORDINATE, t
 use riker_derive::MetricDocs;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
@@ -67,7 +68,6 @@ use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{AuxValue, RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
-use smallvec::SmallVec;
 
 // ─── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -2172,7 +2172,6 @@ fn rec_introns(record: &RikerRecord, min_intron: u32) -> CigarBlocks {
     introns
 }
 
-/// The `MC` (mate CIGAR) tag value as bytes, if present.
 /// Parse the mate CIGAR once per read into a [`MateAlign`], shared by the ribosomal, strand, and
 /// insert-size paths. Only reads whose mate is mapped to the same contig (`ref_id`) parse the `MC`
 /// tag; anything else returns [`MateAlign::Absent`] without touching the aux data. Each consumer
@@ -2284,9 +2283,12 @@ fn encloses_inclusive(outer_start: u32, outer_end: u32, inner_start: u32, inner_
 /// Number of read bases in `blocks` that overlap the transcript's exons (1-based inclusive).
 /// Ported from fgbio `numReadBasesOverlappingTranscript`.
 ///
-/// Exons are sorted by start and disjoint, so for each block we binary-search the first exon
-/// that can overlap and scan only until an exon starts past the block — an O(blocks + exons)
-/// merge-walk rather than the full O(blocks × exons) product (mirrors `overlap_with_intervals`).
+/// A transcript's exons are sorted by start and pairwise disjoint (normalized at locus
+/// construction; see [`crate::gene_model`]'s `normalize_exons`), so for each block we binary-search
+/// the first exon that can overlap and scan only until an exon starts past the block — an
+/// O(blocks + exons) merge-walk rather than the full O(blocks × exons) product (mirrors
+/// `overlap_with_intervals`). Disjointness makes `e.end` monotonic, which the `partition_point`
+/// relies on and which guarantees every scanned exon truly overlaps (so the subtraction is exact).
 fn bases_overlapping_exons(blocks: &[(u32, u32)], exons: &[crate::gene_model::Exon]) -> u32 {
     let mut total = 0;
     for &(start, len) in blocks {
@@ -2436,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn mate_alignment_end_includes_trailing_skip() {
+    fn mate_alignment_blocks_includes_trailing_skip() {
         // A CIGAR ending in N must extend the reference end past the last aligned block
         // (matches fgbio lengthOnTarget). 50M2000N starting at 1000 → end 3049.
         let (blocks, end) = mate_alignment_blocks(b"50M2000N", 1000).unwrap();
