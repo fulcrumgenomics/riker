@@ -1,43 +1,21 @@
 mod helpers;
 
-use helpers::{FastaBuilder, SamBuilder, SortOrder, coord_builder, read_metrics_tsv};
-use noodles::core::Position;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::{
-    Flags, MappingQuality,
-    cigar::{Op, op::Kind},
-};
-use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+use helpers::read_metrics_tsv;
+use noodles::sam::alignment::record::Flags;
+use riker_lib::assert_close;
 use riker_lib::commands::command::Command;
 use riker_lib::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use riker_lib::commands::hybcap::{
     HybCap, HybCapMetric, HybCapOptions, METRICS_SUFFIX, PER_BASE_GZ_SUFFIX, PER_BASE_SUFFIX,
     PER_TARGET_SUFFIX, PerBaseCoverage, PerBaseCoverageFormat, PerTargetCoverage,
 };
+use riker_lib::test_support::{
+    BedBuilder, FastaBuilder, ReadBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
+};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Write a BED file to disk. Entries are (contig, start_0based, end_exclusive).
-fn write_bed(path: &Path, entries: &[(&str, u64, u64)]) {
-    use std::fmt::Write;
-    let content = entries.iter().fold(String::new(), |mut s, (chr, start, end)| {
-        writeln!(s, "{chr}\t{start}\t{end}").unwrap();
-        s
-    });
-    std::fs::write(path, content).unwrap();
-}
-
-/// Write a BED file with names. Entries are (contig, start_0based, end_exclusive, name).
-fn write_named_bed(path: &Path, entries: &[(&str, u64, u64, &str)]) {
-    use std::fmt::Write;
-    let content = entries.iter().fold(String::new(), |mut s, (chr, start, end, name)| {
-        writeln!(s, "{chr}\t{start}\t{end}\t{name}").unwrap();
-        s
-    });
-    std::fs::write(path, content).unwrap();
-}
 
 /// Build a hybcap command with common defaults.
 #[allow(clippy::too_many_arguments)]
@@ -77,138 +55,61 @@ fn run_and_read(cmd: &HybCap) -> HybCapMetric {
     rows.into_iter().next().unwrap()
 }
 
-/// Build a paired-end read pair with custom CIGAR and quality scores.
-///
-/// Both reads get the same CIGAR and quality. `pos1`/`pos2` are 1-based.
+/// Add a mapped single (fragment) read with a custom CIGAR string, per-base
+/// qualities, MAPQ, and flags. `contig` is a name (e.g. "chr1"); `pos` is 1-based.
+#[allow(clippy::too_many_arguments)]
+fn add_single_record(
+    sam: &mut SamBuilder,
+    name: &str,
+    contig: &str,
+    pos: usize,
+    cigar: &str,
+    qual: &[u8],
+    mapq: u8,
+    flags: Flags,
+) {
+    let mut r = read().name(name).at(contig, pos).cigar(cigar).quals(qual.to_vec()).mapq(mapq);
+    if flags.is_reverse_complemented() {
+        r = r.reverse();
+    }
+    if flags.is_secondary() {
+        r = r.secondary();
+    }
+    if flags.is_supplementary() {
+        r = r.supplementary();
+    }
+    if flags.is_duplicate() {
+        r = r.duplicate();
+    }
+    if flags.is_qc_fail() {
+        r = r.qc_fail();
+    }
+    sam.add(r);
+}
+
+/// Add a properly-paired FR read pair; both mates share `cigar`, `qual`, and `mapq`.
+/// `contig` is a name; `pos1`/`pos2` are 1-based.
 #[allow(clippy::too_many_arguments)]
 fn add_custom_pair(
-    builder: &mut SamBuilder,
+    sam: &mut SamBuilder,
     name: &str,
-    ref_id: usize,
+    contig: &str,
     pos1: usize,
     pos2: usize,
-    cigar_ops: &[Op],
+    cigar: &str,
     qual: &[u8],
     mapq: u8,
     is_duplicate: bool,
     fails_vendor_quality: bool,
 ) {
-    let cigar: Cigar = cigar_ops.iter().copied().collect();
-    let read_len: usize = cigar_ops
-        .iter()
-        .filter(|op| {
-            matches!(
-                op.kind(),
-                Kind::Match
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch
-                    | Kind::Insertion
-                    | Kind::SoftClip
-            )
-        })
-        .map(|op| op.len())
-        .sum();
-    let seq: Sequence = vec![b'A'; read_len].into();
-    let qual_scores = QualityScores::from(qual.to_vec());
-    let mq = MappingQuality::new(mapq).unwrap();
-
-    let mut flags1 = Flags::SEGMENTED
-        | Flags::PROPERLY_SEGMENTED
-        | Flags::MATE_REVERSE_COMPLEMENTED
-        | Flags::FIRST_SEGMENT;
-    let mut flags2 = Flags::SEGMENTED
-        | Flags::PROPERLY_SEGMENTED
-        | Flags::REVERSE_COMPLEMENTED
-        | Flags::LAST_SEGMENT;
+    let mut p = pair(name).at(contig, pos1, pos2).mapq(mapq).cigar(cigar).quals(qual.to_vec());
     if is_duplicate {
-        flags1 |= Flags::DUPLICATE;
-        flags2 |= Flags::DUPLICATE;
+        p = p.r1(ReadBuilder::duplicate).r2(ReadBuilder::duplicate);
     }
     if fails_vendor_quality {
-        flags1 |= Flags::QC_FAIL;
-        flags2 |= Flags::QC_FAIL;
+        p = p.qc_fail();
     }
-
-    let pos1_p = Position::new(pos1).unwrap();
-    let pos2_p = Position::new(pos2).unwrap();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let tlen = (pos2 as i32 - pos1 as i32) + read_len as i32;
-
-    let r1 = RecordBuf::builder()
-        .set_name(name)
-        .set_flags(flags1)
-        .set_reference_sequence_id(ref_id)
-        .set_alignment_start(pos1_p)
-        .set_mapping_quality(mq)
-        .set_cigar(cigar.clone())
-        .set_mate_reference_sequence_id(ref_id)
-        .set_mate_alignment_start(pos2_p)
-        .set_template_length(tlen)
-        .set_sequence(seq.clone())
-        .set_quality_scores(qual_scores.clone())
-        .build();
-
-    let r2 = RecordBuf::builder()
-        .set_name(name)
-        .set_flags(flags2)
-        .set_reference_sequence_id(ref_id)
-        .set_alignment_start(pos2_p)
-        .set_mapping_quality(mq)
-        .set_cigar(cigar)
-        .set_mate_reference_sequence_id(ref_id)
-        .set_mate_alignment_start(pos1_p)
-        .set_template_length(-tlen)
-        .set_sequence(seq)
-        .set_quality_scores(qual_scores)
-        .build();
-
-    builder.add_record(r1);
-    builder.add_record(r2);
-}
-
-/// Add a single mapped record with custom CIGAR, quality, and flags.
-#[allow(clippy::too_many_arguments)]
-fn add_single_record(
-    builder: &mut SamBuilder,
-    name: &str,
-    ref_id: usize,
-    pos: usize,
-    cigar_ops: &[Op],
-    qual: &[u8],
-    mapq: u8,
-    flags: Flags,
-) {
-    let cigar: Cigar = cigar_ops.iter().copied().collect();
-    let read_len: usize = cigar_ops
-        .iter()
-        .filter(|op| {
-            matches!(
-                op.kind(),
-                Kind::Match
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch
-                    | Kind::Insertion
-                    | Kind::SoftClip
-            )
-        })
-        .map(|op| op.len())
-        .sum();
-    let seq: Sequence = vec![b'A'; read_len].into();
-    let qual_scores = QualityScores::from(qual.to_vec());
-    let mq = MappingQuality::new(mapq).unwrap();
-
-    let record = RecordBuf::builder()
-        .set_name(name)
-        .set_flags(flags)
-        .set_reference_sequence_id(ref_id)
-        .set_alignment_start(Position::new(pos).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar)
-        .set_sequence(seq)
-        .set_quality_scores(qual_scores)
-        .build();
-
-    builder.add_record(record);
+    sam.add(p);
 }
 
 // ─── Input requirements ────────────────────────────────────────────────────────
@@ -219,21 +120,17 @@ fn add_single_record(
 #[test]
 fn coordinate_unsorted_input_is_rejected() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 1000)]);
-    write_bed(&target_path, &[("chr1", 0, 1000)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 1000).to_temp_bed().unwrap();
 
     // Declares @HD SO:unsorted.
     let mut bld =
         SamBuilder::with_contigs(&[("chr1".to_string(), 10_000)]).sort_order(SortOrder::Unsorted);
     let qual = vec![30u8; 100];
-    let cigar = [Op::new(Kind::Match, 100)];
-    add_single_record(&mut bld, "r1", 0, 100, &cigar, &qual, 20, Flags::empty());
+    add_single_record(&mut bld, "r1", "chr1", 100, "100M", &qual, 20, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(1, 10));
 
     let err = cmd.execute(None).expect_err("non-coordinate-sorted input should be rejected");
     assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
@@ -250,10 +147,11 @@ fn coordinate_unsorted_input_is_rejected() {
 #[test]
 fn coordinate_mislabeled_out_of_order_is_rejected() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 1000), ("chr2", 0, 1000)]);
-    write_bed(&target_path, &[("chr1", 0, 1000), ("chr2", 0, 1000)]);
+    let bed = BedBuilder::new()
+        .interval("chr1", 0, 1000)
+        .interval("chr2", 0, 1000)
+        .to_temp_bed()
+        .unwrap();
 
     // Header lies: declares coordinate sort, but records are written chr2-then-chr1
     // (default Unsorted write order preserves insertion order).
@@ -261,13 +159,12 @@ fn coordinate_mislabeled_out_of_order_is_rejected() {
         SamBuilder::with_contigs(&[("chr1".to_string(), 10_000), ("chr2".to_string(), 10_000)])
             .declare_coordinate_sorted();
     let qual = vec![30u8; 100];
-    let cigar = [Op::new(Kind::Match, 100)];
-    add_single_record(&mut bld, "on_chr2", 1, 100, &cigar, &qual, 20, Flags::empty());
-    add_single_record(&mut bld, "on_chr1", 0, 100, &cigar, &qual, 20, Flags::empty());
+    add_single_record(&mut bld, "on_chr2", "chr2", 100, "100M", &qual, 20, Flags::empty());
+    add_single_record(&mut bld, "on_chr1", "chr1", 100, "100M", &qual, 20, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(1, 10));
 
     let err = cmd.execute(None).expect_err("mislabeled out-of-order input should be rejected");
     assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
@@ -285,21 +182,24 @@ fn coordinate_mislabeled_out_of_order_is_rejected() {
 #[test]
 fn multi_contig_coverage_is_attributed_per_contig() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // chr1 has two targets; the read hits the second, pruning the first.
-    write_bed(&bait_path, &[("chr1", 0, 100), ("chr1", 200, 300), ("chr2", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100), ("chr1", 200, 300), ("chr2", 0, 100)]);
+    let bed = BedBuilder::new()
+        .interval("chr1", 0, 100)
+        .interval("chr1", 200, 300)
+        .interval("chr2", 0, 100)
+        .to_temp_bed()
+        .unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000), ("chr2", 10_000)]);
     let qual = vec![30u8; 100];
-    let cigar = [Op::new(Kind::Match, 100)];
-    add_single_record(&mut bld, "r_chr1", 0, 201, &cigar, &qual, 20, Flags::empty()); // chr1:[200,300)
-    add_single_record(&mut bld, "r_chr2", 1, 1, &cigar, &qual, 20, Flags::empty()); // chr2:[0,100)
+    // chr1:[200,300)
+    add_single_record(&mut bld, "r_chr1", "chr1", 201, "100M", &qual, 20, Flags::empty());
+    // chr2:[0,100)
+    add_single_record(&mut bld, "r_chr2", "chr2", 1, "100M", &qual, 20, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(1, 10));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_target_bases, 200, "both reads' 100 on-target bases must be counted");
@@ -313,49 +213,28 @@ fn multi_contig_coverage_is_attributed_per_contig() {
 #[test]
 fn test_low_base_quality_exclusion() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Target covers 200bp: chr1:0-200
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let good_qual = vec![30u8; 100];
     let bad_qual = vec![2u8; 100];
     // Two unpaired reads at pos 1, 100bp each
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &good_qual,
-        20,
-        Flags::empty(),
-    );
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &bad_qual,
-        20,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &good_qual, 20, Flags::empty());
+    add_single_record(&mut bld, "read2", "chr1", 1, "100M", &bad_qual, 20, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(1, 10));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(1, 10));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 2);
     assert_eq!(m.deduped_bases_aligned, 200);
-    assert_float_eq!(m.frac_exc_baseq, 0.5, 0.001);
-    assert_float_eq!(m.frac_exc_overlap, 0.0, 0.001);
-    assert_float_eq!(m.frac_exc_off_target, 0.0, 0.001);
-    assert_float_eq!(m.frac_target_bases_1x, 0.5, 0.001);
+    assert_close!(m.frac_exc_baseq, 0.5, 0.001);
+    assert_close!(m.frac_exc_overlap, 0.0, 0.001);
+    assert_close!(m.frac_exc_off_target, 0.0, 0.001);
+    assert_close!(m.frac_target_bases_1x, 0.5, 0.001);
     assert_eq!(m.max_target_coverage, 1);
     assert_eq!(m.min_target_coverage, 0);
     assert_eq!(m.total_bases, 200);
@@ -366,49 +245,28 @@ fn test_low_base_quality_exclusion() {
 #[test]
 fn test_low_mapq_filtering() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 101];
     // Read 1: MAPQ=100
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 101)],
-        &qual,
-        100,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "101M", &qual, 100, Flags::empty());
     // Read 2: MAPQ=1
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        1,
-        &[Op::new(Kind::Match, 101)],
-        &qual,
-        1,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read2", "chr1", 1, "101M", &qual, 1, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(2, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(2, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 2);
     assert_eq!(m.bases_aligned, 202);
-    assert_float_eq!(m.frac_exc_baseq, 0.0, 0.001);
+    assert_close!(m.frac_exc_baseq, 0.0, 0.001);
     // One read filtered by MAPQ: 101 / 202 bases
-    assert_float_eq!(m.frac_exc_mapq, 101.0 / 202.0, 0.001);
+    assert_close!(m.frac_exc_mapq, 101.0 / 202.0, 0.001);
     // Only 101 bases survive, covering positions 1-101 out of 200bp target
-    assert_float_eq!(m.frac_target_bases_1x, 101.0 / 200.0, 0.001);
+    assert_close!(m.frac_target_bases_1x, 101.0 / 200.0, 0.001);
 }
 
 /// Port of Picard test #5: Two overlapping paired-end reads with clipping.
@@ -417,40 +275,26 @@ fn test_low_mapq_filtering() {
 #[test]
 fn test_overlapping_reads_with_clipping() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 101];
     // Paired reads: both at pos 1, 101bp, perfectly overlapping
-    add_custom_pair(
-        &mut bld,
-        "pair1",
-        0,
-        1,
-        1,
-        &[Op::new(Kind::Match, 101)],
-        &qual,
-        60,
-        false,
-        false,
-    );
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 1, "101M", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 2);
     assert_eq!(m.bases_aligned, 202);
     // The second-of-pair (left-most tie) gets fully clipped
-    assert_float_eq!(m.frac_exc_overlap, 101.0 / 202.0, 0.01);
-    assert_float_eq!(m.frac_target_bases_1x, 101.0 / 200.0, 0.01);
+    assert_close!(m.frac_exc_overlap, 101.0 / 202.0, 0.01);
+    assert_close!(m.frac_target_bases_1x, 101.0 / 200.0, 0.01);
 }
 
 /// Port of Picard test #6: Overlapping reads WITHOUT clipping.
@@ -458,35 +302,21 @@ fn test_overlapping_reads_with_clipping() {
 #[test]
 fn test_overlapping_reads_without_clipping() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 101];
-    add_custom_pair(
-        &mut bld,
-        "pair1",
-        0,
-        1,
-        1,
-        &[Op::new(Kind::Match, 101)],
-        &qual,
-        60,
-        false,
-        false,
-    );
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 1, "101M", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = true;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
-    assert_float_eq!(m.frac_exc_overlap, 0.0, 0.001);
+    assert_close!(m.frac_exc_overlap, 0.0, 0.001);
     // Both reads cover pos 1-101, so 101 bases covered at 2x → max coverage = 2
     assert_eq!(m.max_target_coverage, 2);
     // On-target bases = both reads' bases = 202 (both count)
@@ -499,35 +329,24 @@ fn test_overlapping_reads_without_clipping() {
 #[test]
 fn test_short_read_partial_target() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Two 10bp intervals
-    write_bed(&bait_path, &[("chr1", 0, 10), ("chr1", 90, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 10), ("chr1", 90, 100)]);
+    let bed =
+        BedBuilder::new().interval("chr1", 0, 10).interval("chr1", 90, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 10];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 10)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "10M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 1);
     assert_eq!(m.deduped_bases_aligned, 10);
     assert_eq!(m.target_territory, 20);
-    assert_float_eq!(m.frac_target_bases_1x, 0.5, 0.001);
+    assert_close!(m.frac_target_bases_1x, 0.5, 0.001);
     assert_eq!(m.max_target_coverage, 1);
     assert_eq!(m.min_target_coverage, 0);
 }
@@ -537,10 +356,7 @@ fn test_short_read_partial_target() {
 #[test]
 fn test_fold_80_uniform_coverage() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 999, 1199)]);
-    write_bed(&target_path, &[("chr1", 999, 1199)]);
+    let bed = BedBuilder::new().interval("chr1", 999, 1199).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 200];
@@ -548,9 +364,9 @@ fn test_fold_80_uniform_coverage() {
         add_single_record(
             &mut bld,
             &format!("read{i}"),
-            0,
+            "chr1",
             1000,
-            &[Op::new(Kind::Match, 200)],
+            "200M",
             &qual,
             60,
             Flags::empty(),
@@ -560,14 +376,14 @@ fn test_fold_80_uniform_coverage() {
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
-    assert_float_eq!(m.mean_target_coverage, 100.0, 0.01);
-    assert_float_eq!(m.median_target_coverage, 100.0, 0.01);
-    assert_float_eq!(m.fold_80_base_penalty, 1.0, 0.01);
-    assert_float_eq!(m.frac_target_bases_100x, 1.0, 0.001);
-    assert_float_eq!(m.frac_target_bases_1000x, 0.0, 0.001);
+    assert_close!(m.mean_target_coverage, 100.0, 0.01);
+    assert_close!(m.median_target_coverage, 100.0, 0.01);
+    assert_close!(m.fold_80_base_penalty, 1.0, 0.01);
+    assert_close!(m.frac_target_bases_100x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_1000x, 0.0, 0.001);
 }
 
 /// Port of Picard indel test: Deletion without INCLUDE_INDELS reduces coverage.
@@ -576,16 +392,21 @@ fn test_fold_80_uniform_coverage() {
 #[test]
 fn test_deletion_without_include_indels() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 120)]);
-    write_bed(&target_path, &[("chr1", 0, 120)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 120).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100]; // 90M + 10M = 100 read bases
-    let cigar = [Op::new(Kind::Match, 90), Op::new(Kind::Deletion, 20), Op::new(Kind::Match, 10)];
     for i in 0..100 {
-        add_single_record(&mut bld, &format!("read{i}"), 0, 1, &cigar, &qual, 60, Flags::empty());
+        add_single_record(
+            &mut bld,
+            &format!("read{i}"),
+            "chr1",
+            1,
+            "90M20D10M",
+            &qual,
+            60,
+            Flags::empty(),
+        );
     }
 
     let bam = bld.to_temp_bam().unwrap();
@@ -593,11 +414,11 @@ fn test_deletion_without_include_indels() {
 
     let mut options = opts(0, 0);
     options.include_indels = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     // 90 bases at 100x + 20 bases at 0x + 10 bases at 100x = 10000 total / 120 = 83.33
-    assert_float_eq!(m.mean_target_coverage, 10_000.0 / 120.0, 0.5);
+    assert_close!(m.mean_target_coverage, 10_000.0 / 120.0, 0.5);
     assert_eq!(m.min_target_coverage, 0);
 }
 
@@ -605,16 +426,21 @@ fn test_deletion_without_include_indels() {
 #[test]
 fn test_deletion_with_include_indels() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 120)]);
-    write_bed(&target_path, &[("chr1", 0, 120)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 120).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-    let cigar = [Op::new(Kind::Match, 90), Op::new(Kind::Deletion, 20), Op::new(Kind::Match, 10)];
     for i in 0..100 {
-        add_single_record(&mut bld, &format!("read{i}"), 0, 1, &cigar, &qual, 60, Flags::empty());
+        add_single_record(
+            &mut bld,
+            &format!("read{i}"),
+            "chr1",
+            1,
+            "90M20D10M",
+            &qual,
+            60,
+            Flags::empty(),
+        );
     }
 
     let bam = bld.to_temp_bam().unwrap();
@@ -622,11 +448,11 @@ fn test_deletion_with_include_indels() {
 
     let mut options = opts(0, 0);
     options.include_indels = true;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     // With indels: 120 bases all at 100x = 100.0 mean
-    assert_float_eq!(m.mean_target_coverage, 100.0, 0.5);
+    assert_close!(m.mean_target_coverage, 100.0, 0.5);
     assert_eq!(m.min_target_coverage, 100);
 }
 
@@ -636,277 +462,160 @@ fn test_deletion_with_include_indels() {
 #[test]
 fn test_duplicate_exclusion() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // One non-duplicate
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
     // One duplicate
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::DUPLICATE,
-    );
+    add_single_record(&mut bld, "read2", "chr1", 1, "100M", &qual, 60, Flags::DUPLICATE);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 2);
     assert_eq!(m.deduped_reads, 1);
-    assert_float_eq!(m.frac_exc_dupe, 0.5, 0.01);
-    assert_float_eq!(m.mean_target_coverage, 1.0, 0.01);
+    assert_close!(m.frac_exc_dupe, 0.5, 0.01);
+    assert_close!(m.mean_target_coverage, 1.0, 0.01);
 }
 
 /// include_duplicates=true should count duplicates toward coverage.
 #[test]
 fn test_include_duplicates() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::DUPLICATE,
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
+    add_single_record(&mut bld, "read2", "chr1", 1, "100M", &qual, 60, Flags::DUPLICATE);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.include_duplicates = true;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
-    assert_float_eq!(m.frac_exc_dupe, 0.0, 0.001);
-    assert_float_eq!(m.mean_target_coverage, 2.0, 0.01);
+    assert_close!(m.frac_exc_dupe, 0.0, 0.001);
+    assert_close!(m.mean_target_coverage, 2.0, 0.01);
 }
 
 /// QC fail reads should be excluded from all computations.
 #[test]
 fn test_qc_fail_excluded() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::QC_FAIL,
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
+    add_single_record(&mut bld, "read2", "chr1", 1, "100M", &qual, 60, Flags::QC_FAIL);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 1); // QC-fail read is excluded entirely
-    assert_float_eq!(m.mean_target_coverage, 1.0, 0.01);
+    assert_close!(m.mean_target_coverage, 1.0, 0.01);
 }
 
 /// Secondary alignments should be completely skipped.
 #[test]
 fn test_secondary_skipped() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // Primary read
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
     // Secondary alignment (should be skipped entirely)
-    add_single_record(
-        &mut bld,
-        "read1_sec",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::SECONDARY,
-    );
+    add_single_record(&mut bld, "read1_sec", "chr1", 1, "100M", &qual, 60, Flags::SECONDARY);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 1); // secondary not counted
-    assert_float_eq!(m.mean_target_coverage, 1.0, 0.01);
+    assert_close!(m.mean_target_coverage, 1.0, 0.01);
 }
 
 /// Off-target bases should be excluded and counted as exc_off_target.
 #[test]
 fn test_off_target_exclusion() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Bait and target only cover positions 0-50
-    write_bed(&bait_path, &[("chr1", 0, 50)]);
-    write_bed(&target_path, &[("chr1", 0, 50)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 50).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // Read covers 1-100, but only 50bp on target
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
-    assert_float_eq!(m.frac_target_bases_1x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_1x, 1.0, 0.001);
     assert_eq!(m.on_target_bases, 50);
     // 50 off-target bases out of 100 aligned
-    assert_float_eq!(m.frac_exc_off_target, 0.5, 0.01);
+    assert_close!(m.frac_exc_off_target, 0.5, 0.01);
 }
 
 /// Bait territory and target territory should be computed correctly after merging.
 #[test]
 fn test_territory_computation() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Overlapping baits: [0-60) and [40-100) → merged [0-100) = 100bp
-    write_bed(&bait_path, &[("chr1", 0, 60), ("chr1", 40, 100)]);
+    let baits =
+        BedBuilder::new().interval("chr1", 0, 60).interval("chr1", 40, 100).to_temp_bed().unwrap();
     // Non-overlapping targets: [0-30) and [70-100) = 60bp
-    write_bed(&target_path, &[("chr1", 0, 30), ("chr1", 70, 100)]);
+    let targets =
+        BedBuilder::new().interval("chr1", 0, 30).interval("chr1", 70, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), baits.path(), targets.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.bait_territory, 100);
     assert_eq!(m.target_territory, 60);
-    assert_float_eq!(m.bait_design_efficiency, 60.0 / 100.0, 0.001);
+    assert_close!(m.bait_design_efficiency, 60.0 / 100.0, 0.001);
 }
 
 /// Genome size should be the sum of all contig lengths from the BAM header.
 #[test]
 fn test_genome_size() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld =
         SamBuilder::with_contigs(&[("chr1".to_string(), 1000), ("chr2".to_string(), 2000)])
             .sort_order(SortOrder::Coordinate);
     let qual = vec![30u8; 100];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.genome_size, 3000);
@@ -916,32 +625,29 @@ fn test_genome_size() {
 #[test]
 fn test_per_target_coverage_output() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Non-abutting intervals so they don't merge
-    write_named_bed(&bait_path, &[("chr1", 0, 50, "bait1"), ("chr1", 60, 110, "bait2")]);
-    write_named_bed(&target_path, &[("chr1", 0, 50, "target1"), ("chr1", 60, 110, "target2")]);
+    let baits = BedBuilder::new()
+        .named("chr1", 0, 50, "bait1")
+        .named("chr1", 60, 110, "bait2")
+        .to_temp_bed()
+        .unwrap();
+    let targets = BedBuilder::new()
+        .named("chr1", 0, 50, "target1")
+        .named("chr1", 60, 110, "target2")
+        .to_temp_bed()
+        .unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 50];
     // Only cover first target
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 50)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "50M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.per_target_coverage = true;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), baits.path(), targets.path(), &prefix, None, options);
     cmd.execute(None).unwrap();
 
     let per_target_path = PathBuf::from(format!("{}{PER_TARGET_SUFFIX}", prefix.display()));
@@ -950,45 +656,33 @@ fn test_per_target_coverage_output() {
 
     // First target: covered
     assert_eq!(rows[0].name, "target1");
-    assert_float_eq!(rows[0].mean_coverage, 1.0, 0.01);
+    assert_close!(rows[0].mean_coverage, 1.0, 0.01);
     assert_eq!(rows[0].min_coverage, 1);
 
     // Second target: not covered
     assert_eq!(rows[1].name, "target2");
-    assert_float_eq!(rows[1].mean_coverage, 0.0, 0.01);
+    assert_close!(rows[1].mean_coverage, 0.0, 0.01);
     assert_eq!(rows[1].max_coverage, 0);
-    assert_float_eq!(rows[1].frac_0x, 1.0, 0.001);
+    assert_close!(rows[1].frac_0x, 1.0, 0.001);
 }
 
 /// Per-base coverage output should have one row per target base position.
 #[test]
 fn test_per_base_coverage_output() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 5)]);
-    write_bed(&target_path, &[("chr1", 0, 5)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 5).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 3];
     // Read covers positions 1-3 (0-based: 0-2) → first 3 of 5 target bases
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 3)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "3M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.per_base_coverage = Some(PerBaseCoverageFormat::Uncompressed);
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     cmd.execute(None).unwrap();
 
     let per_base_path = PathBuf::from(format!("{}{PER_BASE_SUFFIX}", prefix.display()));
@@ -1013,30 +707,18 @@ fn test_per_base_coverage_output() {
 #[test]
 fn test_per_base_coverage_output_compressed() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 5)]);
-    write_bed(&target_path, &[("chr1", 0, 5)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 5).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 3];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 3)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "3M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.per_base_coverage = Some(PerBaseCoverageFormat::Compressed);
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     cmd.execute(None).unwrap();
 
     // The plain-text variant must not exist when compressed output is selected.
@@ -1065,31 +747,19 @@ fn test_per_base_coverage_output_compressed() {
 #[test]
 fn test_bait_classification() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Bait covers positions 0-50
-    write_bed(&bait_path, &[("chr1", 0, 50)]);
-    write_bed(&target_path, &[("chr1", 0, 50)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 50).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // Read covers 1-100 (0-based: 0-99). First 50bp on bait, next 50bp near bait
     // (within 250bp near_distance default)
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_bait_bases, 50);
@@ -1101,29 +771,17 @@ fn test_bait_classification() {
 #[test]
 fn test_off_bait_classification() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 50)]);
-    write_bed(&target_path, &[("chr1", 0, 50)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 50).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 50];
     // Read is >250bp away from bait → off-bait
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        500,
-        &[Op::new(Kind::Match, 50)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 500, "50M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_bait_bases, 0);
@@ -1135,43 +793,33 @@ fn test_off_bait_classification() {
 #[test]
 fn test_zero_coverage_targets() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 50), ("chr1", 500, 550)]);
-    write_bed(&target_path, &[("chr1", 0, 50), ("chr1", 500, 550)]);
+    let bed =
+        BedBuilder::new().interval("chr1", 0, 50).interval("chr1", 500, 550).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 50];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 50)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "50M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     // 1 out of 2 targets has zero coverage
-    assert_float_eq!(m.frac_uncovered_targets, 0.5, 0.001);
+    assert_close!(m.frac_uncovered_targets, 0.5, 0.001);
 }
 
 /// GC/AT dropout with reference: verify non-zero values when coverage is skewed.
 #[test]
 fn test_gc_dropout_with_reference() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Two non-abutting targets: one AT-rich, one GC-rich (gap so they don't merge)
-    write_bed(&bait_path, &[("chr1", 0, 100), ("chr1", 200, 300)]);
-    write_bed(&target_path, &[("chr1", 0, 100), ("chr1", 200, 300)]);
+    let bed = BedBuilder::new()
+        .interval("chr1", 0, 100)
+        .interval("chr1", 200, 300)
+        .to_temp_bed()
+        .unwrap();
 
     // Reference: AT-rich at 0-100, padding at 100-200, GC-rich at 200-300, rest N
     let at_bases = [b'A'; 100];
@@ -1185,27 +833,17 @@ fn test_gc_dropout_with_reference() {
         .chain(padding2.iter())
         .copied()
         .collect();
-    let refa = FastaBuilder::new().add_contig("chr1", &ref_seq).to_temp_fasta().unwrap();
+    let refa = FastaBuilder::new().contig("chr1", ref_seq).to_temp_fasta().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // Only cover the AT-rich target (GC-rich has no coverage → GC dropout)
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd =
-        make_cmd(bam.path(), &bait_path, &target_path, &prefix, Some(refa.path()), opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, Some(refa.path()), opts(0, 0));
     let m = run_and_read(&cmd);
 
     // GC dropout should be positive (GC-rich target has less coverage than expected)
@@ -1216,28 +854,18 @@ fn test_gc_dropout_with_reference() {
 #[test]
 fn test_panel_name_default() {
     let dir = TempDir::new().unwrap();
+    // Panel name defaults to the bait file stem, so the bait file needs that name.
     let bait_path = dir.path().join("my_panel.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    BedBuilder::new().interval("chr1", 0, 100).write_bed(&bait_path).unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), &bait_path, &bait_path, &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.panel_name, "my_panel");
@@ -1247,30 +875,18 @@ fn test_panel_name_default() {
 #[test]
 fn test_panel_name_custom() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.panel_name = Some("TwistExome".to_string());
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     assert_eq!(m.panel_name, "TwistExome");
@@ -1280,88 +896,61 @@ fn test_panel_name_custom() {
 #[test]
 fn test_fold_enrichment() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Bait covers 100bp out of 10000bp genome
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // Read is entirely on bait
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     // 100% on bait, bait is 100/10000 = 1% of genome → enrichment = 1.0 / 0.01 = 100
-    assert_float_eq!(m.fold_enrichment, 100.0, 1.0);
+    assert_close!(m.fold_enrichment, 100.0, 1.0);
 }
 
 /// Mixed base quality: half good, half bad within same read.
 #[test]
 fn test_mixed_base_quality_in_read() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     // First 50 bases Q=30, last 50 bases Q=2
     let mut qual = vec![30u8; 50];
     qual.extend(vec![2u8; 50]);
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 10));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 10));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_target_bases, 50);
-    assert_float_eq!(m.frac_exc_baseq, 0.5, 0.01);
+    assert_close!(m.frac_exc_baseq, 0.5, 0.01);
 }
 
 /// Empty BAM (no reads) should produce all-zero metrics.
 #[test]
 fn test_empty_bam() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let bld = coord_builder(&[("chr1", 10_000)]);
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 0);
-    assert_float_eq!(m.mean_target_coverage, 0.0, 0.001);
+    assert_close!(m.mean_target_coverage, 0.0, 0.001);
     assert_eq!(m.max_target_coverage, 0);
     assert_eq!(m.min_target_coverage, 0);
 }
@@ -1370,10 +959,7 @@ fn test_empty_bam() {
 #[test]
 fn test_coverage_fractions_at_thresholds() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
@@ -1382,9 +968,9 @@ fn test_coverage_fractions_at_thresholds() {
         add_single_record(
             &mut bld,
             &format!("read{i}"),
-            0,
+            "chr1",
             1,
-            &[Op::new(Kind::Match, 100)],
+            "100M",
             &qual,
             60,
             Flags::empty(),
@@ -1394,35 +980,31 @@ fn test_coverage_fractions_at_thresholds() {
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
-    assert_float_eq!(m.mean_target_coverage, 5.0, 0.01);
-    assert_float_eq!(m.frac_target_bases_1x, 1.0, 0.001);
-    assert_float_eq!(m.frac_target_bases_10x, 0.0, 0.001);
+    assert_close!(m.mean_target_coverage, 5.0, 0.01);
+    assert_close!(m.frac_target_bases_1x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_10x, 0.0, 0.001);
 }
 
 /// Read with insertion: insertion bases should not count without INCLUDE_INDELS.
 #[test]
 fn test_insertion_without_include_indels() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     // 50M + 20I + 50M = 120 read bases, 100 ref-consuming
     let qual = vec![30u8; 120];
-    let cigar = [Op::new(Kind::Match, 50), Op::new(Kind::Insertion, 20), Op::new(Kind::Match, 50)];
-    add_single_record(&mut bld, "read1", 0, 1, &cigar, &qual, 60, Flags::empty());
+    add_single_record(&mut bld, "read1", "chr1", 1, "50M20I50M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.include_indels = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     // Only M bases counted on-target (100 out of 100bp target)
@@ -1433,22 +1015,18 @@ fn test_insertion_without_include_indels() {
 #[test]
 fn test_insertion_with_include_indels() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 120];
-    let cigar = [Op::new(Kind::Match, 50), Op::new(Kind::Insertion, 20), Op::new(Kind::Match, 50)];
-    add_single_record(&mut bld, "read1", 0, 1, &cigar, &qual, 60, Flags::empty());
+    add_single_record(&mut bld, "read1", "chr1", 1, "50M20I50M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.include_indels = true;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     // M bases + I bases: 100 + 20 = 120
@@ -1459,44 +1037,19 @@ fn test_insertion_with_include_indels() {
 #[test]
 fn test_selected_pairs() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 50];
     // Pair on-bait
-    add_custom_pair(
-        &mut bld,
-        "pair1",
-        0,
-        1,
-        51,
-        &[Op::new(Kind::Match, 50)],
-        &qual,
-        60,
-        false,
-        false,
-    );
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 51, "50M", &qual, 60, false, false);
     // Pair off-bait (far from bait, > near_distance)
-    add_custom_pair(
-        &mut bld,
-        "pair2",
-        0,
-        500,
-        600,
-        &[Op::new(Kind::Match, 50)],
-        &qual,
-        60,
-        false,
-        false,
-    );
+    add_custom_pair(&mut bld, "pair2", "chr1", 500, 600, "50M", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     // Only the on-bait pair should be counted as selected
@@ -1508,22 +1061,17 @@ fn test_selected_pairs() {
 #[test]
 fn test_soft_clip_excluded() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     // 10S80M10S = 100 read bases, 80 aligned
     let qual = vec![30u8; 100];
-    let cigar =
-        [Op::new(Kind::SoftClip, 10), Op::new(Kind::Match, 80), Op::new(Kind::SoftClip, 10)];
-    add_single_record(&mut bld, "read1", 0, 1, &cigar, &qual, 60, Flags::empty());
+    add_single_record(&mut bld, "read1", "chr1", 1, "10S80M10S", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.deduped_bases_aligned, 80);
@@ -1534,73 +1082,24 @@ fn test_soft_clip_excluded() {
 #[test]
 fn test_partial_overlap_clipping() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
-
-    // Read1 at pos 1 (100M), Read2 at pos 51 (100M)
-    // Overlap: positions 51-100 = 50bp
-    let cigar = [Op::new(Kind::Match, 100)];
-    let cigar_c: Cigar = cigar.iter().copied().collect();
-    let seq: Sequence = vec![b'A'; 100].into();
-    let mq = MappingQuality::new(60).unwrap();
-
-    let r1 = RecordBuf::builder()
-        .set_name("pair1")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::MATE_REVERSE_COMPLEMENTED
-                | Flags::FIRST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(1).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar_c.clone())
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(51).unwrap())
-        .set_template_length(150)
-        .set_sequence(seq.clone())
-        .set_quality_scores(QualityScores::from(qual.clone()))
-        .build();
-
-    let r2 = RecordBuf::builder()
-        .set_name("pair1")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::REVERSE_COMPLEMENTED
-                | Flags::LAST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(51).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar_c)
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(1).unwrap())
-        .set_template_length(-150)
-        .set_sequence(seq)
-        .set_quality_scores(QualityScores::from(qual))
-        .build();
-
-    bld.add_record(r1);
-    bld.add_record(r2);
+    // Read1 at pos 1 (100M), Read2 at pos 51 (100M); overlap = positions 51-100 = 50bp.
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 51, "100M", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     // Read1 starts at 1, mate at 51 → Read1 is left-most, overlap = 50bp clipped from Read1
     // Total aligned = 200, overlap = 50
-    assert_float_eq!(m.frac_exc_overlap, 50.0 / 200.0, 0.01);
+    assert_close!(m.frac_exc_overlap, 50.0 / 200.0, 0.01);
     // Covered positions: Read1 covers 1-50 (after clip), Read2 covers 51-150
     assert_eq!(m.on_target_bases, 150);
 }
@@ -1609,10 +1108,7 @@ fn test_partial_overlap_clipping() {
 #[test]
 fn test_hs_library_size_no_duplicates() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
@@ -1621,10 +1117,10 @@ fn test_hs_library_size_no_duplicates() {
         add_custom_pair(
             &mut bld,
             &format!("pair{i}"),
-            0,
+            "chr1",
             1 + i * 10,
             101 + i * 10,
-            &[Op::new(Kind::Match, 100)],
+            "100M",
             &qual,
             60,
             false,
@@ -1635,7 +1131,7 @@ fn test_hs_library_size_no_duplicates() {
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     // No duplicates → library size = None (all pairs unique)
@@ -1646,54 +1142,24 @@ fn test_hs_library_size_no_duplicates() {
 #[test]
 fn test_fraction_computations() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // 3 reads: 1 non-dup, 1 dup, 1 QC-fail
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::DUPLICATE,
-    );
-    add_single_record(
-        &mut bld,
-        "read3",
-        0,
-        1,
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::QC_FAIL,
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "100M", &qual, 60, Flags::empty());
+    add_single_record(&mut bld, "read2", "chr1", 1, "100M", &qual, 60, Flags::DUPLICATE);
+    add_single_record(&mut bld, "read3", "chr1", 1, "100M", &qual, 60, Flags::QC_FAIL);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 2); // QC-fail read excluded; 1 non-dup + 1 dup
     assert_eq!(m.deduped_reads, 1); // 1 non-dup read
-    assert_float_eq!(m.frac_deduped_reads, 1.0 / 2.0, 0.01);
+    assert_close!(m.frac_deduped_reads, 1.0 / 2.0, 0.01);
 }
 
 // ─── Additional integration tests ────────────────────────────────────────────
@@ -1703,38 +1169,27 @@ fn test_fraction_computations() {
 #[test]
 fn test_multiple_overlapping_targets() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // Two non-abutting targets: bases 0-10 and 20-30 on chr1
-    write_bed(&bait_path, &[("chr1", 0, 10), ("chr1", 20, 30)]);
-    write_bed(&target_path, &[("chr1", 0, 10), ("chr1", 20, 30)]);
+    let bed =
+        BedBuilder::new().interval("chr1", 0, 10).interval("chr1", 20, 30).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 50];
     // One 50bp read at pos 1, covering bases 0-49 (overlaps both targets)
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        1,
-        &[Op::new(Kind::Match, 50)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    add_single_record(&mut bld, "read1", "chr1", 1, "50M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 1);
     // All 20 target bases (10 + 10) should have coverage from the read
     assert_eq!(m.on_target_bases, 20);
     // Both targets fully covered at 1x
-    assert_float_eq!(m.frac_target_bases_1x, 1.0, 0.001);
-    assert_float_eq!(m.mean_target_coverage, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_1x, 1.0, 0.001);
+    assert_close!(m.mean_target_coverage, 1.0, 0.001);
     assert_eq!(m.min_target_coverage, 1);
     assert_eq!(m.max_target_coverage, 1);
 }
@@ -1744,10 +1199,7 @@ fn test_multiple_overlapping_targets() {
 #[test]
 fn test_all_reads_filtered_by_mapq() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
@@ -1756,9 +1208,9 @@ fn test_all_reads_filtered_by_mapq() {
         add_single_record(
             &mut bld,
             &format!("read{i}"),
-            0,
+            "chr1",
             1,
-            &[Op::new(Kind::Match, 100)],
+            "100M",
             &qual,
             1,
             Flags::empty(),
@@ -1768,18 +1220,18 @@ fn test_all_reads_filtered_by_mapq() {
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(20, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(20, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 3);
     assert_eq!(m.bases_aligned, 300);
     // All aligned bases excluded by MAPQ
-    assert_float_eq!(m.frac_exc_mapq, 1.0, 0.001);
+    assert_close!(m.frac_exc_mapq, 1.0, 0.001);
     // Zero coverage on all targets
-    assert_float_eq!(m.mean_target_coverage, 0.0, 0.001);
+    assert_close!(m.mean_target_coverage, 0.0, 0.001);
     assert_eq!(m.max_target_coverage, 0);
     assert_eq!(m.min_target_coverage, 0);
-    assert_float_eq!(m.frac_target_bases_1x, 0.0, 0.001);
+    assert_close!(m.frac_target_bases_1x, 0.0, 0.001);
     assert_eq!(m.on_target_bases, 0);
 }
 
@@ -1788,11 +1240,8 @@ fn test_all_reads_filtered_by_mapq() {
 #[test]
 fn test_high_coverage_u64_safety() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // 10bp target
-    write_bed(&bait_path, &[("chr1", 0, 10)]);
-    write_bed(&target_path, &[("chr1", 0, 10)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 10).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 10];
@@ -1801,9 +1250,9 @@ fn test_high_coverage_u64_safety() {
         add_single_record(
             &mut bld,
             &format!("read{i}"),
-            0,
+            "chr1",
             1,
-            &[Op::new(Kind::Match, 10)],
+            "10M",
             &qual,
             60,
             Flags::empty(),
@@ -1813,18 +1262,18 @@ fn test_high_coverage_u64_safety() {
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, opts(0, 0));
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, opts(0, 0));
     let m = run_and_read(&cmd);
 
     assert_eq!(m.total_reads, 1000);
     assert_eq!(m.on_target_bases, 10_000);
-    assert_float_eq!(m.mean_target_coverage, 1000.0, 0.01);
+    assert_close!(m.mean_target_coverage, 1000.0, 0.01);
     assert_eq!(m.max_target_coverage, 1000);
     assert_eq!(m.min_target_coverage, 1000);
-    assert_float_eq!(m.frac_target_bases_1x, 1.0, 0.001);
-    assert_float_eq!(m.frac_target_bases_100x, 1.0, 0.001);
-    assert_float_eq!(m.frac_target_bases_500x, 1.0, 0.001);
-    assert_float_eq!(m.frac_target_bases_1000x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_1x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_100x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_500x, 1.0, 0.001);
+    assert_close!(m.frac_target_bases_1000x, 1.0, 0.001);
 }
 
 // ─── Overlap clipping with soft clips regression tests ───────────────────────
@@ -1839,26 +1288,22 @@ fn test_high_coverage_u64_safety() {
 #[test]
 fn test_overlap_clipping_with_trailing_soft_clips() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100]; // 90M + 10S = 100 read bases
-    let cigar_ops = [Op::new(Kind::Match, 90), Op::new(Kind::SoftClip, 10)];
-    add_custom_pair(&mut bld, "pair1", 0, 1, 51, &cigar_ops, &qual, 60, false, false);
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 51, "90M10S", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_target_bases, 140);
-    assert_float_eq!(m.frac_exc_overlap, 40.0 / 180.0, 0.001);
+    assert_close!(m.frac_exc_overlap, 40.0 / 180.0, 0.001);
 }
 
 /// Overlap clipping with both leading and trailing soft clips.
@@ -1871,70 +1316,23 @@ fn test_overlap_clipping_with_trailing_soft_clips() {
 #[test]
 fn test_overlap_clipping_with_leading_and_trailing_soft_clips() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100]; // 5S + 85M + 10S = 100 read bases
-    let mq = MappingQuality::new(60).unwrap();
-    let cigar_ops =
-        [Op::new(Kind::SoftClip, 5), Op::new(Kind::Match, 85), Op::new(Kind::SoftClip, 10)];
-    let cigar: Cigar = cigar_ops.iter().copied().collect();
-    let seq: Sequence = vec![b'A'; 100].into();
-
-    let r1 = RecordBuf::builder()
-        .set_name("pair1")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::MATE_REVERSE_COMPLEMENTED
-                | Flags::FIRST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(1).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar.clone())
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(46).unwrap())
-        .set_template_length(130)
-        .set_sequence(seq.clone())
-        .set_quality_scores(QualityScores::from(qual.clone()))
-        .build();
-
-    let r2 = RecordBuf::builder()
-        .set_name("pair1")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::REVERSE_COMPLEMENTED
-                | Flags::LAST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(46).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar)
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(1).unwrap())
-        .set_template_length(-130)
-        .set_sequence(seq)
-        .set_quality_scores(QualityScores::from(qual))
-        .build();
-
-    bld.add_record(r1);
-    bld.add_record(r2);
+    // Read1 at pos 1, Read2 at pos 46, both 5S85M10S; overlap = 40bp on ref 45-84.
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 46, "5S85M10S", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_target_bases, 130);
-    assert_float_eq!(m.frac_exc_overlap, 40.0 / 170.0, 0.001);
+    assert_close!(m.frac_exc_overlap, 40.0 / 170.0, 0.001);
 }
 
 /// Edge case: overlap is large enough that the entire aligned portion of Read1 is clipped.
@@ -1947,68 +1345,54 @@ fn test_overlap_clipping_with_leading_and_trailing_soft_clips() {
 #[test]
 fn test_overlap_clipping_trailing_soft_clip_fully_clips_read() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 100)]);
-    write_bed(&target_path, &[("chr1", 0, 100)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 100).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100]; // 50M + 50S = 100 read bases
-    let cigar_ops = [Op::new(Kind::Match, 50), Op::new(Kind::SoftClip, 50)];
-    add_custom_pair(&mut bld, "pair1", 0, 1, 1, &cigar_ops, &qual, 60, false, false);
+    add_custom_pair(&mut bld, "pair1", "chr1", 1, 1, "50M50S", &qual, 60, false, false);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_target_bases, 50);
-    assert_float_eq!(m.frac_exc_overlap, 50.0 / 100.0, 0.001);
+    assert_close!(m.frac_exc_overlap, 50.0 / 100.0, 0.001);
 }
 
 /// Verify that per-target output uses 1-based coordinates (not 0-based from BED).
 #[test]
 fn test_per_target_coordinates_are_one_based() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
     // BED is 0-based half-open
-    write_named_bed(&bait_path, &[("chr1", 100, 200, "bait1"), ("chr1", 500, 600, "bait2")]);
-    write_named_bed(&target_path, &[("chr1", 100, 200, "target1"), ("chr1", 500, 600, "target2")]);
+    let baits = BedBuilder::new()
+        .named("chr1", 100, 200, "bait1")
+        .named("chr1", 500, 600, "bait2")
+        .to_temp_bed()
+        .unwrap();
+    let targets = BedBuilder::new()
+        .named("chr1", 100, 200, "target1")
+        .named("chr1", 500, 600, "target2")
+        .to_temp_bed()
+        .unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     let qual = vec![30u8; 100];
     // One read covering each target
-    add_single_record(
-        &mut bld,
-        "read1",
-        0,
-        101, // 1-based pos covering target1
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
-    add_single_record(
-        &mut bld,
-        "read2",
-        0,
-        501, // 1-based pos covering target2
-        &[Op::new(Kind::Match, 100)],
-        &qual,
-        60,
-        Flags::empty(),
-    );
+    // 1-based pos covering target1
+    add_single_record(&mut bld, "read1", "chr1", 101, "100M", &qual, 60, Flags::empty());
+    // 1-based pos covering target2
+    add_single_record(&mut bld, "read2", "chr1", 501, "100M", &qual, 60, Flags::empty());
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.per_target_coverage = true;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), baits.path(), targets.path(), &prefix, None, options);
     cmd.execute(None).unwrap();
 
     let per_target_path = PathBuf::from(format!("{}{PER_TARGET_SUFFIX}", prefix.display()));
@@ -2035,76 +1419,25 @@ fn test_per_target_coordinates_are_one_based() {
 #[test]
 fn test_overlap_clipping_trailing_soft_clip_with_hard_clip() {
     let dir = TempDir::new().unwrap();
-    let bait_path = dir.path().join("baits.bed");
-    let target_path = dir.path().join("targets.bed");
-    write_bed(&bait_path, &[("chr1", 0, 200)]);
-    write_bed(&target_path, &[("chr1", 0, 200)]);
+    let bed = BedBuilder::new().interval("chr1", 0, 200).to_temp_bed().unwrap();
 
     let mut bld = coord_builder(&[("chr1", 10_000)]);
-    let mq = MappingQuality::new(60).unwrap();
 
-    // Read1: 80M10S5H → 90 sequence bases (H doesn't count), 80 aligned
-    let cigar1: Cigar =
-        [Op::new(Kind::Match, 80), Op::new(Kind::SoftClip, 10), Op::new(Kind::HardClip, 5)]
-            .into_iter()
-            .collect();
-    let seq1: Sequence = vec![b'A'; 90].into();
-    let qual1 = QualityScores::from(vec![30u8; 90]);
-
-    // Read2: 80M → 80 sequence bases, 80 aligned
-    let cigar2: Cigar = [Op::new(Kind::Match, 80)].into_iter().collect();
-    let seq2: Sequence = vec![b'A'; 80].into();
-    let qual2 = QualityScores::from(vec![30u8; 80]);
-
-    let r1 = RecordBuf::builder()
-        .set_name("pair1")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::MATE_REVERSE_COMPLEMENTED
-                | Flags::FIRST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(1).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar1)
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(51).unwrap())
-        .set_template_length(130)
-        .set_sequence(seq1)
-        .set_quality_scores(qual1)
-        .build();
-
-    let r2 = RecordBuf::builder()
-        .set_name("pair1")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::REVERSE_COMPLEMENTED
-                | Flags::LAST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(51).unwrap())
-        .set_mapping_quality(mq)
-        .set_cigar(cigar2)
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(1).unwrap())
-        .set_template_length(-130)
-        .set_sequence(seq2)
-        .set_quality_scores(qual2)
-        .build();
-
-    bld.add_record(r1);
-    bld.add_record(r2);
+    // Read1: 80M10S5H → 90 sequence bases (H doesn't count), 80 aligned.
+    // Read2: 80M → 80 sequence bases, 80 aligned.
+    let p = pair("pair1")
+        .r1(|r| r.at("chr1", 1).cigar("80M10S5H").quals(vec![30u8; 90]).mapq(60))
+        .r2(|r| r.at("chr1", 51).cigar("80M").quals(vec![30u8; 80]).mapq(60).reverse());
+    bld.add(p);
 
     let bam = bld.to_temp_bam().unwrap();
     let prefix = dir.path().join("out");
 
     let mut options = opts(0, 0);
     options.dont_clip_overlapping_reads = false;
-    let cmd = make_cmd(bam.path(), &bait_path, &target_path, &prefix, None, options);
+    let cmd = make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options);
     let m = run_and_read(&cmd);
 
     assert_eq!(m.on_target_bases, 130);
-    assert_float_eq!(m.frac_exc_overlap, 30.0 / 160.0, 0.001);
+    assert_close!(m.frac_exc_overlap, 30.0 / 160.0, 0.001);
 }

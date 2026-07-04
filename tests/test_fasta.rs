@@ -1,11 +1,8 @@
-#[allow(dead_code)]
-mod helpers;
-
 use std::path::Path;
 
 use anyhow::Result;
-use helpers::{FastaBuilder, SamBuilder};
 use riker_lib::fasta::Fasta;
+use riker_lib::test_support::{FastaBuilder, SamBuilder};
 
 // ─── from_path error ─────────────────────────────────────────────────────────
 
@@ -24,7 +21,7 @@ fn test_from_path_nonexistent() {
 
 #[test]
 fn test_validate_bam_header_mismatch() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let fasta = Fasta::from_path(refa.path())?;
 
     // Build a BAM header with a contig not in the FASTA
@@ -42,7 +39,7 @@ fn test_validate_bam_header_mismatch() -> Result<()> {
 
 #[test]
 fn test_validate_bam_header_ok() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let fasta = Fasta::from_path(refa.path())?;
 
     let builder = SamBuilder::with_contigs(&[("chr1".to_string(), 20)]);
@@ -54,7 +51,7 @@ fn test_validate_bam_header_ok() -> Result<()> {
 
 #[test]
 fn test_load_contig_unknown() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let mut fasta = Fasta::from_path(refa.path())?;
 
     match fasta.load_contig("chrZ", true) {
@@ -69,7 +66,7 @@ fn test_load_contig_unknown() -> Result<()> {
 
 #[test]
 fn test_load_contig_ok() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", b"ACGTacgt").to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", b"ACGTacgt".to_vec()).to_temp_fasta()?;
     let mut fasta = Fasta::from_path(refa.path())?;
 
     let seq = fasta.load_contig("chr1", true)?;
@@ -82,8 +79,8 @@ fn test_load_contig_ok() -> Result<()> {
 #[test]
 fn test_contig_length() -> Result<()> {
     let refa = FastaBuilder::new()
-        .add_contig("chr1", &[b'A'; 100])
-        .add_contig("chr2", &[b'G'; 50])
+        .contig("chr1", vec![b'A'; 100])
+        .contig("chr2", vec![b'G'; 50])
         .to_temp_fasta()?;
     let fasta = Fasta::from_path(refa.path())?;
 
@@ -98,8 +95,8 @@ fn test_contig_length() -> Result<()> {
 #[test]
 fn test_contig_names() -> Result<()> {
     let refa = FastaBuilder::new()
-        .add_contig("chr1", &[b'A'; 20])
-        .add_contig("chr2", &[b'G'; 30])
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'G'; 30])
         .to_temp_fasta()?;
     let fasta = Fasta::from_path(refa.path())?;
 

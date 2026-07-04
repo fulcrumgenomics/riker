@@ -63,6 +63,7 @@ pub fn get_pair_orientation(record: &RikerRecord) -> Option<PairOrientation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{ReadBuilder, pair};
     use noodles::core::Position;
     use noodles::sam::Header;
     use noodles::sam::alignment::RecordBuf;
@@ -143,40 +144,19 @@ mod tests {
     #[test]
     fn test_mate_different_contig() {
         // Reads on different contigs → None
-        let flags = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED | Flags::MATE_REVERSE_COMPLEMENTED;
-        let cigar: Cigar = [Op::new(Kind::Match, 100)].into_iter().collect();
-        let record = RecordBuf::builder()
-            .set_flags(flags)
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(100).unwrap())
-            .set_mapping_quality(MappingQuality::new(60).unwrap())
-            .set_cigar(cigar)
-            .set_mate_reference_sequence_id(1) // different contig
-            .set_mate_alignment_start(Position::new(200).unwrap())
-            .set_template_length(200)
-            .build();
+        let (record, _) = pair("q").r1(|r| r.at("chr1", 100)).r2(|r| r.at("chr2", 200)).build();
         assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 
     #[test]
     fn test_mate_unmapped() {
-        let flags = Flags::SEGMENTED | Flags::MATE_UNMAPPED;
-        let record = RecordBuf::builder()
-            .set_flags(flags)
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(100).unwrap())
-            .build();
+        let (record, _) = pair("q").r2(ReadBuilder::unmapped).build();
         assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 
     #[test]
     fn test_record_unmapped() {
-        let flags = Flags::SEGMENTED | Flags::UNMAPPED;
-        let record = RecordBuf::builder()
-            .set_flags(flags)
-            .set_mate_reference_sequence_id(0)
-            .set_mate_alignment_start(Position::new(100).unwrap())
-            .build();
+        let (record, _) = pair("q").r1(ReadBuilder::unmapped).build();
         assert_eq!(get_pair_orientation(&to_riker(&record)), None);
     }
 

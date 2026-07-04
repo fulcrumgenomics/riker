@@ -448,16 +448,10 @@ impl GcBiasCollector {
                 let (normalized_coverage, error_bar_width) =
                     normalized_coverage_and_error(reads, windows, mean_reads_per_window);
 
-                let reported_base_quality = {
-                    let qbases = self.quality_bases_by_gc[gc];
-                    if qbases > 0 { self.quality_sum_by_gc[gc] as f64 / qbases as f64 } else { 0.0 }
-                };
+                let reported_base_quality =
+                    mean_base_quality(self.quality_sum_by_gc[gc], self.quality_bases_by_gc[gc]);
 
-                let empirical_base_quality = if bases > 0 && errors > 0 {
-                    -10.0 * (errors as f64 / bases as f64).log10()
-                } else {
-                    0.0
-                };
+                let empirical_base_quality = phred_from_error_counts(errors, bases);
 
                 GcBiasDetailMetric {
                     sample: self.sample.clone(),
@@ -781,6 +775,19 @@ fn normalized_coverage_and_error(reads: u64, windows: u64, mean_rpw: f64) -> (f6
     (nc, eb)
 }
 
+/// Mean reported base quality for a GC bin: the average of the per-base quality scores of
+/// the reads binned here, or `0.0` when the bin has no quality bases.
+fn mean_base_quality(quality_sum: u64, quality_bases: u64) -> f64 {
+    if quality_bases > 0 { quality_sum as f64 / quality_bases as f64 } else { 0.0 }
+}
+
+/// Empirical (Phred-scaled) base quality for a GC bin, derived from the observed error rate
+/// `errors / bases`: `-10 * log10(errors / bases)`. Returns `0.0` when the bin has no bases
+/// or no errors, where the Phred score would otherwise be undefined or infinite.
+fn phred_from_error_counts(errors: u64, bases: u64) -> f64 {
+    if bases > 0 && errors > 0 { -10.0 * (errors as f64 / bases as f64).log10() } else { 0.0 }
+}
+
 /// Compute AT and GC dropout from per-GC-bin window and read counts.
 ///
 /// Dropout measures the deficit in read coverage relative to the reference
@@ -1001,29 +1008,6 @@ mod tests {
         assert_eq!(counts.iter().sum::<u64>(), 0);
     }
 
-    #[test]
-    fn test_dropout_calculation() {
-        // Manually test dropout formula
-        let total_windows = 100u64;
-        let total_reads = 100u64;
-        // Bin 25% (AT region): 40 windows, 20 reads
-        // relative_windows = 0.40, relative_reads = 0.20
-        // dropout = (0.40 - 0.20) * 100 = 20.0 (positive → AT dropout)
-        let rel_w = 40.0 / total_windows as f64;
-        let rel_r = 20.0 / total_reads as f64;
-        let dropout = (rel_w - rel_r) * 100.0;
-        assert!((dropout - 20.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_phred_quality_calculation() {
-        // errors=1, bases=1000 → -10*log10(0.001) = 30.0
-        let errors = 1.0_f64;
-        let bases = 1000.0_f64;
-        let phred = -10.0 * (errors / bases).log10();
-        assert!((phred - 30.0).abs() < 0.001);
-    }
-
     // ── scan_contig_gc — additional edge cases ──────────────────────────────
 
     #[test]
@@ -1095,8 +1079,8 @@ mod tests {
     #[test]
     fn test_nc_normal() {
         let (nc, eb) = normalized_coverage_and_error(100, 50, 1.0);
-        assert!((nc - 2.0).abs() < 1e-9);
-        assert!((eb - 0.2).abs() < 1e-9); // sqrt(100)/50 / 1.0 = 10/50 = 0.2
+        crate::assert_close!(nc, 2.0, 1e-9);
+        crate::assert_close!(eb, 0.2, 1e-9); // sqrt(100)/50 / 1.0 = 10/50 = 0.2
     }
 
     #[test]
@@ -1111,6 +1095,37 @@ mod tests {
         let (nc, eb) = normalized_coverage_and_error(100, 50, 0.0);
         assert_eq!(nc, 0.0);
         assert_eq!(eb, 0.0);
+    }
+
+    // ── mean_base_quality / phred_from_error_counts ──────────────────────────
+
+    #[test]
+    fn mean_base_quality_averages_the_quality_sum() {
+        // 400 total quality over 10 bases → mean Q40.
+        crate::assert_close!(mean_base_quality(400, 10), 40.0);
+    }
+
+    #[test]
+    fn mean_base_quality_is_zero_without_quality_bases() {
+        assert_eq!(mean_base_quality(999, 0), 0.0);
+    }
+
+    #[test]
+    fn phred_from_error_counts_is_phred_scaled_error_rate() {
+        crate::assert_close!(phred_from_error_counts(1, 100), 20.0); // 1% error → Q20
+        crate::assert_close!(phred_from_error_counts(1, 1000), 30.0); // 0.1% error → Q30
+    }
+
+    #[test]
+    fn phred_from_error_counts_saturated_error_rate_is_zero() {
+        // Every base an error → rate 1.0 → -10*log10(1) = Q0, via the formula not the guard.
+        crate::assert_close!(phred_from_error_counts(10, 10), 0.0);
+    }
+
+    #[test]
+    fn phred_from_error_counts_is_zero_without_errors_or_bases() {
+        assert_eq!(phred_from_error_counts(0, 100), 0.0); // no errors
+        assert_eq!(phred_from_error_counts(5, 0), 0.0); // no bases
     }
 
     // ── compute_dropout ─────────────────────────────────────────────────────

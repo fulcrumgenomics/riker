@@ -512,7 +512,7 @@ mod tests {
         let (mean, sd) = c.mean_and_stddev();
         assert_eq!(mean, 100.0);
         let expected_sd = (2.0_f64 / 3.0).sqrt();
-        assert!((sd - expected_sd).abs() < 1e-9, "sd={sd} expected={expected_sd}");
+        crate::assert_close!(sd, expected_sd, 1e-9);
     }
 
     #[test]

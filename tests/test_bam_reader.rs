@@ -1,14 +1,11 @@
-#[allow(dead_code)]
-mod helpers;
-
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
-use helpers::{SamBuilder, coord_builder};
 use noodles::core::Region;
 use riker_lib::sam::alignment_reader::{AlignmentReader, IndexedAlignmentReader};
 use riker_lib::sam::riker_record::{RikerRecord, RikerRecordRequirements};
+use riker_lib::test_support::{FastaBuilder, SamBuilder, coord_builder, pair, read};
 use tempfile::NamedTempFile;
 
 /// The comparable fields of one record: name, flags, start, end, mapq, cigar
@@ -90,8 +87,8 @@ fn test_open_invalid_bam() -> Result<()> {
 #[test]
 fn test_bamrec_roundtrip_preserves_scalars() -> Result<()> {
     let mut builder = SamBuilder::new();
-    builder.add_pair("pair1", 0, 100, 200, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
+    builder.add(pair("pair1").at("chr1", 100, 200).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).reverse().nm(3));
     let bam = builder.to_temp_bam()?;
 
     let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
@@ -131,7 +128,7 @@ fn test_bamrec_roundtrip_preserves_scalars() -> Result<()> {
 fn test_bamrec_alignment_end_matches_cigar_span() -> Result<()> {
     let mut builder = SamBuilder::new();
     // 50bp match → alignment_end = start + 50 - 1 = start + 49.
-    builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
+    builder.add(read().name("r1").at("chr1", 100).len(50).no_nm());
     let bam = builder.to_temp_bam()?;
 
     let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
@@ -156,12 +153,10 @@ fn test_bamrec_alignment_end_matches_cigar_span() -> Result<()> {
 /// intact. Exercises the rust-htslib backend.
 #[test]
 fn test_cram_roundtrip_via_fill_record() -> Result<()> {
-    use helpers::{FastaBuilder, coord_builder};
-
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 1_000]).to_temp_fasta()?;
     let mut builder = coord_builder(&[("chr1", 1_000)]);
-    builder.add_pair("pair1", 0, 100, 200, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, None);
+    builder.add(pair("pair1").at("chr1", 100, 200).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).no_nm());
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
@@ -192,7 +187,6 @@ fn test_cram_roundtrip_via_fill_record() -> Result<()> {
 /// `fill_record`-driven loop in [`drive_records`].
 #[test]
 fn test_cram_drives_through_collector() -> Result<()> {
-    use helpers::{FastaBuilder, coord_builder};
     use riker_lib::collector::{Collector, drive_collector_single_threaded};
     use riker_lib::progress::ProgressLogger;
 
@@ -221,10 +215,10 @@ fn test_cram_drives_through_collector() -> Result<()> {
         }
     }
 
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 1_000]).to_temp_fasta()?;
     let mut builder = coord_builder(&[("chr1", 1_000)]);
-    builder.add_pair("p1", 0, 100, 200, 200, 60, 50, false, false);
-    builder.add_pair("p2", 0, 300, 400, 200, 60, 50, false, false);
+    builder.add(pair("p1").at("chr1", 100, 200).len(50).no_nm());
+    builder.add(pair("p2").at("chr1", 300, 400).len(50).no_nm());
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
@@ -268,7 +262,7 @@ fn test_drive_collector_does_not_finish_after_failed_initialize() -> Result<()> 
     }
 
     let mut builder = SamBuilder::new();
-    builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
+    builder.add(read().name("r1").at("chr1", 100).len(50).no_nm());
     let bam = builder.to_temp_bam()?;
     let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
     let mut collector = FailingInit { finish_called: false };
@@ -289,13 +283,11 @@ fn test_drive_collector_does_not_finish_after_failed_initialize() -> Result<()> 
 /// and with `with_aux_tag(NM)` the htslib aux walker populates the store.
 #[test]
 fn test_cram_fill_record_decodes_sequence_and_aux() -> Result<()> {
-    use helpers::{FastaBuilder, coord_builder};
-
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 1_000]).to_temp_fasta()?;
     let mut builder = coord_builder(&[("chr1", 1_000)]);
     // Fragment with NM:i:3 — the only record carrying an aux tag.
-    builder.add_unpaired("frag1", 0, 100, 60, 50, false, false, false, Some(3));
-    builder.add_pair("pair1", 0, 200, 400, 200, 60, 50, false, false);
+    builder.add(read().name("frag1").at("chr1", 100).len(50).nm(3));
+    builder.add(pair("pair1").at("chr1", 200, 400).len(50).no_nm());
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
@@ -331,11 +323,9 @@ fn test_cram_fill_record_decodes_sequence_and_aux() -> Result<()> {
 /// at [`test_bamrec_alignment_end_matches_cigar_span`].
 #[test]
 fn test_htslibrec_alignment_end_matches_cigar_span() -> Result<()> {
-    use helpers::{FastaBuilder, coord_builder};
-
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 1_000]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 1_000]).to_temp_fasta()?;
     let mut builder = coord_builder(&[("chr1", 1_000)]);
-    builder.add_unpaired("r1", 0, 100, 60, 50, false, false, false, None);
+    builder.add(read().name("r1").at("chr1", 100).len(50).no_nm());
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
@@ -361,8 +351,8 @@ fn test_htslibrec_alignment_end_matches_cigar_span() -> Result<()> {
 #[test]
 fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
     let mut builder = SamBuilder::new();
-    builder.add_pair("pair1", 0, 100, 200, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
+    builder.add(pair("pair1").at("chr1", 100, 200).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).reverse().nm(3));
     let sam = builder.to_temp_sam()?;
 
     let mut reader = AlignmentReader::open(sam.path(), None, 0)?;
@@ -398,9 +388,9 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
 #[test]
 fn bam_records_identical_across_decode_thread_counts() -> Result<()> {
     let mut builder = SamBuilder::new();
-    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
-    builder.add_pair("pair2", 0, 700, 900, 200, 55, 60, false, false);
+    builder.add(pair("pair1").at("chr1", 100, 300).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).reverse().nm(3));
+    builder.add(pair("pair2").at("chr1", 700, 900).len(60).mapq(55).no_nm());
     let bam = builder.to_temp_bam()?;
 
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
@@ -417,9 +407,9 @@ fn bam_records_identical_across_decode_thread_counts() -> Result<()> {
 #[test]
 fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
     let mut builder = coord_builder(&[("chr1", 2_000)]);
-    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, Some(3));
-    builder.add_pair("pair2", 0, 1_200, 1_400, 200, 55, 60, false, false);
+    builder.add(pair("pair1").at("chr1", 100, 300).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).nm(3));
+    builder.add(pair("pair2").at("chr1", 1_200, 1_400).len(60).mapq(55).no_nm());
     let bam = builder.to_temp_indexed_bam()?;
 
     let region: Region = "chr1".parse().expect("valid region");
@@ -448,9 +438,9 @@ fn indexed_bam_query_identical_across_decode_thread_counts() -> Result<()> {
 #[test]
 fn indexed_bam_query_works_with_csi_index() -> Result<()> {
     let mut builder = coord_builder(&[("chr1", 2_000)]);
-    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, false, false, false, Some(3));
-    builder.add_pair("pair2", 0, 1_200, 1_400, 200, 55, 60, false, false);
+    builder.add(pair("pair1").at("chr1", 100, 300).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).nm(3));
+    builder.add(pair("pair2").at("chr1", 1_200, 1_400).len(60).mapq(55).no_nm());
     let bam = builder.to_temp_csi_indexed_bam()?;
 
     let region: Region = "chr1".parse().expect("valid region");
@@ -478,8 +468,8 @@ fn indexed_bam_query_works_with_csi_index() -> Result<()> {
 #[test]
 fn sam_ignores_decode_threads() -> Result<()> {
     let mut builder = SamBuilder::new();
-    builder.add_pair("pair1", 0, 100, 300, 200, 60, 50, false, false);
-    builder.add_unpaired("frag1", 0, 500, 30, 75, true, false, false, Some(3));
+    builder.add(pair("pair1").at("chr1", 100, 300).len(50).no_nm());
+    builder.add(read().name("frag1").at("chr1", 500).len(75).mapq(30).reverse().nm(3));
     let sam = builder.to_temp_sam()?;
 
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");

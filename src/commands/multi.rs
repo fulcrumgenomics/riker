@@ -883,6 +883,7 @@ fn group_worker_loop(
 mod tests {
     use super::*;
     use crate::sam::riker_record::RikerRecord;
+    use crate::test_support::{SamBuilder, read};
 
     /// Collector that fails on the Nth `accept` call to exercise the
     /// poison-flag shutdown path of `run_parallel`.
@@ -939,46 +940,15 @@ mod tests {
     }
 
     /// Write a tiny temp BAM with `n` mapped records on chr1 for the
-    /// `run_parallel` tests. `helpers/` is only on the integration-test target,
-    /// so we build the BAM inline here.
+    /// `run_parallel` tests. Content is irrelevant — these tests only exercise
+    /// batching and error propagation — so the reads take the builder defaults.
     fn tiny_bam(n: u32) -> Result<tempfile::NamedTempFile> {
-        use noodles::bam;
-        use noodles::sam::Header;
-        use noodles::sam::alignment::RecordBuf;
-        use noodles::sam::alignment::io::Write as _;
-        use noodles::sam::alignment::record::Flags;
-        use noodles::sam::alignment::record::cigar::Op;
-        use noodles::sam::alignment::record::cigar::op::Kind;
-        use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
-        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
-
-        let header = Header::builder()
-            .add_reference_sequence(
-                "chr1",
-                Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(10_000).unwrap()),
-            )
-            .build();
-        let tmp = tempfile::NamedTempFile::with_suffix(".bam")?;
-        let file = std::fs::File::create(tmp.path())?;
-        let mut writer = bam::io::Writer::new(std::io::BufWriter::new(file));
-        writer.write_header(&header)?;
-        let cigar: Cigar = [Op::new(Kind::Match, 50)].into_iter().collect();
+        let mut builder = SamBuilder::new();
         for i in 0..n {
-            let pos =
-                noodles::core::Position::new(usize::try_from(i).unwrap() % 9_000 + 1).unwrap();
-            let record = RecordBuf::builder()
-                .set_name(format!("r{i}").into_bytes())
-                .set_flags(Flags::empty())
-                .set_reference_sequence_id(0)
-                .set_alignment_start(pos)
-                .set_cigar(cigar.clone())
-                .set_sequence(Sequence::from(vec![b'A'; 50]))
-                .set_quality_scores(QualityScores::from(vec![30u8; 50]))
-                .build();
-            writer.write_alignment_record(&header, &record)?;
+            let pos = i as usize % 9_000 + 1;
+            builder.add(read().name(format!("r{i}")).at("chr1", pos));
         }
-        drop(writer);
-        Ok(tmp)
+        builder.to_temp_bam()
     }
 
     /// A failing collector inside `run_parallel` should propagate its
@@ -1027,12 +997,8 @@ mod tests {
         Ok(())
     }
 
-    fn nz(n: usize) -> NonZero<usize> {
-        NonZero::new(n).expect("test uses non-zero")
-    }
-
     fn plan(t: usize, n_tools: usize, kind: InputKind) -> (usize, usize) {
-        let p = plan_multi(nz(t), n_tools, kind);
+        let p = plan_multi(NonZero::new(t).expect("test uses non-zero"), n_tools, kind);
         (p.decode_threads, p.compute_workers)
     }
 

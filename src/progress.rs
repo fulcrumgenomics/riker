@@ -253,24 +253,10 @@ mod tests {
 
     #[test]
     fn test_extract_chrom_pos_mapped() {
-        use noodles::core::Position;
-        use noodles::sam::alignment::RecordBuf;
-        use noodles::sam::alignment::record::Flags;
-        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
-        use std::num::NonZeroUsize;
+        use crate::test_support::{SamBuilder, read};
 
-        let header = Header::builder()
-            .add_reference_sequence(
-                b"chr1",
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).unwrap()),
-            )
-            .build();
-
-        let rec = RecordBuf::builder()
-            .set_flags(Flags::empty())
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(100).unwrap())
-            .build();
+        let header = SamBuilder::new().header().clone();
+        let rec = read().at("chr1", 100).build();
         let riker = RikerRecord::from_alignment_record(&header, &rec).unwrap();
 
         let (chrom, pos) = extract_chrom_pos(&riker, &header);

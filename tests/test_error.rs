@@ -1,234 +1,146 @@
 mod helpers;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use helpers::{FastaBuilder, SamBuilder, coord_builder, read_metrics_tsv};
-use noodles::core::Position;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::{
-    Flags, MappingQuality,
-    cigar::{Op, op::Kind},
-};
-use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+use helpers::read_metrics_tsv;
+use riker_lib::assert_close;
 use riker_lib::commands::command::Command;
 use riker_lib::commands::common::{InputOptions, OutputOptions};
 use riker_lib::commands::error::{
-    Error, ErrorOptions, IndelMetric, MismatchMetric, OverlappingMismatchMetric,
+    Error, ErrorOptions, INDEL_SUFFIX, IndelMetric, MISMATCH_SUFFIX, MismatchMetric,
+    OVERLAP_SUFFIX, OverlappingMismatchMetric,
 };
+use riker_lib::test_support::{BedBuilder, FastaBuilder, VcfBuilder, coord_builder, pair, read};
 
-/// Build a simple FR pair where read1 is forward and read2 is reverse.
-#[expect(clippy::too_many_arguments)]
-fn make_pair(
-    builder: &mut SamBuilder,
-    name: &str,
-    ref_id: usize,
-    pos1: usize,
-    pos2: usize,
-    tlen: i32,
-    seq1: &[u8],
-    seq2: &[u8],
-    quals: &[u8],
-) {
-    let read_len = seq1.len();
-    let mapq = MappingQuality::new(60).unwrap();
-    let cigar: Cigar = [Op::new(Kind::Match, read_len)].into_iter().collect();
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-    // Read 1: forward
-    let r1 = RecordBuf::builder()
-        .set_name(name)
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::MATE_REVERSE_COMPLEMENTED
-                | Flags::FIRST_SEGMENT,
-        )
-        .set_reference_sequence_id(ref_id)
-        .set_alignment_start(Position::new(pos1).unwrap())
-        .set_mapping_quality(mapq)
-        .set_cigar(cigar.clone())
-        .set_mate_reference_sequence_id(ref_id)
-        .set_mate_alignment_start(Position::new(pos2).unwrap())
-        .set_template_length(tlen)
-        .set_sequence(Sequence::from(seq1.to_vec()))
-        .set_quality_scores(QualityScores::from(quals.to_vec()))
-        .build();
-
-    // Read 2: reverse
-    let r2 = RecordBuf::builder()
-        .set_name(name)
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::REVERSE_COMPLEMENTED
-                | Flags::LAST_SEGMENT,
-        )
-        .set_reference_sequence_id(ref_id)
-        .set_alignment_start(Position::new(pos2).unwrap())
-        .set_mapping_quality(mapq)
-        .set_cigar(cigar)
-        .set_mate_reference_sequence_id(ref_id)
-        .set_mate_alignment_start(Position::new(pos1).unwrap())
-        .set_template_length(-tlen)
-        .set_sequence(Sequence::from(seq2.to_vec()))
-        .set_quality_scores(QualityScores::from(quals.to_vec()))
-        .build();
-
-    builder.add_record(r1);
-    builder.add_record(r2);
+/// A 1000 bp reference of repeating `ACGT`. Reads derive their bases from it via
+/// `read().matching_ref(&fasta)`, so a read matches the reference by default and a
+/// `.sub(offset, base)` plants a single mismatch; its temp file is the `--reference`.
+fn reference() -> FastaBuilder {
+    FastaBuilder::new().contig("chr1", (0..1000).map(|i| b"ACGT"[i % 4]).collect::<Vec<u8>>())
 }
 
-/// Run the error command and return the output directory for assertions.
-fn run_error(
-    bam_path: &std::path::Path,
-    fasta_path: &std::path::Path,
-    stratify_by: Vec<String>,
-) -> PathBuf {
+/// Default error options: MAPQ ≥ 20, every base passes (`min_bq` 0), no masking.
+/// The `reference` field is a placeholder overwritten by [`make_cmd`].
+fn opts() -> ErrorOptions {
+    ErrorOptions {
+        reference: PathBuf::new(),
+        vcf: None,
+        intervals: None,
+        min_mapq: 20,
+        min_bq: 0,
+        include_duplicates: false,
+        max_isize: 1000,
+        picard_compat: false,
+        stratify_by: Vec::new(),
+    }
+}
+
+/// Build an `error` command from a BAM, reference, output prefix, and options.
+fn make_cmd(bam: &Path, ref_file: &Path, output: &Path, options: ErrorOptions) -> Error {
+    Error {
+        input: InputOptions { input: bam.to_path_buf() },
+        output: OutputOptions { output: output.to_path_buf() },
+        options: ErrorOptions { reference: ref_file.to_path_buf(), ..options },
+    }
+}
+
+/// Run `error` with the given options and return the output prefix. The temp dir
+/// is leaked so the output files persist for assertions.
+fn run_opts(bam: &Path, ref_file: &Path, options: ErrorOptions) -> PathBuf {
     let dir = tempfile::tempdir().unwrap();
     let prefix = dir.path().join("out");
-
-    let cmd = Error {
-        input: InputOptions { input: bam_path.to_path_buf() },
-        output: OutputOptions { output: prefix.clone() },
-        options: ErrorOptions {
-            reference: fasta_path.to_path_buf(),
-            vcf: None,
-            intervals: None,
-            min_mapq: 20,
-            min_bq: 0, // set to 0 for tests so all bases pass
-            include_duplicates: false,
-            max_isize: 1000,
-            picard_compat: false,
-            stratify_by,
-        },
-    };
-
-    cmd.execute(None).expect("error command should succeed");
-
-    // Leak the tempdir so files persist for assertions
-    let path = prefix.clone();
+    make_cmd(bam, ref_file, &prefix, options).execute(None).expect("error command should succeed");
     std::mem::forget(dir);
-    path
+    prefix
 }
 
-/// Create test reference: chr1 = 1000bp of repeating ACGTACGT...
-fn test_reference() -> (tempfile::NamedTempFile, Vec<u8>) {
-    let seq: Vec<u8> = (0..1000).map(|i| b"ACGT"[i % 4]).collect();
-    let fasta = FastaBuilder::new().add_contig("chr1", &seq).to_temp_fasta().unwrap();
-    (fasta, seq)
+/// Run `error` with default options and the given stratifiers.
+fn run(bam: &Path, ref_file: &Path, stratify_by: Vec<String>) -> PathBuf {
+    run_opts(bam, ref_file, ErrorOptions { stratify_by, ..opts() })
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+/// Read the mismatch metric rows from an output prefix.
+fn mismatch_rows(prefix: &Path) -> Vec<MismatchMetric> {
+    read_metrics_tsv(&prefix.with_file_name(format!("out{MISMATCH_SUFFIX}"))).unwrap()
+}
+
+/// Read the indel metric rows from an output prefix.
+fn indel_rows(prefix: &Path) -> Vec<IndelMetric> {
+    read_metrics_tsv(&prefix.with_file_name(format!("out{INDEL_SUFFIX}"))).unwrap()
+}
+
+/// Read the overlapping-mismatch metric rows from an output prefix.
+fn overlap_rows(prefix: &Path) -> Vec<OverlappingMismatchMetric> {
+    read_metrics_tsv(&prefix.with_file_name(format!("out{OVERLAP_SUFFIX}"))).unwrap()
+}
+
+/// The `all` stratifier row from a set of mismatch rows.
+fn all_mismatch(rows: &[MismatchMetric]) -> &MismatchMetric {
+    rows.iter().find(|r| r.stratifier == "all").unwrap()
+}
+
+/// The `all` stratifier row from a set of indel rows.
+fn all_indel(rows: &[IndelMetric]) -> &IndelMetric {
+    rows.iter().find(|r| r.stratifier == "all").unwrap()
+}
+
+// ─── Core correctness tests ─────────────────────────────────────────────────
 
 #[test]
 fn test_no_errors() {
-    let (fasta, ref_seq) = test_reference();
-    let seq = ref_seq[99..109].to_vec(); // 10bp matching reference at pos 100-109
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    make_pair(&mut builder, "read1", 0, 100, 120, 30, &seq, &ref_seq[119..129], &quals);
-    let bam = builder.to_temp_indexed_bam().unwrap();
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(pair("read1").at("chr1", 100, 120).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
     // Should have one row for "all" stratifier with zero errors
     assert!(!mm.is_empty());
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     assert!(all_row.total_bases > 0);
     assert_eq!(all_row.error_bases, 0);
-    assert_float_eq!(all_row.frac_error, 0.0, 1e-9);
+    assert_close!(all_row.frac_error, 0.0, 1e-9);
 }
 
 #[test]
 fn test_simple_mismatches() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Create a read that matches reference except for 2 bases
-    let mut seq = ref_seq[99..109].to_vec(); // pos 100-109 (1-based)
-    seq[0] = b'T'; // mismatch at pos 100 (ref is 'A' at 0-based index 99 → 99%4=3 → 'T', wait)
-    // ref at 0-based 99 is ref_seq[99] = b"ACGT"[99%4] = b"ACGT"[3] = b'T'
-    // So seq[0] matching ref_seq[99] = T. Let me pick a position where ref is 'A'.
-    // ref at 0-based 100 is ref_seq[100] = b"ACGT"[100%4] = b"ACGT"[0] = b'A'
-    // So let's use pos 101 (1-based) through 110 (1-based)
-    let mut seq = ref_seq[100..110].to_vec(); // matching reference
-    seq[0] = b'G'; // mismatch at index 100, ref='A', read='G'
-    seq[5] = b'T'; // mismatch at index 105, ref='C' (105%4=1), read='T'
-    let quals = vec![30u8; 10];
+    // A read matching the reference except for 2 planted mismatches at offsets 0 and 5.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta).sub(0, b'G').sub(5, b'T'));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    // Only add an unpaired read to keep it simple
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap()) // 1-based
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     assert_eq!(all_row.total_bases, 10);
     assert_eq!(all_row.error_bases, 2);
-    assert!((all_row.frac_error - 0.2).abs() < 1e-6);
+    assert_close!(all_row.frac_error, 0.2, 1e-6);
 }
 
 #[test]
 fn test_stratify_by_strand() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-
+    let mut sam = coord_builder(&[("chr1", 1000)]);
     // Forward read with 1 mismatch
-    let mut seq_fwd = ref_seq[100..110].to_vec();
-    seq_fwd[0] = b'G'; // mismatch
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let r_fwd = RecordBuf::builder()
-        .set_name("read_fwd")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar.clone())
-        .set_sequence(Sequence::from(seq_fwd))
-        .set_quality_scores(QualityScores::from(quals.clone()))
-        .build();
-
+    sam.add(read().name("read_fwd").at("chr1", 101).len(10).matching_ref(&fasta).sub(0, b'G'));
     // Reverse read with 0 mismatches
-    let seq_rev = ref_seq[200..210].to_vec();
-    let r_rev = RecordBuf::builder()
-        .set_name("read_rev")
-        .set_flags(Flags::REVERSE_COMPLEMENTED)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(201).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq_rev))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
+    sam.add(read().name("read_rev").at("chr1", 201).len(10).matching_ref(&fasta).reverse());
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    builder.add_record(r_fwd);
-    builder.add_record(r_rev);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["strand".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["strand".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     let fwd = mm.iter().find(|r| r.stratifier == "strand" && r.covariate == "+").unwrap();
     let rev = mm.iter().find(|r| r.stratifier == "strand" && r.covariate == "-").unwrap();
@@ -241,37 +153,18 @@ fn test_stratify_by_strand() {
 
 #[test]
 fn test_insertion_detection() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 13]; // 10M + 3I = 13 read bases
-
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
     // Read with 10M3I (10 aligned + 3 inserted bases)
-    // Sequence: 10 bases matching ref + 3 inserted bases
-    let mut seq = ref_seq[100..110].to_vec();
-    seq.extend_from_slice(b"AAA"); // 3bp insertion
-    let cigar: Cigar =
-        [Op::new(Kind::Match, 10), Op::new(Kind::Insertion, 3)].into_iter().collect();
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("10M3I").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let indels = indel_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     assert_eq!(all_row.total_bases, 10); // only aligned bases count for total
     assert_eq!(all_row.num_insertions, 1);
     assert_eq!(all_row.num_inserted_bases, 3);
@@ -280,38 +173,18 @@ fn test_insertion_detection() {
 
 #[test]
 fn test_deletion_detection() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
-
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
     // Read with 5M2D5M (5 match, 2 deleted, 5 match)
-    let mut seq = ref_seq[100..105].to_vec(); // first 5 bases
-    seq.extend_from_slice(&ref_seq[107..112]); // skip 2, next 5 bases
-    let cigar: Cigar =
-        [Op::new(Kind::Match, 5), Op::new(Kind::Deletion, 2), Op::new(Kind::Match, 5)]
-            .into_iter()
-            .collect();
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("5M2D5M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let indels = indel_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     assert_eq!(all_row.total_bases, 10); // 5 + 5 aligned bases
     assert_eq!(all_row.num_deletions, 1);
     assert_eq!(all_row.num_deleted_bases, 2);
@@ -320,31 +193,16 @@ fn test_deletion_detection() {
 
 #[test]
 fn test_min_mapq_filter() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
-
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
     // Read with MAPQ 10 (below default min of 20)
-    let seq = ref_seq[100..110].to_vec();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(10).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).mapq(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
     // All bases should be filtered out — empty or zero
     if let Some(all_row) = mm.iter().find(|r| r.stratifier == "all") {
@@ -355,49 +213,20 @@ fn test_min_mapq_filter() {
 
 #[test]
 fn test_duplicate_exclusion() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-
-    // Duplicate read
-    let seq = ref_seq[100..110].to_vec();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read_dup")
-        .set_flags(Flags::DUPLICATE)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar.clone())
-        .set_sequence(Sequence::from(seq.clone()))
-        .set_quality_scores(QualityScores::from(quals.clone()))
-        .build();
-
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    // Duplicate read (matches reference)
+    sam.add(read().name("read_dup").at("chr1", 101).len(10).matching_ref(&fasta).duplicate());
     // Non-duplicate read with 1 mismatch
-    let mut seq2 = ref_seq[100..110].to_vec();
-    seq2[0] = b'G';
-    let record2 = RecordBuf::builder()
-        .set_name("read_ok")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq2))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
+    sam.add(read().name("read_ok").at("chr1", 101).len(10).matching_ref(&fasta).sub(0, b'G'));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    builder.add_record(record);
-    builder.add_record(record2);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     // Only the non-duplicate read should be counted
     assert_eq!(all_row.total_bases, 10);
     assert_eq!(all_row.error_bases, 1);
@@ -405,30 +234,16 @@ fn test_duplicate_exclusion() {
 
 #[test]
 fn test_all_group_always_present() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let seq = ref_seq[100..110].to_vec();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
     // User specifies only "bq" but "all" should still be present
-    let prefix = run_error(bam.path(), fasta.path(), vec!["bq".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["bq".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     // Should have both "all" and "bq" rows
     assert!(mm.iter().any(|r| r.stratifier == "all"));
@@ -437,29 +252,15 @@ fn test_all_group_always_present() {
 
 #[test]
 fn test_composite_stratifier() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let seq = ref_seq[100..110].to_vec();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["strand,mapq".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["strand,mapq".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     // Should have rows for the composite "strand,mapq" group
     let composite_rows: Vec<_> = mm.iter().filter(|r| r.stratifier == "strand,mapq").collect();
@@ -470,39 +271,17 @@ fn test_composite_stratifier() {
 
 #[test]
 fn test_overlapping_reads_mismatching_ref_and_mate() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Two overlapping reads at positions 101-110 and 106-115.
+    // Read 1 matches the reference; read 2 mismatches at 0-based ref 107 (read2 offset 2).
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(pair("pair1").at("chr1", 101, 106).len(10).matching_ref(&fasta).r2(|r| r.sub(2, b'A')));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Two overlapping reads at positions 101-110 and 106-115
-    // Read 1: all matching reference
-    let seq1 = ref_seq[100..110].to_vec();
-    // Read 2: matches reference except pos 107 (0-based) which is in overlap region
-    let mut seq2 = ref_seq[105..115].to_vec();
-    seq2[2] = b'N'; // mismatch at position 107, but N won't count
-    // Actually, N gets filtered. Let's use a real mismatch.
-    let mut seq2 = ref_seq[105..115].to_vec();
-    // ref at 0-based 107 = b"ACGT"[107%4] = b"ACGT"[3] = b'T'
-    seq2[2] = b'A'; // mismatch at 0-based pos 107, ref='T', read='A'
-
-    make_pair(
-        &mut builder,
-        "pair1",
-        0,
-        101, // read1 pos (1-based)
-        106, // read2 pos (1-based)
-        15,  // tlen
-        &seq1,
-        &seq2,
-        &quals,
-    );
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     // We should have some overlap data
     if let Some(all_row) = ov.iter().find(|r| r.stratifier == "all") {
@@ -513,26 +292,14 @@ fn test_overlapping_reads_mismatching_ref_and_mate() {
 
 #[test]
 fn test_three_output_files_always_created() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let seq = ref_seq[100..110].to_vec();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
 
     // All three output files should exist
     assert!(prefix.with_file_name("out.error-mismatch.txt").exists());
@@ -540,110 +307,43 @@ fn test_three_output_files_always_created() {
     assert!(prefix.with_file_name("out.error-indel.txt").exists());
 }
 
-// ─── Helper for running with custom min_bq ──────────────────────────────────
-
-/// Run the error command with a custom `min_bq` threshold.
-fn run_error_with_bq(
-    bam_path: &std::path::Path,
-    fasta_path: &std::path::Path,
-    stratify_by: Vec<String>,
-    min_bq: u8,
-) -> PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let prefix = dir.path().join("out");
-
-    let cmd = Error {
-        input: InputOptions { input: bam_path.to_path_buf() },
-        output: OutputOptions { output: prefix.clone() },
-        options: ErrorOptions {
-            reference: fasta_path.to_path_buf(),
-            vcf: None,
-            intervals: None,
-            min_mapq: 20,
-            min_bq,
-            include_duplicates: false,
-            max_isize: 1000,
-            picard_compat: false,
-            stratify_by,
-        },
-    };
-
-    cmd.execute(None).expect("error command should succeed");
-    let path = prefix.clone();
-    std::mem::forget(dir);
-    path
-}
-
-// ─── Core correctness tests ─────────────────────────────────────────────────
-
 #[test]
 fn test_min_bq_filter() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Create a read where bases 0..5 have quality 10 and bases 5..10 have quality 30
-    let seq = ref_seq[100..110].to_vec(); // all matching reference
+    // A read where bases 0..5 have quality 10 and bases 5..10 have quality 30.
     let mut quals = vec![10u8; 10];
     for q in quals.iter_mut().skip(5) {
         *q = 30;
     }
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta).quals(quals));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error_with_bq(bam.path(), fasta.path(), vec![], 20);
+    let prefix = run_opts(bam.path(), ref_file.path(), ErrorOptions { min_bq: 20, ..opts() });
+    let mm = mismatch_rows(&prefix);
 
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     // Only the 5 high-quality bases should be counted
     assert_eq!(all_row.total_bases, 5);
 }
 
 #[test]
 fn test_n_bases_excluded() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Build a 10bp read: first 4 match ref, then N, then 4 match ref, then N
-    // Aligned at position 101 (1-based), so 0-based indices 100..110
-    let mut seq = ref_seq[100..110].to_vec();
-    seq[4] = b'N';
-    seq[9] = b'N';
-    let quals = vec![30u8; 10];
+    // A 10bp read matching the reference but with N bases at offsets 4 and 9.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta).sub(4, b'N').sub(9, b'N'));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     // 2 N bases should be excluded, leaving 8 valid bases
     assert_eq!(all_row.total_bases, 8);
     assert_eq!(all_row.error_bases, 0);
@@ -651,99 +351,49 @@ fn test_n_bases_excluded() {
 
 #[test]
 fn test_soft_clip_excluded() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // 10bp read with CIGAR 3S7M: 3 soft-clipped + 7 matched
-    // The 7 matched bases align starting at position 101 (1-based)
-    let mut seq = vec![b'A'; 3]; // soft-clipped bases (don't matter)
-    seq.extend_from_slice(&ref_seq[100..107]); // 7 matching ref bases
-    let quals = vec![30u8; 10];
+    // 10bp read with CIGAR 3S7M: 3 soft-clipped + 7 matched, aligned at 101.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("3S7M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::SoftClip, 3), Op::new(Kind::Match, 7)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     assert_eq!(all_row.total_bases, 7);
 }
 
 #[test]
 fn test_secondary_supplementary_excluded() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-
+    let mut sam = coord_builder(&[("chr1", 1000)]);
     // Primary read with 1 mismatch
-    let mut primary_seq = ref_seq[100..110].to_vec();
-    primary_seq[0] = b'G'; // mismatch at ref='A'
-    let primary = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar.clone())
-        .set_sequence(Sequence::from(primary_seq))
-        .set_quality_scores(QualityScores::from(quals.clone()))
-        .build();
-
+    sam.add(read().name("read1").at("chr1", 101).len(10).matching_ref(&fasta).sub(0, b'G'));
     // Secondary read with 1 mismatch
-    let mut secondary_seq = ref_seq[100..110].to_vec();
-    secondary_seq[1] = b'T'; // mismatch
-    let secondary = RecordBuf::builder()
-        .set_name("read2")
-        .set_flags(Flags::SECONDARY)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar.clone())
-        .set_sequence(Sequence::from(secondary_seq))
-        .set_quality_scores(QualityScores::from(quals.clone()))
-        .build();
-
+    sam.add(
+        read().name("read2").at("chr1", 101).len(10).matching_ref(&fasta).sub(1, b'T').secondary(),
+    );
     // Supplementary read with 1 mismatch
-    let mut supplementary_seq = ref_seq[100..110].to_vec();
-    supplementary_seq[2] = b'T'; // mismatch
-    let supplementary = RecordBuf::builder()
-        .set_name("read3")
-        .set_flags(Flags::SUPPLEMENTARY)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(supplementary_seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
+    sam.add(
+        read()
+            .name("read3")
+            .at("chr1", 101)
+            .len(10)
+            .matching_ref(&fasta)
+            .sub(2, b'T')
+            .supplementary(),
+    );
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    builder.add_record(primary);
-    builder.add_record(secondary);
-    builder.add_record(supplementary);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     // Only the primary read should be counted
     assert_eq!(all_row.total_bases, 10);
     assert_eq!(all_row.error_bases, 1);
@@ -751,49 +401,18 @@ fn test_secondary_supplementary_excluded() {
 
 #[test]
 fn test_mixed_insertion_and_deletion() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // CIGAR: 5M2I5M3D5M
-    // Read bases: 5 (match) + 2 (ins) + 5 (match) + 5 (match) = 17 read bases
-    // Ref consumed: 5 + 5 + 3 + 5 = 18 ref bases
-    // Aligned bases: 5 + 5 + 5 = 15
-    let mut seq = ref_seq[100..105].to_vec(); // first 5M
-    seq.extend_from_slice(b"AA"); // 2I
-    seq.extend_from_slice(&ref_seq[105..110]); // second 5M
-    // After the 3D, reference skips to 113; next 5M covers ref 113..118
-    seq.extend_from_slice(&ref_seq[113..118]); // third 5M
-    let quals = vec![30u8; 17];
+    // CIGAR: 5M2I5M3D5M — 15 aligned bases, one 2bp insertion, one 3bp deletion.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("5M2I5M3D5M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [
-        Op::new(Kind::Match, 5),
-        Op::new(Kind::Insertion, 2),
-        Op::new(Kind::Match, 5),
-        Op::new(Kind::Deletion, 3),
-        Op::new(Kind::Match, 5),
-    ]
-    .into_iter()
-    .collect();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let indels = indel_rows(&prefix);
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     assert_eq!(all_row.total_bases, 15);
     assert_eq!(all_row.num_insertions, 1);
     assert_eq!(all_row.num_inserted_bases, 2);
@@ -803,95 +422,50 @@ fn test_mixed_insertion_and_deletion() {
 
 #[test]
 fn test_q_score_calculation() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-
-    // Create 100 reads of 10bp each = 1000 total bases, with exactly 1 mismatch.
-    // Stack all reads at the same position to stay within the 1000bp reference.
+    // 100 reads of 10bp each = 1000 total bases, with exactly 1 mismatch (in the
+    // first read). Stack all reads at the same position to stay within the reference.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
     for i in 0..100 {
-        let mut seq = ref_seq[100..110].to_vec();
+        let mut r = read().at("chr1", 101).len(10).matching_ref(&fasta);
         if i == 0 {
-            seq[0] = b'G'; // single mismatch in the first read (ref='A' at 0-based 100)
+            r = r.sub(0, b'G');
         }
-        let record = RecordBuf::builder()
-            .set_name(format!("read{i}").as_str())
-            .set_flags(Flags::empty())
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(101).unwrap())
-            .set_mapping_quality(MappingQuality::new(60).unwrap())
-            .set_cigar(cigar.clone())
-            .set_sequence(Sequence::from(seq))
-            .set_quality_scores(QualityScores::from(quals.clone()))
-            .build();
-        builder.add_record(record);
+        sam.add(r);
     }
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     assert_eq!(all_row.total_bases, 1000);
     assert_eq!(all_row.error_bases, 1);
     // q_score = -10 * log10(1/1000) = 30.0
-    assert_float_eq!(all_row.q_score, 30.0, 0.01);
+    assert_close!(all_row.q_score, 30.0, 0.01);
 }
 
 // ─── Stratifier correctness tests ───────────────────────────────────────────
 
 #[test]
 fn test_stratify_by_cycle() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-
+    let mut sam = coord_builder(&[("chr1", 1000)]);
     // Forward read with a mismatch at read offset 2 (cycle 3 for forward reads)
-    let mut seq_fwd = ref_seq[100..110].to_vec();
-    // ref at 0-based 102 = b"ACGT"[102%4] = b"ACGT"[2] = b'G'
-    seq_fwd[2] = b'T'; // mismatch at cycle 3
-    let fwd = RecordBuf::builder()
-        .set_name("read_fwd")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar.clone())
-        .set_sequence(Sequence::from(seq_fwd))
-        .set_quality_scores(QualityScores::from(quals.clone()))
-        .build();
+    sam.add(read().name("read_fwd").at("chr1", 101).len(10).matching_ref(&fasta).sub(2, b'T'));
+    // Reverse-strand read with a mismatch at read offset 7. For reverse reads the
+    // cycle counts down from read_len, so offset 7 -> cycle = 10 - 7 = 3.
+    sam.add(
+        read().name("read_rev").at("chr1", 201).len(10).matching_ref(&fasta).sub(7, b'A').reverse(),
+    );
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Reverse-strand read with a mismatch at read offset 7 (cycle 3 for reverse)
-    // For reverse reads, cycle starts at read_len and counts down, so
-    // read_offset 7 -> cycle = 10 - 7 = 3
-    let mut seq_rev = ref_seq[200..210].to_vec();
-    // ref at 0-based 207 = b"ACGT"[207%4] = b"ACGT"[3] = b'T'
-    seq_rev[7] = b'A'; // mismatch at cycle 3 for reverse read
-    let rev = RecordBuf::builder()
-        .set_name("read_rev")
-        .set_flags(Flags::REVERSE_COMPLEMENTED)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(201).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq_rev))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-
-    builder.add_record(fwd);
-    builder.add_record(rev);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["cycle".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["cycle".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     let cycle3 = mm.iter().find(|r| r.stratifier == "cycle" && r.covariate == "3").unwrap();
     // Both reads contribute a mismatch at cycle 3
@@ -900,24 +474,16 @@ fn test_stratify_by_cycle() {
 
 #[test]
 fn test_stratify_by_read_num() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Read1 (forward) with 1 mismatch, Read2 (reverse) with 0 mismatches.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(pair("pair1").at("chr1", 101, 120).len(10).matching_ref(&fasta).r1(|r| r.sub(0, b'G')));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Read1 (forward) with 1 mismatch
-    let mut seq1 = ref_seq[100..110].to_vec();
-    seq1[0] = b'G'; // mismatch
-    // Read2 (reverse) with 0 mismatches
-    let seq2 = ref_seq[119..129].to_vec();
-
-    make_pair(&mut builder, "pair1", 0, 101, 120, 29, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["read_num".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["read_num".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     let r1 = mm.iter().find(|r| r.stratifier == "read_num" && r.covariate == "R1").unwrap();
     let r2 = mm.iter().find(|r| r.stratifier == "read_num" && r.covariate == "R2").unwrap();
@@ -927,34 +493,17 @@ fn test_stratify_by_read_num() {
 
 #[test]
 fn test_stratify_by_ref_base() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
+    // Forward read aligned at 101 (1-based). Reference at 0-based 100..110 is
+    // A C G T A C G T A C; a mismatch at offset 0 is at ref base 'A'.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta).sub(0, b'G'));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Forward read aligned at 101 (1-based). Reference pattern at 0-based 100..110:
-    // A C G T A C G T A C
-    let mut seq = ref_seq[100..110].to_vec();
-    // Introduce mismatch at offset 0: ref='A', read='G'
-    seq[0] = b'G';
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["ref_base".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["ref_base".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     // The mismatch at ref_base 'A' should show up
     let ref_a = mm.iter().find(|r| r.stratifier == "ref_base" && r.covariate == "A").unwrap();
@@ -966,48 +515,23 @@ fn test_stratify_by_ref_base() {
 
 #[test]
 fn test_stratify_by_hp_len() {
-    // Build a FASTA with a homopolymer run: ACGT then AAAA then CGTACGTACGT...
-    let mut custom_seq: Vec<u8> = Vec::with_capacity(1000);
-    // First 100 bases: normal ACGT pattern
-    custom_seq.extend((0..100).map(|i| b"ACGT"[i % 4]));
-    // Bases 100-103: AAAA (4-base homopolymer)
+    // Reference with a homopolymer run: ACGT pattern, then AAAA at 0-based 100-103.
+    let mut custom_seq: Vec<u8> = (0..100).map(|i| b"ACGT"[i % 4]).collect();
     custom_seq.extend_from_slice(b"AAAA");
-    // Fill rest with ACGT pattern
     custom_seq.extend((104..1000).map(|i| b"ACGT"[i % 4]));
+    let fasta = FastaBuilder::new().contig("chr1", custom_seq);
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let fasta = FastaBuilder::new().add_contig("chr1", &custom_seq).to_temp_fasta().unwrap();
+    // A forward read at 1-based 98 spanning the homopolymer region, matching the ref.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 98).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Create a forward read spanning the homopolymer region
-    // Read at positions 98..108 (0-based), which is 99-based=99 -> 1-based=99
-    // Actually: positions 97..107 (0-based) = 1-based 98..107
-    // This spans: ref[97..107] which includes the AAAA at positions 100-103
-    let seq = custom_seq[97..107].to_vec(); // all matching reference
-    let quals = vec![30u8; 10];
+    let prefix = run(bam.path(), ref_file.path(), vec!["hp_len".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(98).unwrap()) // 1-based
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["hp_len".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    // The base after the 4A homopolymer (read offset where we see 4 preceding A's)
-    // should have hp_len >= 3 (since the preceding identical bases form the hp run)
     // The hp_len stratifier should produce multiple covariate values including "0"
-    // and some non-zero values for bases after the homopolymer
+    // and some non-zero values for bases after the AAAA homopolymer.
     let hp_rows: Vec<_> = mm.iter().filter(|r| r.stratifier == "hp_len").collect();
     assert!(!hp_rows.is_empty());
     // Should have a row with hp_len=0 (for bases not following a homopolymer)
@@ -1021,37 +545,16 @@ fn test_stratify_by_hp_len() {
 
 #[test]
 fn test_stratify_by_indel_len() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Read with 5M3I5M: 5 match + 3 inserted + 5 match = 13 read bases
-    let mut seq = ref_seq[100..105].to_vec();
-    seq.extend_from_slice(b"AAA"); // 3bp insertion
-    seq.extend_from_slice(&ref_seq[105..110]);
-    let quals = vec![30u8; 13];
+    // Read with 5M3I5M: 5 match + 3 inserted + 5 match.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("5M3I5M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar =
-        [Op::new(Kind::Match, 5), Op::new(Kind::Insertion, 3), Op::new(Kind::Match, 5)]
-            .into_iter()
-            .collect();
-
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["indel_len".to_string()]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["indel_len".to_string()]);
+    let indels = indel_rows(&prefix);
 
     // Should have an indel_len=3 row for the 3bp insertion
     let indel_3 = indels.iter().find(|r| r.stratifier == "indel_len" && r.covariate == "3");
@@ -1060,8 +563,7 @@ fn test_stratify_by_indel_len() {
     assert_eq!(indel_3.num_insertions, 1);
 
     // Mismatch metrics should have rows with indel_len=0 for aligned bases
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let mm = mismatch_rows(&prefix);
     let mm_0 = mm.iter().find(|r| r.stratifier == "indel_len" && r.covariate == "0");
     assert!(mm_0.is_some(), "Expected indel_len=0 row for aligned bases in mismatch metrics");
     let mm_0 = mm_0.unwrap();
@@ -1072,22 +574,16 @@ fn test_stratify_by_indel_len() {
 
 #[test]
 fn test_overlapping_reads_all_agree() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Two overlapping reads (101-110 and 106-115) that both match the reference.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(pair("pair1").at("chr1", 101, 106).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Two overlapping reads where both match reference in the overlap region
-    let seq1 = ref_seq[100..110].to_vec(); // pos 101-110
-    let seq2 = ref_seq[105..115].to_vec(); // pos 106-115, overlap at 106-110
-
-    make_pair(&mut builder, "pair1", 0, 101, 106, 15, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     let all_row = ov.iter().find(|r| r.stratifier == "all").unwrap();
     assert!(all_row.overlapping_read_bases > 0, "Expected overlapping bases");
@@ -1098,30 +594,27 @@ fn test_overlapping_reads_all_agree() {
 
 #[test]
 fn test_overlapping_reads_matching_mate_but_not_ref() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Both reads carry the SAME mismatch at 0-based ref 107: read1 offset 7, read2
+    // offset 2. They disagree with the reference but agree with each other.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(
+        pair("pair1")
+            .at("chr1", 101, 106)
+            .len(10)
+            .matching_ref(&fasta)
+            .r1(|r| r.sub(7, b'A'))
+            .r2(|r| r.sub(2, b'A')),
+    );
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Overlapping pair where both reads have the SAME mismatch at position 107 (0-based)
-    // ref at 107 = b"ACGT"[107%4] = b"ACGT"[3] = b'T'
-    let mut seq1 = ref_seq[100..110].to_vec(); // pos 101-110
-    seq1[7] = b'A'; // read offset 7 -> ref pos 107, ref='T', read='A'
-
-    let mut seq2 = ref_seq[105..115].to_vec(); // pos 106-115
-    seq2[2] = b'A'; // read offset 2 -> ref pos 107, ref='T', read='A'
-
-    make_pair(&mut builder, "pair1", 0, 101, 106, 15, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     let all_row = ov.iter().find(|r| r.stratifier == "all").unwrap();
     assert!(all_row.overlapping_read_bases > 0);
-    // Both reads disagree with ref but agree with each other
     assert!(
         all_row.bases_matching_mate_but_not_ref > 0,
         "Expected bases_matching_mate_but_not_ref > 0, got {}",
@@ -1131,26 +624,23 @@ fn test_overlapping_reads_matching_mate_but_not_ref() {
 
 #[test]
 fn test_overlapping_reads_three_way() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Three-way disagreement at 0-based ref 107: ref='T', read1='A', read2='C'.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(
+        pair("pair1")
+            .at("chr1", 101, 106)
+            .len(10)
+            .matching_ref(&fasta)
+            .r1(|r| r.sub(7, b'A'))
+            .r2(|r| r.sub(2, b'C')),
+    );
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Three-way disagreement at position 107 (0-based):
-    // ref='T' (107%4=3), read='A', mate='C' — all different
-    let mut seq1 = ref_seq[100..110].to_vec(); // pos 101-110
-    seq1[7] = b'A'; // ref pos 107, ref='T', read1='A'
-
-    let mut seq2 = ref_seq[105..115].to_vec(); // pos 106-115
-    seq2[2] = b'C'; // ref pos 107, ref='T', read2='C'
-
-    make_pair(&mut builder, "pair1", 0, 101, 106, 15, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     let all_row = ov.iter().find(|r| r.stratifier == "all").unwrap();
     assert!(all_row.overlapping_read_bases > 0);
@@ -1163,28 +653,18 @@ fn test_overlapping_reads_three_way() {
 
 #[test]
 fn test_overlapping_reads_mismatching_ref_and_mate_exact() {
-    // Strengthened version of the existing test with exact assertions
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Read 1 matches the reference; read 2 mismatches at 0-based ref 107 (offset 2).
+    // In the overlap region read1 agrees with ref there, so this is exactly one
+    // base_mismatching_ref_and_mate.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(pair("pair1").at("chr1", 101, 106).len(10).matching_ref(&fasta).r2(|r| r.sub(2, b'A')));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Read 1: all matching reference at pos 101-110
-    let seq1 = ref_seq[100..110].to_vec();
-    // Read 2: matches reference except pos 107 (0-based)
-    // ref at 107 = b'T', we set read to 'A'
-    // In the overlap region (106-110), only pos 107 mismatches in read2
-    // Read1 agrees with ref at pos 107, so this is bases_mismatching_ref_and_mate
-    let mut seq2 = ref_seq[105..115].to_vec();
-    seq2[2] = b'A'; // mismatch at ref pos 107 (read2 offset 2)
-
-    make_pair(&mut builder, "pair1", 0, 101, 106, 15, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     let all_row = ov.iter().find(|r| r.stratifier == "all").unwrap();
     assert!(all_row.overlapping_read_bases > 0, "Expected overlapping bases");
@@ -1198,89 +678,37 @@ fn test_overlapping_reads_mismatching_ref_and_mate_exact() {
 
 #[test]
 fn test_multi_contig() {
-    // Build a FASTA with two contigs
-    let seq1: Vec<u8> = (0..500).map(|i| b"ACGT"[i % 4]).collect();
-    let seq2: Vec<u8> = (0..500).map(|i| b"ACGT"[i % 4]).collect();
-    let fasta = FastaBuilder::new()
-        .add_contig("chr1", &seq1)
-        .add_contig("chr2", &seq2)
-        .to_temp_fasta()
-        .unwrap();
+    let acgt = |n: usize| (0..n).map(|i| b"ACGT"[i % 4]).collect::<Vec<u8>>();
+    let fasta = FastaBuilder::new().contig("chr1", acgt(500)).contig("chr2", acgt(500));
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let quals = vec![30u8; 10];
-    let mut builder = coord_builder(&[("chr1", 500), ("chr2", 500)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
+    let mut sam = coord_builder(&[("chr1", 500), ("chr2", 500)]);
+    sam.add(read().name("read_chr1").at("chr1", 101).len(10).matching_ref(&fasta));
+    sam.add(read().name("read_chr2").at("chr2", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Read on chr1
-    let read_seq1 = seq1[100..110].to_vec();
-    let r1 = RecordBuf::builder()
-        .set_name("read_chr1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar.clone())
-        .set_sequence(Sequence::from(read_seq1))
-        .set_quality_scores(QualityScores::from(quals.clone()))
-        .build();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    // Read on chr2
-    let read_seq2 = seq2[100..110].to_vec();
-    let r2 = RecordBuf::builder()
-        .set_name("read_chr2")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(1)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(read_seq2))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-
-    builder.add_record(r1);
-    builder.add_record(r2);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     // Both reads should be counted: 10 + 10 = 20 total bases
     assert_eq!(all_row.total_bases, 20);
 }
 
 #[test]
 fn test_deletion_at_read_start() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // CIGAR: 2D10M — deletion before any aligned base, so no anchor.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("2D10M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // CIGAR: 2D10M — deletion before any aligned base, so no anchor
-    let seq = ref_seq[102..112].to_vec(); // 10 bases after the 2bp deletion
-    let cigar: Cigar = [Op::new(Kind::Deletion, 2), Op::new(Kind::Match, 10)].into_iter().collect();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let indels = indel_rows(&prefix);
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     assert_eq!(all_row.total_bases, 10);
     // No anchor before the deletion, so it should be silently skipped
     assert_eq!(all_row.num_deletions, 0);
@@ -1288,80 +716,35 @@ fn test_deletion_at_read_start() {
 
 #[test]
 fn test_insertion_at_read_start() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // CIGAR: 3I10M — insertion before any aligned base, so no anchor
-    let mut seq = vec![b'A'; 3]; // 3 inserted bases
-    seq.extend_from_slice(&ref_seq[100..110]); // 10 aligned bases
-    let quals = vec![30u8; 13];
+    // CIGAR: 3I10M — insertion before any aligned base, so no anchor.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("3I10M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar =
-        [Op::new(Kind::Insertion, 3), Op::new(Kind::Match, 10)].into_iter().collect();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let indels = indel_rows(&prefix);
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     // No anchor before the insertion, so it should be skipped
     assert_eq!(all_row.num_insertions, 0);
 }
 
 #[test]
 fn test_stratifier_parse_error() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let seq = ref_seq[100..110].to_vec();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let prefix = dir.path().join("out");
-
-    let cmd = Error {
-        input: InputOptions { input: bam.path().to_path_buf() },
-        output: OutputOptions { output: prefix },
-        options: ErrorOptions {
-            reference: fasta.path().to_path_buf(),
-            vcf: None,
-            intervals: None,
-            min_mapq: 20,
-            min_bq: 0,
-            include_duplicates: false,
-            max_isize: 1000,
-            picard_compat: false,
-            stratify_by: vec!["invalid_name".to_string()],
-        },
-    };
+    let options = ErrorOptions { stratify_by: vec!["invalid_name".to_string()], ..opts() };
+    let cmd = make_cmd(bam.path(), ref_file.path(), &prefix, options);
 
     let result = cmd.execute(None);
     assert!(result.is_err(), "Expected error for invalid stratifier name");
@@ -1371,36 +754,18 @@ fn test_stratifier_parse_error() {
 
 #[test]
 fn test_gc_stratification() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Create a read with a known GC content.
-    // Use ref_seq[100..110] = A C G T A C G T A C
-    // GC count = 4 (C,G,C,G), total = 10 -> GC% = 40 (rounded = (4*100+5)/10 = 40)
-    let seq = ref_seq[100..110].to_vec();
-    let quals = vec![30u8; 10];
+    // Read at 1-based 101 matching ref[100..110] = A C G T A C G T A C: 5 GC bases.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let prefix = run(bam.path(), ref_file.path(), vec!["gc".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["gc".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    // Sequence ACGTACGTAC has 5 GC bases (3 C's + 2 G's) out of 10
-    // GC% = (5*100 + 5)/10 = 50 (rounded)
+    // Sequence ACGTACGTAC has 5 GC bases out of 10 -> GC% = (5*100 + 5)/10 = 50.
     let gc_rows: Vec<_> = mm.iter().filter(|r| r.stratifier == "gc").collect();
     assert!(!gc_rows.is_empty());
     // All 10 bases should be in the gc=50 bucket
@@ -1415,34 +780,17 @@ fn test_gc_stratification() {
 
 #[test]
 fn test_pre_dinuc_stratification() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Forward read at pos 101 (1-based), ref[100..110] = A C G T A C G T A C
-    // Read matches ref exactly.
-    // pre_dinuc = previous read base + current ref base (in sequencing order)
-    // At read offset 1: prev_base=A (offset 0), ref_base=C (pos 101 0-based) -> "AC"
-    let seq = ref_seq[100..110].to_vec();
-    let quals = vec![30u8; 10];
+    // Forward read at 1-based 101 matching ref[100..110] = A C G T A C G T A C.
+    // pre_dinuc = previous read base + current ref base; at offset 1 that is "AC".
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["pre_dinuc".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["pre_dinuc".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     let dinuc_rows: Vec<_> = mm.iter().filter(|r| r.stratifier == "pre_dinuc").collect();
     assert!(!dinuc_rows.is_empty());
@@ -1456,33 +804,17 @@ fn test_pre_dinuc_stratification() {
 
 #[test]
 fn test_context_3bp_stratification() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // Forward read at pos 101 (1-based), ref[100..110] = A C G T A C G T A C
-    // context_3bp = prev_read_base + ref_base + next_read_base
-    // At read offset 1: prev=A(offset 0), ref=C(pos 101), next=G(offset 2) -> "ACG"
-    let seq = ref_seq[100..110].to_vec();
-    let quals = vec![30u8; 10];
+    // Forward read at 1-based 101 matching ref[100..110] = A C G T A C G T A C.
+    // context_3bp at offset 1 = prev 'A' + ref 'C' + next 'G' -> "ACG".
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec!["context_3bp".to_string()]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec!["context_3bp".to_string()]);
+    let mm = mismatch_rows(&prefix);
 
     let ctx_rows: Vec<_> = mm.iter().filter(|r| r.stratifier == "context_3bp").collect();
     assert!(!ctx_rows.is_empty());
@@ -1498,47 +830,26 @@ fn test_context_3bp_stratification() {
 /// whose mate is not present in the BAM should still be processed for mismatch/indel errors.
 #[test]
 fn test_orphaned_buffered_read_still_counted() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-
-    // Create a single read that classify_overlap will put into the Buffer:
-    // - paired, both mapped, same contig, tlen < 2*read_len, starts before mate
-    // - BUT the mate is not in the BAM
-    let mut seq = ref_seq[100..110].to_vec(); // pos 101-110
-    seq[5] = b'G'; // mismatch at ref pos 105, ref='C' (105%4=1 -> 'C'), read='G'
-
-    let mapq = MappingQuality::new(60).unwrap();
-    let cigar: Cigar = [Op::new(Kind::Match, 10)].into_iter().collect();
-    let r1 = RecordBuf::builder()
-        .set_name("orphan")
-        .set_flags(
-            Flags::SEGMENTED
-                | Flags::PROPERLY_SEGMENTED
-                | Flags::MATE_REVERSE_COMPLEMENTED
-                | Flags::FIRST_SEGMENT,
-        )
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(mapq)
-        .set_cigar(cigar)
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(106).unwrap()) // mate starts later
-        .set_template_length(15) // < 2*10, so overlap expected
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
+    // A single read of a pair (mate at 106, small insert) whose mate is absent from
+    // the BAM. classify_overlap buffers it, and it must still be counted. It carries
+    // a mismatch at 0-based ref 105 (offset 5).
+    let (orphan, _mate) = pair("orphan")
+        .at("chr1", 101, 106)
+        .len(10)
+        .matching_ref(&fasta)
+        .r1(|r| r.sub(5, b'G'))
         .build();
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(orphan);
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    builder.add_record(r1);
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let mm = mismatch_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     assert_eq!(all_row.total_bases, 10, "Orphaned read's 10 bases should be counted");
     assert_eq!(all_row.error_bases, 1, "Orphaned read's mismatch should be counted");
 }
@@ -1549,52 +860,29 @@ fn test_orphaned_buffered_read_still_counted() {
 /// insertion to be skipped, while aligned bases are still counted.
 #[test]
 fn test_insertion_low_bq_first_base_excluded() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // CIGAR: 30M2I44M = 76 read bases, 74 aligned bases
-    // Position 101 (1-based), so ref[100..174]
-    let mut seq = ref_seq[100..130].to_vec(); // 30M
-    seq.extend_from_slice(b"AA"); // 2I
-    seq.extend_from_slice(&ref_seq[130..174]); // 44M
-    assert_eq!(seq.len(), 76);
-
-    // All bases get BQ=30 except the first inserted base (read offset 30) gets BQ=5
+    // CIGAR: 30M2I44M = 76 read bases, 74 aligned. All BQ=30 except the first
+    // inserted base (read offset 30) at BQ=5.
     let mut quals = vec![30u8; 76];
     quals[30] = 5;
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar =
-        [Op::new(Kind::Match, 30), Op::new(Kind::Insertion, 2), Op::new(Kind::Match, 44)]
-            .into_iter()
-            .collect();
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("30M2I44M").matching_ref(&fasta).quals(quals));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
+    let prefix = run_opts(bam.path(), ref_file.path(), ErrorOptions { min_bq: 20, ..opts() });
+    let indels = indel_rows(&prefix);
 
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error_with_bq(bam.path(), fasta.path(), vec![], 20);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     // The insertion should be entirely skipped because the first inserted base has BQ < min_bq
     assert_eq!(
         all_row.num_insertions, 0,
         "Insertion should be skipped when first base BQ < min_bq"
     );
     assert_eq!(all_row.num_inserted_bases, 0);
-    // Aligned bases should still be counted (74 total, minus any with BQ < 20, but all aligned
-    // bases have BQ=30 so all 74 should pass)
+    // The 74 aligned bases (all BQ=30) should still be counted.
     assert_eq!(all_row.total_bases, 74);
 }
 
@@ -1603,32 +891,27 @@ fn test_insertion_low_bq_first_base_excluded() {
 /// `overlapping_read_bases` should count both reads' contributions to the overlap.
 #[test]
 fn test_overlap_double_counted() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Both reads mismatch at 0-based ref 106: read1 offset 6, read2 offset 1.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(
+        pair("pair1")
+            .at("chr1", 101, 106)
+            .len(10)
+            .matching_ref(&fasta)
+            .r1(|r| r.sub(6, b'T'))
+            .r2(|r| r.sub(1, b'T')),
+    );
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Read1: pos 101-110 (1-based). Mismatch at pos 107 (0-based 106).
-    // ref at 0-based 106 = b"ACGT"[106%4] = b"ACGT"[2] = b'G'
-    let mut seq1 = ref_seq[100..110].to_vec();
-    seq1[6] = b'T'; // mismatch at ref pos 107 (0-based 106), ref='G', read='T'
-
-    // Read2: pos 106-115 (1-based). Overlap region is 106-110. Mismatch at same position.
-    // ref at 0-based 106 = 'G'. Read offset for pos 107 in read2 = 107-106 = 1
-    let mut seq2 = ref_seq[105..115].to_vec();
-    seq2[1] = b'T'; // mismatch at ref pos 107 (0-based 106), ref='G', read='T'
-
-    make_pair(&mut builder, "pair1", 0, 101, 106, 15, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     let all_row = ov.iter().find(|r| r.stratifier == "all").unwrap();
-    // The overlap region is 106-110 (5 positions). Both reads are counted in the overlap,
-    // so overlapping_read_bases should be 2 * 5 = 10.
+    // The overlap region is 106-110 (5 positions); both reads are counted, so
+    // overlapping_read_bases should be 2 * 5 = 10.
     assert_eq!(
         all_row.overlapping_read_bases, 10,
         "Both reads should contribute to overlapping_read_bases"
@@ -1645,51 +928,23 @@ fn test_overlap_double_counted() {
 /// but still counted in the "all" group.
 #[test]
 fn test_max_isize_exclusion() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    // Pair 1: small insert size (tlen=15, overlapping).
+    sam.add(pair("small_pair").at("chr1", 101, 106).len(10).matching_ref(&fasta));
+    // Pair 2: large insert size (tlen=500).
+    sam.add(pair("large_pair").at("chr1", 101, 591).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Pair 1: small insert size (tlen=15, overlapping)
-    let small_fwd = ref_seq[100..110].to_vec();
-    let small_rev = ref_seq[105..115].to_vec();
-    make_pair(&mut builder, "small_pair", 0, 101, 106, 15, &small_fwd, &small_rev, &quals);
-
-    // Pair 2: large insert size (tlen=500)
-    let large_fwd = ref_seq[100..110].to_vec();
-    let large_rev = ref_seq[590..600].to_vec();
-    make_pair(&mut builder, "large_pair", 0, 101, 591, 500, &large_fwd, &large_rev, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-
-    let dir = tempfile::tempdir().unwrap();
-    let prefix = dir.path().join("out");
-
-    let cmd = Error {
-        input: InputOptions { input: bam.path().to_path_buf() },
-        output: OutputOptions { output: prefix.clone() },
-        options: ErrorOptions {
-            reference: fasta.path().to_path_buf(),
-            vcf: None,
-            intervals: None,
-            min_mapq: 20,
-            min_bq: 0,
-            include_duplicates: false,
-            max_isize: 100,
-            picard_compat: false,
-            stratify_by: vec!["all".into(), "isize".into()],
-        },
-    };
-
-    cmd.execute(None).expect("error command should succeed");
-    let path = prefix.clone();
-    std::mem::forget(dir);
-
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&path.with_file_name("out.error-mismatch.txt")).unwrap();
+    let options =
+        ErrorOptions { max_isize: 100, stratify_by: vec!["all".into(), "isize".into()], ..opts() };
+    let prefix = run_opts(bam.path(), ref_file.path(), options);
+    let mm = mismatch_rows(&prefix);
 
     // The "all" row should count bases from BOTH pairs (4 reads x 10 bases = 40)
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_mismatch(&mm);
     assert_eq!(all_row.total_bases, 40, "All 4 reads should be counted in the 'all' group");
 
     // The isize stratifier should have a row for tlen=15 (small pair)
@@ -1705,21 +960,16 @@ fn test_max_isize_exclusion() {
 /// overlapping bases in the overlap metrics.
 #[test]
 fn test_non_overlapping_pair_no_overlap_metrics() {
-    let (fasta, ref_seq) = test_reference();
-    let quals = vec![30u8; 10];
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
+    // Read1 at 101-110, read2 at 200-209. No overlap.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(pair("pair1").at("chr1", 101, 200).len(10).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    // Read1 at pos 101-110, read2 at pos 200-209. No overlap.
-    let seq1 = ref_seq[100..110].to_vec();
-    let seq2 = ref_seq[199..209].to_vec();
-    make_pair(&mut builder, "pair1", 0, 101, 200, 109, &seq1, &seq2, &quals);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let ov: Vec<OverlappingMismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-overlap.txt")).unwrap();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let ov = overlap_rows(&prefix);
 
     // If there is an "all" overlap row, it should have zero overlapping bases
     if let Some(all_row) = ov.iter().find(|r| r.stratifier == "all") {
@@ -1735,36 +985,18 @@ fn test_non_overlapping_pair_no_overlap_metrics() {
 /// so the insertion should not be counted, but the aligned bases should still be counted.
 #[test]
 fn test_insertion_at_read_start_no_anchor() {
-    let (fasta, ref_seq) = test_reference();
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    // CIGAR: 3I50M — insertion before any aligned base, so no anchor
-    let mut seq = vec![b'A'; 3]; // 3 inserted bases
-    seq.extend_from_slice(&ref_seq[100..150]); // 50 aligned bases
-    let quals = vec![30u8; 53];
+    // CIGAR: 3I50M — insertion before any aligned base, so no anchor.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("3I50M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
-    let mut builder = coord_builder(&[("chr1", 1000)]);
-    let cigar: Cigar =
-        [Op::new(Kind::Insertion, 3), Op::new(Kind::Match, 50)].into_iter().collect();
+    let prefix = run(bam.path(), ref_file.path(), vec![]);
+    let indels = indel_rows(&prefix);
 
-    let record = RecordBuf::builder()
-        .set_name("read1")
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(101).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq))
-        .set_quality_scores(QualityScores::from(quals))
-        .build();
-    builder.add_record(record);
-
-    let bam = builder.to_temp_indexed_bam().unwrap();
-    let prefix = run_error(bam.path(), fasta.path(), vec![]);
-
-    let indels: Vec<IndelMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-indel.txt")).unwrap();
-
-    let all_row = indels.iter().find(|r| r.stratifier == "all").unwrap();
+    let all_row = all_indel(&indels);
     // No anchor before the insertion, so it should be skipped
     assert_eq!(
         all_row.num_insertions, 0,
@@ -1774,9 +1006,8 @@ fn test_insertion_at_read_start_no_anchor() {
     assert_eq!(all_row.total_bases, 50);
 
     // Verify mismatch metrics also count the aligned bases
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-    let mm_all = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let mm = mismatch_rows(&prefix);
+    let mm_all = all_mismatch(&mm);
     assert_eq!(mm_all.total_bases, 50, "Aligned M bases should still be counted for mismatches");
 }
 
@@ -1799,50 +1030,122 @@ fn test_insertion_at_read_start_no_anchor() {
 /// 35 positions are skipped by `RegionContext::contains`, so `error_bases` is 0.
 #[test]
 fn test_cross_contig_orphan_not_processed_against_wrong_contig() {
-    let chr1 = vec![b'A'; 200];
-    let chr2 = vec![b'G'; 200];
-    let fasta = FastaBuilder::new()
-        .add_contig("chr1", &chr1)
-        .add_contig("chr2", &chr2)
-        .to_temp_fasta()
-        .unwrap();
+    let fasta = FastaBuilder::new().contig("chr1", vec![b'A'; 200]).contig("chr2", vec![b'G'; 200]);
+    let ref_file = fasta.to_temp_fasta().unwrap();
 
-    let quals = vec![30u8; 50];
-    let seq_all_a = vec![b'A'; 50];
-    let mut builder = coord_builder(&[("chr1", 200), ("chr2", 200)]);
-    // read1 at 1-based pos 1, mate at pos 30 (0-based 29) — mate_pos falls inside
-    // read1's [1, 50] span so the buffer keeps it pending.
-    make_pair(&mut builder, "read", 0, 1, 30, 79, &seq_all_a, &seq_all_a, &quals);
-    let bam = builder.to_temp_indexed_bam().unwrap();
+    // read1 at 1-based pos 1, mate at pos 30 — mate_pos falls inside read1's [1, 50]
+    // span so the buffer keeps it pending.
+    let mut sam = coord_builder(&[("chr1", 200), ("chr2", 200)]);
+    sam.add(pair("read").at("chr1", 1, 30).len(50).matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
 
     // BED: chr1 partial interval ending *before* read1's mate_pos (29); chr2 full.
     let dir = tempfile::tempdir().unwrap();
-    let bed_path = dir.path().join("regions.bed");
-    std::fs::write(&bed_path, "chr1\t0\t15\nchr2\t0\t200\n").unwrap();
+    let bed =
+        BedBuilder::new().interval("chr1", 0, 15).interval("chr2", 0, 200).to_temp_bed().unwrap();
 
     let prefix = dir.path().join("out");
-    let cmd = Error {
-        input: InputOptions { input: bam.path().to_path_buf() },
-        output: OutputOptions { output: prefix.clone() },
-        options: ErrorOptions {
-            reference: fasta.path().to_path_buf(),
-            vcf: None,
-            intervals: Some(bed_path),
-            min_mapq: 20,
-            min_bq: 0,
-            include_duplicates: false,
-            max_isize: 1000,
-            picard_compat: false,
-            stratify_by: vec![],
-        },
-    };
-    cmd.execute(None).expect("error command should succeed");
+    let options = ErrorOptions { intervals: Some(bed.path().to_path_buf()), ..opts() };
+    make_cmd(bam.path(), ref_file.path(), &prefix, options)
+        .execute(None)
+        .expect("error command should succeed");
 
-    let mm: Vec<MismatchMetric> =
-        read_metrics_tsv(&prefix.with_file_name("out.error-mismatch.txt")).unwrap();
-    let all_row = mm.iter().find(|r| r.stratifier == "all").unwrap();
+    let mm = mismatch_rows(&prefix);
+    let all_row = all_mismatch(&mm);
     assert_eq!(
         all_row.error_bases, 0,
         "orphan on chr1 must not be compared against chr2's reference bases"
     );
+}
+
+// ─── Known-sites (VCF) masking tests ────────────────────────────────────────
+
+#[test]
+fn test_vcf_masks_known_variant_mismatch() {
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
+
+    // A read matching the reference except a mismatch at offset 0 (1-based pos 101).
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).len(10).matching_ref(&fasta).sub(0, b'G'));
+    let bam = sam.to_temp_indexed_bam().unwrap();
+
+    // Without a VCF, the mismatch counts as an error over all 10 bases.
+    let plain = run(bam.path(), ref_file.path(), vec![]);
+    let plain_rows = mismatch_rows(&plain);
+    let all = all_mismatch(&plain_rows);
+    assert_eq!(all.total_bases, 10);
+    assert_eq!(all.error_bases, 1);
+
+    // A known variant at chr1:101 masks that position: the mismatch is excluded and
+    // the masked base drops out of the denominator too.
+    let mut vcf = VcfBuilder::with_contigs(&[("chr1", 1000)]);
+    vcf.add("chr1", 101, "A").alt("G");
+    let vcf_file = vcf.to_temp_vcf().unwrap();
+
+    let options = ErrorOptions { vcf: Some(vcf_file.path().to_path_buf()), ..opts() };
+    let masked = run_opts(bam.path(), ref_file.path(), options);
+    let masked_rows = mismatch_rows(&masked);
+    let all = all_mismatch(&masked_rows);
+    assert_eq!(all.total_bases, 9, "the masked position drops from the denominator");
+    assert_eq!(all.error_bases, 0, "the mismatch at the known-variant site is not counted");
+}
+
+#[test]
+fn test_vcf_masks_deletion_in_variant_span() {
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
+
+    // Read 5M2D5M at 101 deletes 1-based reference positions 106 and 107.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("5M2D5M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
+
+    // Without a VCF the deletion is reported.
+    let plain = run(bam.path(), ref_file.path(), vec![]);
+    let plain_rows = indel_rows(&plain);
+    let all = all_indel(&plain_rows);
+    assert_eq!(all.num_deletions, 1);
+    assert_eq!(all.num_deleted_bases, 2);
+
+    // A known 2 bp deletion (REF "CG" at 106) masks the whole deleted span, so the
+    // observed deletion is excluded.
+    let mut vcf = VcfBuilder::with_contigs(&[("chr1", 1000)]);
+    vcf.add("chr1", 106, "CG").alt("C");
+    let vcf_file = vcf.to_temp_vcf().unwrap();
+
+    let options = ErrorOptions { vcf: Some(vcf_file.path().to_path_buf()), ..opts() };
+    let masked = run_opts(bam.path(), ref_file.path(), options);
+    let masked_rows = indel_rows(&masked);
+    let all = all_indel(&masked_rows);
+    assert_eq!(all.num_deletions, 0, "a deletion fully within a known-variant span is excluded");
+}
+
+#[test]
+fn test_vcf_masks_insertion_at_variant_anchor() {
+    let fasta = reference();
+    let ref_file = fasta.to_temp_fasta().unwrap();
+
+    // Read 5M3I5M at 101: the insertion is anchored at 1-based reference pos 105.
+    let mut sam = coord_builder(&[("chr1", 1000)]);
+    sam.add(read().at("chr1", 101).cigar("5M3I5M").matching_ref(&fasta));
+    let bam = sam.to_temp_indexed_bam().unwrap();
+
+    // Without a VCF the insertion is reported.
+    let plain = run(bam.path(), ref_file.path(), vec![]);
+    let plain_rows = indel_rows(&plain);
+    let all = all_indel(&plain_rows);
+    assert_eq!(all.num_insertions, 1);
+    assert_eq!(all.num_inserted_bases, 3);
+
+    // A known variant at the insertion's anchor (chr1:105) excludes the insertion.
+    let mut vcf = VcfBuilder::with_contigs(&[("chr1", 1000)]);
+    vcf.add("chr1", 105, "A").alt("G");
+    let vcf_file = vcf.to_temp_vcf().unwrap();
+
+    let options = ErrorOptions { vcf: Some(vcf_file.path().to_path_buf()), ..opts() };
+    let masked = run_opts(bam.path(), ref_file.path(), options);
+    let masked_rows = indel_rows(&masked);
+    let all = all_indel(&masked_rows);
+    assert_eq!(all.num_insertions, 0, "an insertion anchored at a known-variant site is excluded");
 }

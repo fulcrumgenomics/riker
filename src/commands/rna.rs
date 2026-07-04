@@ -2465,8 +2465,8 @@ mod tests {
 
     #[test]
     fn median_odd_and_even() {
-        assert!((median(&mut [3.0, 1.0, 2.0]) - 2.0).abs() < 1e-9);
-        assert!((median(&mut [1.0, 2.0, 3.0, 4.0]) - 2.5).abs() < 1e-9);
+        crate::assert_close!(median(&mut [3.0, 1.0, 2.0]), 2.0, 1e-9);
+        crate::assert_close!(median(&mut [1.0, 2.0, 3.0, 4.0]), 2.5, 1e-9);
         assert_eq!(median(&mut []), 0.0);
     }
 

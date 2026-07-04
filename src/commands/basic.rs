@@ -736,11 +736,11 @@ mod tests {
         // Q60 is the max → upper = 60 → counts spans 0..=60 (length 61).
         assert_eq!(counts.len(), 61);
         // The top bin holds Q60's fraction; nothing was dropped.
-        assert!((counts[60] - 0.6).abs() < 1e-9);
-        assert!((counts[30] - 0.4).abs() < 1e-9);
+        crate::assert_close!(counts[60], 0.6, 1e-9);
+        crate::assert_close!(counts[30], 0.4, 1e-9);
         // Edges run 0.0 .. 61.0 inclusive.
-        assert!((edges[0] - 0.0).abs() < 1e-9);
-        assert!((edges[edges.len() - 1] - 61.0).abs() < 1e-9);
+        crate::assert_close!(edges[0], 0.0, 1e-9);
+        crate::assert_close!(edges[edges.len() - 1], 61.0, 1e-9);
     }
 
     /// Even when no observed quality reaches 45, the X axis must still
@@ -758,7 +758,7 @@ mod tests {
         // upper = max(45, 10) = 45 → counts spans 0..=45 (length 46).
         assert_eq!(counts.len(), 46);
         assert_eq!(edges.len(), 47);
-        assert!((edges[edges.len() - 1] - 46.0).abs() < 1e-9);
+        crate::assert_close!(edges[edges.len() - 1], 46.0, 1e-9);
     }
 
     /// `ACGT_BITMASK` is the bitset over `(base & 0x1F)` slots that

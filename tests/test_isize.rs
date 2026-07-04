@@ -1,14 +1,16 @@
 mod helpers;
 
-use helpers::{SamBuilder, read_metrics_tsv};
+use helpers::read_metrics_tsv;
+use riker_lib::assert_close;
 use riker_lib::commands::command::Command;
 use riker_lib::commands::isize::{
     HISTOGRAM_SUFFIX, InsertSize, InsertSizeHistogramEntry, InsertSizeMetric, IsizeOptions,
     METRICS_SUFFIX, PLOT_SUFFIX,
 };
+use riker_lib::test_support::{ReadBuilder, SamBuilder, pair};
 use tempfile::TempDir;
 
-// ─── Helper ──────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Build an `InsertSize` command pointing at `bam_path` with a given output prefix.
 fn make_cmd(
@@ -26,27 +28,16 @@ fn make_cmd(
     }
 }
 
-/// Assert two f64 values are approximately equal.
-macro_rules! assert_f64_eq {
-    ($a:expr, $b:expr) => {{
-        let a: f64 = $a;
-        let b: f64 = $b;
-        assert!((a - b).abs() < 1e-6, "expected {b} got {a} (diff={})", (a - b).abs());
-    }};
-}
-
 // ─── Integration tests ────────────────────────────────────────────────────────
 
 #[test]
 fn test_basic_fr_five_pairs() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // 5 FR pairs, all with insert size 100.
-    for i in 0..5 {
-        let name = format!("read{i}");
-        // pos1=100, pos2=200, read_len=100 → FR orientation, insert_size=100
-        builder.add_pair(&name, 0, 100, 200, 100, 60, 100, false, false);
+    for _ in 0..5 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200));
     }
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
@@ -58,35 +49,25 @@ fn test_basic_fr_five_pairs() {
     let m = &rows[0];
     assert_eq!(m.pair_orientation, "FR");
     assert_eq!(m.read_pairs, 5);
-    assert_f64_eq!(m.median_insert_size, 100.0);
+    assert_close!(m.median_insert_size, 100.0);
     assert_eq!(m.mode_insert_size, 100);
     assert_eq!(m.min_insert_size, 100);
     assert_eq!(m.max_insert_size, 100);
-    assert_f64_eq!(m.mean_insert_size, 100.0);
-    assert_f64_eq!(m.standard_deviation, 0.0);
-    assert_f64_eq!(m.median_absolute_deviation, 0.0);
+    assert_close!(m.mean_insert_size, 100.0);
+    assert_close!(m.standard_deviation, 0.0);
+    assert_close!(m.median_absolute_deviation, 0.0);
 }
 
 #[test]
 fn test_varied_insert_sizes() {
-    // 6 FR pairs with distinct insert sizes.
-    let sizes: [u32; 6] = [90, 95, 100, 100, 105, 110];
-    let mut builder = SamBuilder::new();
-    for (i, &sz) in sizes.iter().enumerate() {
-        #[allow(clippy::cast_possible_wrap)]
-        builder.add_pair(
-            &format!("r{i}"),
-            0,
-            100,
-            100 + sz as usize,
-            sz as i32,
-            60,
-            1,
-            false,
-            false,
-        );
+    // 6 FR pairs with distinct insert sizes. The 90 and 95 bp inserts are shorter
+    // than the 100 bp reads, so the pair builder soft-clips the adapter read-through.
+    let sizes: [usize; 6] = [90, 95, 100, 100, 105, 110];
+    let mut sam = SamBuilder::new();
+    for &sz in &sizes {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..(100 + sz)));
     }
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
@@ -99,25 +80,30 @@ fn test_varied_insert_sizes() {
     assert_eq!(m.pair_orientation, "FR");
     assert_eq!(m.read_pairs, 6);
     // median of {90,95,100,100,105,110} = (100+100)/2 = 100
-    assert_f64_eq!(m.median_insert_size, 100.0);
+    assert_close!(m.median_insert_size, 100.0);
     assert_eq!(m.mode_insert_size, 100);
     assert_eq!(m.min_insert_size, 90);
     assert_eq!(m.max_insert_size, 110);
-    assert_f64_eq!(m.mean_insert_size, 100.0);
+    assert_close!(m.mean_insert_size, 100.0);
 }
 
 #[test]
 fn test_duplicate_filter() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // 5 normal pairs
-    for i in 0..5 {
-        builder.add_pair(&format!("norm{i}"), 0, 100, 200, 100, 60, 50, false, false);
+    for _ in 0..5 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200));
     }
     // 3 duplicate pairs
-    for i in 0..3 {
-        builder.add_pair(&format!("dup{i}"), 0, 100, 200, 100, 60, 50, true, false);
+    for _ in 0..3 {
+        sam.add(
+            pair(sam.next_id())
+                .fr("chr1", 100..200)
+                .r1(ReadBuilder::duplicate)
+                .r2(ReadBuilder::duplicate),
+        );
     }
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
 
     let dir_excl = TempDir::new().unwrap();
     let prefix_excl = dir_excl.path().join("out");
@@ -136,15 +122,15 @@ fn test_duplicate_filter() {
 
 #[test]
 fn test_qc_fail_filter() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // 5 PF pairs + 2 QC-fail pairs
-    for i in 0..5 {
-        builder.add_pair(&format!("pf{i}"), 0, 100, 200, 100, 60, 50, false, false);
+    for _ in 0..5 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200));
     }
-    for i in 0..2 {
-        builder.add_pair(&format!("fail{i}"), 0, 100, 200, 100, 60, 50, false, true);
+    for _ in 0..2 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200).qc_fail());
     }
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
@@ -157,15 +143,15 @@ fn test_qc_fail_filter() {
 
 #[test]
 fn test_min_frac_excludes_minority_orientation() {
-    let mut builder = SamBuilder::new();
-    // 20 FR pairs: pos1 < pos2
-    for i in 0..20 {
-        builder.add_pair(&format!("fr{i}"), 0, 100, 200, 100, 60, 50, false, false);
+    let mut sam = SamBuilder::new();
+    // 20 FR pairs
+    for _ in 0..20 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200));
     }
-    // 1 RF pair: pos1 > pos2 (read2 at pos2=100, mate at pos1=200)
-    builder.add_pair("rf0", 0, 200, 100, 100, 60, 50, false, false);
+    // 1 RF pair: the reverse mate sits upstream of the forward mate ("outie").
+    sam.add(pair("rf0").at("chr1", 200, 100));
 
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
@@ -180,13 +166,14 @@ fn test_min_frac_excludes_minority_orientation() {
 
 #[test]
 fn test_min_frac_zero_includes_all_orientations() {
-    let mut builder = SamBuilder::new();
-    for i in 0..10 {
-        builder.add_pair(&format!("fr{i}"), 0, 100, 200, 100, 60, 50, false, false);
+    let mut sam = SamBuilder::new();
+    for _ in 0..10 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200));
     }
-    builder.add_pair("rf0", 0, 200, 100, 100, 60, 50, false, false);
+    // 1 RF pair: the reverse mate sits upstream of the forward mate ("outie").
+    sam.add(pair("rf0").at("chr1", 200, 100));
 
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
@@ -201,13 +188,14 @@ fn test_min_frac_zero_includes_all_orientations() {
 
 #[test]
 fn test_histogram_output() {
-    let mut builder = SamBuilder::new();
-    builder.add_pair("r100a", 0, 100, 200, 100, 60, 50, false, false);
-    builder.add_pair("r100b", 0, 100, 200, 100, 60, 50, false, false);
-    builder.add_pair("r101", 0, 100, 201, 101, 60, 50, false, false);
-    builder.add_pair("r102", 0, 100, 202, 102, 60, 50, false, false);
+    let inserts: [(&str, usize); 4] =
+        [("r100a", 100), ("r100b", 100), ("r101", 101), ("r102", 102)];
+    let mut sam = SamBuilder::new();
+    for (name, insert) in inserts {
+        sam.add(pair(name).fr("chr1", 100..(100 + insert)));
+    }
 
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
@@ -234,19 +222,19 @@ fn test_histogram_output() {
 /// `median + deviations * MAD` window should survive.
 #[test]
 fn test_histogram_trims_long_tail() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // 100 typical FR pairs spread over insert sizes 200..209.
-    for i in 0..100i32 {
-        let tlen = 200 + (i % 10);
-        builder.add_pair(&format!("ok{i}"), 0, 100, 300, tlen, 60, 50, false, false);
+    for i in 0..100usize {
+        let insert = 200 + i % 10;
+        sam.add(pair(sam.next_id()).fr("chr1", 100..(100 + insert)));
     }
     // 3 anomalous FR pairs with very large insert sizes that should not
     // appear in the trimmed output.
-    for i in 0..3 {
-        builder.add_pair(&format!("anom{i}"), 0, 100, 100_000, 50_000, 60, 50, false, false);
+    for _ in 0..3 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..50_100));
     }
 
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
     make_cmd(bam.path(), &prefix, false, 0.0).execute(None).unwrap();
@@ -286,11 +274,11 @@ fn test_histogram_trims_long_tail() {
 
 #[test]
 fn test_plot_output_created() {
-    let mut builder = SamBuilder::new();
-    for i in 0..5 {
-        builder.add_pair(&format!("r{i}"), 0, 100, 200, 100, 60, 50, false, false);
+    let mut sam = SamBuilder::new();
+    for _ in 0..5 {
+        sam.add(pair(sam.next_id()).fr("chr1", 100..200));
     }
-    let bam = builder.to_temp_bam().unwrap();
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 

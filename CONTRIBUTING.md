@@ -232,7 +232,8 @@ calls in both the `"text"` and `"markdown"` arms.
 ### 5. Add tests
 
 - **Integration tests** in `tests/test_<name>.rs` — build BAM data
-  programmatically using `SamBuilder`, run the command, deserialize output with
+  programmatically with `read()`/`pair()` + `SamBuilder` (from
+  `riker_lib::test_support`), run the command, deserialize output with
   `read_metrics_tsv`, and assert on results.
 - **Multi integration tests** in `tests/test_multi.rs` — add at least one test
   that runs your collector through the `multi` command.
@@ -308,15 +309,20 @@ The macro classifies each field into one of three categories:
 
 ## Testing
 
-**No checked-in test data.** All BAM, FASTA, and interval data is built
-programmatically using the helpers in `tests/helpers/mod.rs`:
+**No checked-in test data.** All BAM, FASTA, interval, and VCF data is built
+programmatically with the fluent builders in `riker_lib::test_support` — a
+feature-gated module shared by the `tests/` integration crate and the lib's own
+inline `#[cfg(test)]` tests:
 
-| Helper | Purpose |
+| Builder / helper | Purpose |
 |--------|---------|
-| `SamBuilder` | Build `RecordBuf` instances and write to a temp BAM |
-| `FastaBuilder` | Build a temp FASTA with `.fai` index |
-| `read_metrics_tsv::<T>(path)` | Deserialize TSV output for assertions |
-| `assert_float_eq!(a, b, eps)` | Float comparison with epsilon |
+| `read()` / `pair()` | Build a `RecordBuf` / an FR pair; bases derive from a frozen reference so `.sub(off, base)` plants a mismatch |
+| `SamBuilder` / `coord_builder()` | Collect records and write a temp BAM/SAM/CRAM or an indexed BAM |
+| `FastaBuilder` | Build a temp FASTA + `.fai` (frozen hg38-mini default, or custom contigs) |
+| `BedBuilder` / `VcfBuilder` | Build a temp BED / bgzip+tabix VCF |
+| `drive_collector(collector, bam)` | Run a `Collector` over a BAM (open → init → accept → finish) |
+| `crate::assert_close!(a, b[, eps])` | Inclusive float comparison (`\|a - b\| <= eps`) |
+| `helpers::read_metrics_tsv::<T>(path)` | Deserialize TSV output for assertions (`tests/helpers`) |
 
 **Guidelines:**
 

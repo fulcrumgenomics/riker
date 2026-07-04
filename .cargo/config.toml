@@ -1,4 +1,4 @@
 [alias]
-ci-test = "nextest run --locked --no-tests=pass"
+ci-test = "nextest run --locked --no-tests=pass --features test-support"
 ci-fmt = "fmt --package riker-ngs -- --check"
-ci-lint = "clippy --package riker-ngs --all-targets -- -D warnings -W clippy::pedantic -A clippy::doc_markdown"
+ci-lint = "clippy --package riker-ngs --all-targets --features test-support -- -D warnings -W clippy::pedantic -A clippy::doc_markdown"

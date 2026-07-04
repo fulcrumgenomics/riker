@@ -1829,28 +1829,28 @@ mod tests {
     fn test_compute_median_simple() {
         // 5 bases at depth 0, 10 bases at depth 1
         let hist = vec![5, 10];
-        assert!((compute_median(&hist, 15) - 1.0).abs() < f64::EPSILON);
+        crate::assert_close!(compute_median(&hist, 15), 1.0, f64::EPSILON);
     }
 
     #[test]
     fn test_compute_median_empty() {
-        assert!((compute_median(&[], 0)).abs() < f64::EPSILON);
+        crate::assert_close!(compute_median(&[], 0), 0.0, f64::EPSILON);
     }
 
     #[test]
     fn test_compute_percentile() {
         // 10 bases at depth 0, 10 at depth 1, 10 at depth 2
         let hist = vec![10, 10, 10];
-        assert!((compute_percentile(&hist, 30, 0.20)).abs() < f64::EPSILON); // 20th pctile = depth 0
-        assert!((compute_percentile(&hist, 30, 0.50) - 1.0).abs() < f64::EPSILON); // 50th pctile = depth 1
+        crate::assert_close!(compute_percentile(&hist, 30, 0.20), 0.0, f64::EPSILON); // 20th pctile = depth 0
+        crate::assert_close!(compute_percentile(&hist, 30, 0.50), 1.0, f64::EPSILON); // 50th pctile = depth 1
     }
 
     #[test]
     fn test_gc_fraction_pure_acgt() {
         // 4 G/C out of 8 → 0.5.
-        assert!((HybCapCollector::gc_fraction(b"ACGTACGT") - 0.5).abs() < f64::EPSILON);
+        crate::assert_close!(HybCapCollector::gc_fraction(b"ACGTACGT"), 0.5, f64::EPSILON);
         // Lowercase is treated identically.
-        assert!((HybCapCollector::gc_fraction(b"acgtacgt") - 0.5).abs() < f64::EPSILON);
+        crate::assert_close!(HybCapCollector::gc_fraction(b"acgtacgt"), 0.5, f64::EPSILON);
     }
 
     #[test]
@@ -1859,16 +1859,16 @@ mod tests {
         // each contributes 0.5 to the numerator and 1 to the denominator.
         // 4 unambiguous ACGT (2 G/C) + 8 ambiguous → (2 + 8*0.5) / 12 = 0.5.
         let bases = b"ACGTNSWRYKMB";
-        assert!((HybCapCollector::gc_fraction(bases) - 0.5).abs() < f64::EPSILON);
+        crate::assert_close!(HybCapCollector::gc_fraction(bases), 0.5, f64::EPSILON);
 
         // All-N pulls GC toward 0.5 regardless of case.
-        assert!((HybCapCollector::gc_fraction(b"NNNNnnnn") - 0.5).abs() < f64::EPSILON);
+        crate::assert_close!(HybCapCollector::gc_fraction(b"NNNNnnnn"), 0.5, f64::EPSILON);
     }
 
     #[test]
     fn test_gc_fraction_empty() {
         // safe_div_f returns 0.0 for an empty slice.
-        assert!(HybCapCollector::gc_fraction(b"").abs() < f64::EPSILON);
+        crate::assert_close!(HybCapCollector::gc_fraction(b""), 0.0, f64::EPSILON);
     }
 
     #[test]
@@ -1926,6 +1926,6 @@ mod tests {
     fn test_hs_penalty_no_library_size() {
         let penalty =
             HybCapCollector::calculate_hs_penalty(None, 50.0, 1.5, 0.8, 10_000, 9_000, 30);
-        assert!(penalty.abs() < f64::EPSILON);
+        crate::assert_close!(penalty, 0.0, f64::EPSILON);
     }
 }

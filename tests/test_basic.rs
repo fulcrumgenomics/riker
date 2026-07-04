@@ -1,90 +1,30 @@
 mod helpers;
 
-use helpers::{SamBuilder, read_metrics_tsv};
-use noodles::core::Position;
-use noodles::sam::alignment::RecordBuf;
-use noodles::sam::alignment::record::Flags;
-use noodles::sam::alignment::record::MappingQuality;
-use noodles::sam::alignment::record::cigar::{Op, op::Kind};
-use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
-use riker_lib::collector::Collector;
+use helpers::read_metrics_tsv;
+use riker_lib::assert_close;
 use riker_lib::commands::basic::{
     BASE_DIST_PLOT_SUFFIX, BASE_DIST_SUFFIX, BaseDistributionByCycleMetric, BasicCollector,
     MEAN_QUAL_PLOT_SUFFIX, MEAN_QUAL_SUFFIX, MeanQualityByCycleMetric, QUAL_DIST_PLOT_SUFFIX,
     QUAL_DIST_SUFFIX, QualityScoreDistributionMetric,
 };
+use riker_lib::test_support::{ReadBuilder, SamBuilder, drive_collector, pair, read};
 use tempfile::TempDir;
 
-/// Run the BasicCollector on a SamBuilder and return the output prefix.
-fn run_basic(builder: &SamBuilder) -> (TempDir, std::path::PathBuf) {
-    let bam = builder.to_temp_bam().unwrap();
+/// Run the `BasicCollector` over `sam` and return the temp dir plus output prefix.
+fn run_basic(sam: &SamBuilder) -> (TempDir, std::path::PathBuf) {
+    let bam = sam.to_temp_bam().unwrap();
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
-    let header = builder.header().clone();
-
     let mut collector = BasicCollector::new(bam.path(), &prefix);
-    collector.initialize(&header).unwrap();
-
-    let mut reader =
-        riker_lib::sam::alignment_reader::AlignmentReader::open(bam.path(), None, 0).unwrap();
-    let hdr = reader.header().clone();
-    let requirements = collector.field_needs();
-    for result in reader.riker_records(&requirements) {
-        let record = result.unwrap();
-        collector.accept(&record, &hdr).unwrap();
-    }
-    collector.finish().unwrap();
-
+    drive_collector(&mut collector, bam.path()).unwrap();
     (dir, prefix)
 }
 
-/// Build a RecordBuf with specific sequence and qualities.
-fn make_record(name: &str, flags: Flags, seq: &[u8], quals: &[u8]) -> RecordBuf {
-    let cigar: Cigar = [Op::new(Kind::Match, seq.len())].into_iter().collect();
-    RecordBuf::builder()
-        .set_name(name)
-        .set_flags(flags)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(1).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(seq.to_vec()))
-        .set_quality_scores(QualityScores::from(quals.to_vec()))
-        .build()
-}
-
-/// Build a paired record with specific sequence and qualities.
-fn make_paired_record(
-    name: &str,
-    is_r2: bool,
-    is_reverse: bool,
-    seq: &[u8],
-    quals: &[u8],
-) -> RecordBuf {
-    let mut flags = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED;
-    if is_r2 {
-        flags |= Flags::LAST_SEGMENT;
-    } else {
-        flags |= Flags::FIRST_SEGMENT;
-    }
-    if is_reverse {
-        flags |= Flags::REVERSE_COMPLEMENTED;
-    }
-
-    let cigar: Cigar = [Op::new(Kind::Match, seq.len())].into_iter().collect();
-    RecordBuf::builder()
-        .set_name(name)
-        .set_flags(flags)
-        .set_reference_sequence_id(0)
-        .set_alignment_start(Position::new(1).unwrap())
-        .set_mapping_quality(MappingQuality::new(60).unwrap())
-        .set_cigar(cigar)
-        .set_mate_reference_sequence_id(0)
-        .set_mate_alignment_start(Position::new(100).unwrap())
-        .set_template_length(if is_r2 { -200 } else { 200 })
-        .set_sequence(Sequence::from(seq.to_vec()))
-        .set_quality_scores(QualityScores::from(quals.to_vec()))
-        .build()
+/// A single mapped read at chr1:1 with an explicit name, bases, and qualities —
+/// the base/quality content is exactly what these tests assert on. Callers chain
+/// flag setters (`.reverse()`, `.secondary()`, …) and `.build()`.
+fn read_with(name: &str, bases: &[u8], quals: &[u8]) -> ReadBuilder {
+    read().name(name).bases(bases.to_vec()).quals(quals.to_vec())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -93,11 +33,14 @@ fn make_paired_record(
 fn test_paired_reads() {
     // R1: ACGT with quals 10,20,30,40
     // R2: TTTT with quals 20,20,20,20
-    let mut builder = SamBuilder::new();
-    builder.add_record(make_paired_record("r1", false, false, b"ACGT", &[10, 20, 30, 40]));
-    builder.add_record(make_paired_record("r1", true, true, b"TTTT", &[20, 20, 20, 20]));
+    let mut sam = SamBuilder::new();
+    sam.add(
+        pair("r1")
+            .r1(|r| r.bases(b"ACGT".to_vec()).quals(vec![10u8, 20, 30, 40]))
+            .r2(|r| r.reverse().bases(b"TTTT".to_vec()).quals(vec![20u8; 4])),
+    );
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     // Check base distribution
     let bd_path =
@@ -109,21 +52,21 @@ fn test_paired_reads() {
     assert_eq!(r1.len(), 4);
 
     // Cycle 1: A=1.0, rest=0
-    assert_float_eq!(r1[0].frac_a, 1.0, 1e-5);
-    assert_float_eq!(r1[0].frac_c, 0.0, 1e-5);
+    assert_close!(r1[0].frac_a, 1.0, 1e-5);
+    assert_close!(r1[0].frac_c, 0.0, 1e-5);
     // Cycle 2: C=1.0
-    assert_float_eq!(r1[1].frac_c, 1.0, 1e-5);
+    assert_close!(r1[1].frac_c, 1.0, 1e-5);
     // Cycle 3: G=1.0
-    assert_float_eq!(r1[2].frac_g, 1.0, 1e-5);
+    assert_close!(r1[2].frac_g, 1.0, 1e-5);
     // Cycle 4: T=1.0
-    assert_float_eq!(r1[3].frac_t, 1.0, 1e-5);
+    assert_close!(r1[3].frac_t, 1.0, 1e-5);
 
     // R2: reverse-complemented, so cycle numbering reversed: cycle 4,3,2,1
     // but all bases are T, so each cycle should be 100% T
     let r2: Vec<_> = base_dist.iter().filter(|m| m.read_end == 2).collect();
     assert_eq!(r2.len(), 4);
     for m in &r2 {
-        assert_float_eq!(m.frac_t, 1.0, 1e-5);
+        assert_close!(m.frac_t, 1.0, 1e-5);
     }
 
     // Check mean quality by cycle
@@ -133,14 +76,14 @@ fn test_paired_reads() {
     // R1: 4 cycles, R2: 4 cycles offset by 4
     assert_eq!(mean_qual.len(), 8);
     // R1 cycles
-    assert_float_eq!(mean_qual[0].mean_quality, 10.0, 0.01);
-    assert_float_eq!(mean_qual[1].mean_quality, 20.0, 0.01);
-    assert_float_eq!(mean_qual[2].mean_quality, 30.0, 0.01);
-    assert_float_eq!(mean_qual[3].mean_quality, 40.0, 0.01);
+    assert_close!(mean_qual[0].mean_quality, 10.0, 0.01);
+    assert_close!(mean_qual[1].mean_quality, 20.0, 0.01);
+    assert_close!(mean_qual[2].mean_quality, 30.0, 0.01);
+    assert_close!(mean_qual[3].mean_quality, 40.0, 0.01);
     // R2 cycles (all 20, offset cycles 5-8)
     assert_eq!(mean_qual[4].cycle, 5);
     for m in &mean_qual[4..8] {
-        assert_float_eq!(m.mean_quality, 20.0, 0.01);
+        assert_close!(m.mean_quality, 20.0, 0.01);
     }
 
     // Check quality score distribution
@@ -160,12 +103,11 @@ fn test_paired_reads() {
 
 #[test]
 fn test_unpaired_forward_read() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // Forward read: ACG, quals 10,20,30
-    let flags = Flags::empty();
-    builder.add_record(make_record("r1", flags, b"ACG", &[10, 20, 30]));
+    sam.add(read_with("r1", b"ACG", &[10, 20, 30]));
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let bd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
@@ -176,22 +118,21 @@ fn test_unpaired_forward_read() {
     assert!(base_dist.iter().all(|m| m.read_end == 1));
     // Cycle 1=A, 2=C, 3=G
     assert_eq!(base_dist[0].cycle, 1);
-    assert_float_eq!(base_dist[0].frac_a, 1.0, 1e-5);
+    assert_close!(base_dist[0].frac_a, 1.0, 1e-5);
     assert_eq!(base_dist[1].cycle, 2);
-    assert_float_eq!(base_dist[1].frac_c, 1.0, 1e-5);
+    assert_close!(base_dist[1].frac_c, 1.0, 1e-5);
     assert_eq!(base_dist[2].cycle, 3);
-    assert_float_eq!(base_dist[2].frac_g, 1.0, 1e-5);
+    assert_close!(base_dist[2].frac_g, 1.0, 1e-5);
 }
 
 #[test]
 fn test_unpaired_reverse_read() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // Reverse-complemented read: ACG, quals 10,20,30
     // Cycle numbering reversed: stored seq position 0 -> cycle 3, pos 1 -> cycle 2, pos 2 -> cycle 1
-    let flags = Flags::REVERSE_COMPLEMENTED;
-    builder.add_record(make_record("r1", flags, b"ACG", &[10, 20, 30]));
+    sam.add(read_with("r1", b"ACG", &[10, 20, 30]).reverse());
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let bd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
@@ -202,30 +143,29 @@ fn test_unpaired_reverse_read() {
     // Stored pos 1 (C) -> cycle_idx 1 (cycle 2)
     // Stored pos 2 (G) -> cycle_idx 0 (cycle 1)
     assert_eq!(base_dist[0].cycle, 1);
-    assert_float_eq!(base_dist[0].frac_g, 1.0, 1e-5);
+    assert_close!(base_dist[0].frac_g, 1.0, 1e-5);
     assert_eq!(base_dist[1].cycle, 2);
-    assert_float_eq!(base_dist[1].frac_c, 1.0, 1e-5);
+    assert_close!(base_dist[1].frac_c, 1.0, 1e-5);
     assert_eq!(base_dist[2].cycle, 3);
-    assert_float_eq!(base_dist[2].frac_a, 1.0, 1e-5);
+    assert_close!(base_dist[2].frac_a, 1.0, 1e-5);
 
     // Quality: pos 0 (q=10) -> cycle 3, pos 1 (q=20) -> cycle 2, pos 2 (q=30) -> cycle 1
     let mq_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), MEAN_QUAL_SUFFIX));
     let mean_qual: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&mq_path).unwrap();
     assert_eq!(mean_qual.len(), 3);
-    assert_float_eq!(mean_qual[0].mean_quality, 30.0, 0.01); // cycle 1
-    assert_float_eq!(mean_qual[1].mean_quality, 20.0, 0.01); // cycle 2
-    assert_float_eq!(mean_qual[2].mean_quality, 10.0, 0.01); // cycle 3
+    assert_close!(mean_qual[0].mean_quality, 30.0, 0.01); // cycle 1
+    assert_close!(mean_qual[1].mean_quality, 20.0, 0.01); // cycle 2
+    assert_close!(mean_qual[2].mean_quality, 10.0, 0.01); // cycle 3
 }
 
 #[test]
 fn test_n_bases_in_base_dist_excluded_from_qual_dist() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // Read with N bases: ANT, quals 10,20,30
-    let flags = Flags::empty();
-    builder.add_record(make_record("r1", flags, b"ANT", &[10, 20, 30]));
+    sam.add(read_with("r1", b"ANT", &[10, 20, 30]));
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     // Base distribution should include N
     let bd_path =
@@ -233,7 +173,7 @@ fn test_n_bases_in_base_dist_excluded_from_qual_dist() {
     let base_dist: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&bd_path).unwrap();
     assert_eq!(base_dist.len(), 3);
     // Cycle 2 should have N=1.0
-    assert_float_eq!(base_dist[1].frac_n, 1.0, 1e-5);
+    assert_close!(base_dist[1].frac_n, 1.0, 1e-5);
 
     // Quality distribution should exclude the N base (q=20)
     let qd_path =
@@ -252,18 +192,18 @@ fn test_n_bases_in_base_dist_excluded_from_qual_dist() {
 
 #[test]
 fn test_secondary_supplementary_skipped() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
 
     // One normal read
-    builder.add_record(make_record("r1", Flags::empty(), b"ACGT", &[30, 30, 30, 30]));
+    sam.add(read_with("r1", b"ACGT", &[30, 30, 30, 30]));
 
     // Secondary read — should be skipped
-    builder.add_record(make_record("r2", Flags::SECONDARY, b"TTTT", &[30, 30, 30, 30]));
+    sam.add(read_with("r2", b"TTTT", &[30, 30, 30, 30]).secondary());
 
     // Supplementary read — should be skipped
-    builder.add_record(make_record("r3", Flags::SUPPLEMENTARY, b"GGGG", &[30, 30, 30, 30]));
+    sam.add(read_with("r3", b"GGGG", &[30, 30, 30, 30]).supplementary());
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let qd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), QUAL_DIST_SUFFIX));
@@ -276,12 +216,12 @@ fn test_secondary_supplementary_skipped() {
 
 #[test]
 fn test_qc_fail_skipped() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
 
-    builder.add_record(make_record("r1", Flags::empty(), b"AC", &[30, 30]));
-    builder.add_record(make_record("r2", Flags::QC_FAIL, b"GT", &[30, 30]));
+    sam.add(read_with("r1", b"AC", &[30, 30]));
+    sam.add(read_with("r2", b"GT", &[30, 30]).qc_fail());
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let qd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), QUAL_DIST_SUFFIX));
@@ -292,14 +232,14 @@ fn test_qc_fail_skipped() {
 
 #[test]
 fn test_duplicates_included() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
 
     // Normal read
-    builder.add_record(make_record("r1", Flags::empty(), b"AC", &[30, 30]));
+    sam.add(read_with("r1", b"AC", &[30, 30]));
     // Duplicate read — should still be counted
-    builder.add_record(make_record("r2", Flags::DUPLICATE, b"GT", &[30, 30]));
+    sam.add(read_with("r2", b"GT", &[30, 30]).duplicate());
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let qd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), QUAL_DIST_SUFFIX));
@@ -310,14 +250,14 @@ fn test_duplicates_included() {
 
 #[test]
 fn test_mixed_read_lengths() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
 
     // 3-base read
-    builder.add_record(make_record("r1", Flags::empty(), b"ACG", &[10, 20, 30]));
+    sam.add(read_with("r1", b"ACG", &[10, 20, 30]));
     // 5-base read
-    builder.add_record(make_record("r2", Flags::empty(), b"TTTTT", &[40, 40, 40, 40, 40]));
+    sam.add(read_with("r2", b"TTTTT", &[40, 40, 40, 40, 40]));
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let bd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
@@ -328,18 +268,18 @@ fn test_mixed_read_lengths() {
 
     // Cycles 1-3: mixed (A+T, C+T, G+T at respective cycles)
     // Cycle 1: A from r1, T from r2 -> frac_a=0.5, frac_t=0.5
-    assert_float_eq!(base_dist[0].frac_a, 0.5, 1e-5);
-    assert_float_eq!(base_dist[0].frac_t, 0.5, 1e-5);
+    assert_close!(base_dist[0].frac_a, 0.5, 1e-5);
+    assert_close!(base_dist[0].frac_t, 0.5, 1e-5);
 
     // Cycles 4-5: only from r2 (T)
-    assert_float_eq!(base_dist[3].frac_t, 1.0, 1e-5);
-    assert_float_eq!(base_dist[4].frac_t, 1.0, 1e-5);
+    assert_close!(base_dist[3].frac_t, 1.0, 1e-5);
+    assert_close!(base_dist[4].frac_t, 1.0, 1e-5);
 }
 
 #[test]
 fn test_empty_bam() {
-    let builder = SamBuilder::new();
-    let (_dir, prefix) = run_basic(&builder);
+    let sam = SamBuilder::new();
+    let (_dir, prefix) = run_basic(&sam);
 
     // All TSV files should exist and be empty (no data rows)
     let bd_path =
@@ -360,13 +300,13 @@ fn test_empty_bam() {
 
 #[test]
 fn test_multiple_reads_accumulation() {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
 
     // Two forward reads of length 2: AA and CC
-    builder.add_record(make_record("r1", Flags::empty(), b"AA", &[10, 20]));
-    builder.add_record(make_record("r2", Flags::empty(), b"CC", &[30, 40]));
+    sam.add(read_with("r1", b"AA", &[10, 20]));
+    sam.add(read_with("r2", b"CC", &[30, 40]));
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     let bd_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
@@ -374,26 +314,26 @@ fn test_multiple_reads_accumulation() {
     assert_eq!(base_dist.len(), 2);
 
     // Each cycle: A=0.5, C=0.5
-    assert_float_eq!(base_dist[0].frac_a, 0.5, 1e-5);
-    assert_float_eq!(base_dist[0].frac_c, 0.5, 1e-5);
-    assert_float_eq!(base_dist[1].frac_a, 0.5, 1e-5);
-    assert_float_eq!(base_dist[1].frac_c, 0.5, 1e-5);
+    assert_close!(base_dist[0].frac_a, 0.5, 1e-5);
+    assert_close!(base_dist[0].frac_c, 0.5, 1e-5);
+    assert_close!(base_dist[1].frac_a, 0.5, 1e-5);
+    assert_close!(base_dist[1].frac_c, 0.5, 1e-5);
 
     // Mean quality: cycle 1 = (10+30)/2 = 20, cycle 2 = (20+40)/2 = 30
     let mq_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), MEAN_QUAL_SUFFIX));
     let mean_qual: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&mq_path).unwrap();
     assert_eq!(mean_qual.len(), 2);
-    assert_float_eq!(mean_qual[0].mean_quality, 20.0, 0.01);
-    assert_float_eq!(mean_qual[1].mean_quality, 30.0, 0.01);
+    assert_close!(mean_qual[0].mean_quality, 20.0, 0.01);
+    assert_close!(mean_qual[1].mean_quality, 30.0, 0.01);
 }
 
 #[test]
 fn test_plot_files_created() {
-    let mut builder = SamBuilder::new();
-    builder.add_record(make_record("r1", Flags::empty(), b"ACGT", &[30, 30, 30, 30]));
+    let mut sam = SamBuilder::new();
+    sam.add(read_with("r1", b"ACGT", &[30, 30, 30, 30]));
 
-    let (_dir, prefix) = run_basic(&builder);
+    let (_dir, prefix) = run_basic(&sam);
 
     for suffix in [BASE_DIST_PLOT_SUFFIX, MEAN_QUAL_PLOT_SUFFIX, QUAL_DIST_PLOT_SUFFIX] {
         let path = std::path::PathBuf::from(format!("{}{suffix}", prefix.to_str().unwrap()));
@@ -410,14 +350,29 @@ fn test_truncated_quality_scores_do_not_panic() {
     // common prefix; trailing bases without quality data contribute to
     // neither the base distribution nor the per-cycle quality sums.
     //
-    // The BAM writer rejects mismatched seq/qual lengths at write time,
-    // so this case can't be reached through a well-formed BAM; we
-    // exercise the collector directly via the in-process API rather than
-    // round-tripping through a temp BAM.
+    // The pair()/read() builders assert seq.len() == quals.len() (and a BAM
+    // writer would reject the mismatch too), so this deliberately-malformed
+    // record is built raw and fed to the collector in-process.
+    use noodles::core::Position;
     use noodles::sam::Header;
+    use noodles::sam::alignment::RecordBuf;
+    use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+    use noodles::sam::alignment::record::{Flags, MappingQuality};
+    use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+    use riker_lib::collector::Collector;
     use riker_lib::sam::riker_record::RikerRecord;
 
-    let buf = make_record("truncated", Flags::empty(), b"ACGT", &[30, 30]);
+    let cigar: Cigar = [Op::new(Kind::Match, 4)].into_iter().collect();
+    let buf = RecordBuf::builder()
+        .set_name("truncated")
+        .set_flags(Flags::empty())
+        .set_reference_sequence_id(0)
+        .set_alignment_start(Position::new(1).unwrap())
+        .set_mapping_quality(MappingQuality::new(60).unwrap())
+        .set_cigar(cigar)
+        .set_sequence(Sequence::from(b"ACGT".to_vec()))
+        .set_quality_scores(QualityScores::from(vec![30u8, 30]))
+        .build();
     let header = Header::default();
     let record = RikerRecord::from_alignment_record(&header, &buf).unwrap();
 
@@ -448,11 +403,11 @@ fn test_lowercase_bases_handled_case_insensitively() {
     // 'A' must produce identical metrics. BAM decode normally yields
     // uppercase, but the collector contract is case-insensitive.
     let mut upper = SamBuilder::new();
-    upper.add_record(make_record("u", Flags::empty(), b"ACGT", &[30, 30, 30, 30]));
+    upper.add(read_with("u", b"ACGT", &[30, 30, 30, 30]));
     let (_dir_u, prefix_u) = run_basic(&upper);
 
     let mut lower = SamBuilder::new();
-    lower.add_record(make_record("l", Flags::empty(), b"acgt", &[30, 30, 30, 30]));
+    lower.add(read_with("l", b"acgt", &[30, 30, 30, 30]));
     let (_dir_l, prefix_l) = run_basic(&lower);
 
     let bd_u: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(
@@ -466,11 +421,11 @@ fn test_lowercase_bases_handled_case_insensitively() {
 
     assert_eq!(bd_u.len(), bd_l.len());
     for (mu, ml) in bd_u.iter().zip(bd_l.iter()) {
-        assert_float_eq!(mu.frac_a, ml.frac_a, 1e-9);
-        assert_float_eq!(mu.frac_c, ml.frac_c, 1e-9);
-        assert_float_eq!(mu.frac_g, ml.frac_g, 1e-9);
-        assert_float_eq!(mu.frac_t, ml.frac_t, 1e-9);
-        assert_float_eq!(mu.frac_n, ml.frac_n, 1e-9);
+        assert_close!(mu.frac_a, ml.frac_a, 1e-9);
+        assert_close!(mu.frac_c, ml.frac_c, 1e-9);
+        assert_close!(mu.frac_g, ml.frac_g, 1e-9);
+        assert_close!(mu.frac_t, ml.frac_t, 1e-9);
+        assert_close!(mu.frac_n, ml.frac_n, 1e-9);
     }
 }
 
@@ -482,10 +437,10 @@ fn test_iupac_ambiguity_codes_excluded_from_qual_dist() {
     // quality histogram; riker matches that behaviour via the
     // `(ACGT_BITMASK >> bi) & 1` gate. These bases still contribute to
     // the per-cycle base distribution as `frac_n` (the residual bucket).
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // Read order: A (Q10), W (Q20 — IUPAC), C (Q30)
-    builder.add_record(make_record("r1", Flags::empty(), b"AWC", &[10, 20, 30]));
-    let (_dir, prefix) = run_basic(&builder);
+    sam.add(read_with("r1", b"AWC", &[10, 20, 30]));
+    let (_dir, prefix) = run_basic(&sam);
 
     // Base distribution: cycle 2 (W) lands in frac_n.
     let bd: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(
@@ -493,8 +448,8 @@ fn test_iupac_ambiguity_codes_excluded_from_qual_dist() {
     ))
     .unwrap();
     assert_eq!(bd.len(), 3);
-    assert_float_eq!(bd[1].frac_n, 1.0, 1e-9);
-    assert_float_eq!(bd[1].frac_a, 0.0, 1e-9);
+    assert_close!(bd[1].frac_n, 1.0, 1e-9);
+    assert_close!(bd[1].frac_a, 0.0, 1e-9);
 
     // Quality distribution: only A's Q10 and C's Q30 — W's Q20 excluded.
     let qd: Vec<QualityScoreDistributionMetric> = read_metrics_tsv(&std::path::PathBuf::from(
@@ -515,9 +470,9 @@ fn test_qual_histogram_bank_merge() {
     // 0,1,2,3,0,1,2,3). The merged histogram in the output TSV must
     // report the full count of 8 — an off-by-one in the bank-merge loop
     // would silently drop one or more banks.
-    let mut builder = SamBuilder::new();
-    builder.add_record(make_record("r1", Flags::empty(), b"ACGTACGT", &[35; 8]));
-    let (_dir, prefix) = run_basic(&builder);
+    let mut sam = SamBuilder::new();
+    sam.add(read_with("r1", b"ACGTACGT", &[35; 8]));
+    let (_dir, prefix) = run_basic(&sam);
 
     let qd: Vec<QualityScoreDistributionMetric> = read_metrics_tsv(&std::path::PathBuf::from(
         format!("{}{}", prefix.to_str().unwrap(), QUAL_DIST_SUFFIX),
@@ -535,12 +490,12 @@ fn test_reverse_strand_with_heterogeneous_qualities() {
     // mean-quality mismatch. BAM stores reverse-complemented reads in
     // the opposite orientation from sequencing, so seq[0] corresponds
     // to the LAST cycle and seq[n-1] to the FIRST cycle.
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     // Stored seq: A(Q10) C(Q20) G(Q30) T(Q40)
     // After reverse-cycle mapping the per-cycle qualities should be
     // 40, 30, 20, 10 (cycle 1 = seq[3], cycle 2 = seq[2], ...).
-    builder.add_record(make_record("rev", Flags::REVERSE_COMPLEMENTED, b"ACGT", &[10, 20, 30, 40]));
-    let (_dir, prefix) = run_basic(&builder);
+    sam.add(read_with("rev", b"ACGT", &[10, 20, 30, 40]).reverse());
+    let (_dir, prefix) = run_basic(&sam);
 
     let mq: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&std::path::PathBuf::from(format!(
         "{}{}",
@@ -549,8 +504,8 @@ fn test_reverse_strand_with_heterogeneous_qualities() {
     )))
     .unwrap();
     assert_eq!(mq.len(), 4);
-    assert_float_eq!(mq[0].mean_quality, 40.0, 0.01);
-    assert_float_eq!(mq[1].mean_quality, 30.0, 0.01);
-    assert_float_eq!(mq[2].mean_quality, 20.0, 0.01);
-    assert_float_eq!(mq[3].mean_quality, 10.0, 0.01);
+    assert_close!(mq[0].mean_quality, 40.0, 0.01);
+    assert_close!(mq[1].mean_quality, 30.0, 0.01);
+    assert_close!(mq[2].mean_quality, 20.0, 0.01);
+    assert_close!(mq[3].mean_quality, 10.0, 0.01);
 }

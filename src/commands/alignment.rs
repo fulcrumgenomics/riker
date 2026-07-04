@@ -801,6 +801,7 @@ fn count_bad_cycles(nocall_map: &Counter<u64>, total_reads: u64) -> u64 {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::test_support::read;
     use noodles::core::Position;
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::{
@@ -809,69 +810,11 @@ mod tests {
     };
     use noodles::sam::alignment::record_buf::{Cigar, Data, QualityScores, Sequence};
 
-    // ── Helper: build a minimal RecordBuf and wrap as RikerRecord ────────────
-
-    #[allow(clippy::too_many_arguments)]
-    fn make_record(
-        flags: Flags,
-        pos: Option<usize>,
-        mapq: u8,
-        cigar: Cigar,
-        seq: &[u8],
-        quals: &[u8],
-        ref_id: Option<usize>,
-        mate_ref_id: Option<usize>,
-        tlen: i32,
-        data: noodles::sam::alignment::record_buf::Data,
-    ) -> RikerRecord {
-        let mut b = RecordBuf::builder()
-            .set_flags(flags)
-            .set_mapping_quality(MappingQuality::new(mapq).expect("mapq"))
-            .set_cigar(cigar)
-            .set_sequence(Sequence::from(seq.to_vec()))
-            .set_quality_scores(QualityScores::from(quals.to_vec()))
-            .set_template_length(tlen)
-            .set_data(data);
-
-        if let Some(rid) = ref_id {
-            b = b.set_reference_sequence_id(rid);
-        }
-        if let Some(mrid) = mate_ref_id {
-            b = b.set_mate_reference_sequence_id(mrid);
-        }
-        if let Some(p) = pos {
-            b = b.set_alignment_start(Position::new(p).expect("pos"));
-        }
-        RikerRecord::from_alignment_record(&Header::default(), &b.build()).unwrap()
-    }
-
-    fn simple_cigar(len: usize) -> Cigar {
-        [Op::new(CigarKind::Match, len)].into_iter().collect()
-    }
-
     // ── sum_cigar_op ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_sum_cigar_op_soft_clip() {
-        let cigar: Cigar = [
-            Op::new(CigarKind::SoftClip, 5),
-            Op::new(CigarKind::Match, 90),
-            Op::new(CigarKind::SoftClip, 5),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 100],
-            &[30u8; 100],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("5S90M5S").into_riker_record();
         assert_eq!(sum_cigar_op(&record, Kind::SoftClip), 10);
         assert_eq!(sum_cigar_op(&record, Kind::Match), 90);
     }
@@ -885,18 +828,7 @@ mod tests {
 
     #[test]
     fn test_cigar_stats_match_only() {
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            simple_cigar(100),
-            &[b'A'; 100],
-            &[30u8; 100],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("100M").into_riker_record();
         let cs = cigar_stats(&record, false);
         assert_eq!(cs.aligned_read_length, 100);
         assert_eq!(cs.soft_clip_bases, 0);
@@ -907,25 +839,7 @@ mod tests {
 
     #[test]
     fn test_cigar_stats_with_soft_clip() {
-        let cigar: Cigar = [
-            Op::new(CigarKind::SoftClip, 5),
-            Op::new(CigarKind::Match, 90),
-            Op::new(CigarKind::SoftClip, 5),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 100],
-            &[30u8; 100],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("5S90M5S").into_riker_record();
         let cs = cigar_stats(&record, false);
         assert_eq!(cs.aligned_read_length, 90);
         assert_eq!(cs.soft_clip_bases, 10);
@@ -934,25 +848,7 @@ mod tests {
 
     #[test]
     fn test_cigar_stats_with_insertion() {
-        let cigar: Cigar = [
-            Op::new(CigarKind::Match, 80),
-            Op::new(CigarKind::Insertion, 5),
-            Op::new(CigarKind::Match, 10),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 95],
-            &[30u8; 95],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("80M5I10M").into_riker_record();
         let cs = cigar_stats(&record, false);
         // M + I + M = 80 + 5 + 10 = 95.
         assert_eq!(cs.aligned_read_length, 95);
@@ -963,70 +859,21 @@ mod tests {
     #[test]
     fn test_3prime_soft_clip_forward_trailing() {
         // 5S 90M 5S — forward strand: 3′ clip is the trailing 5S.
-        let cigar: Cigar = [
-            Op::new(CigarKind::SoftClip, 5),
-            Op::new(CigarKind::Match, 90),
-            Op::new(CigarKind::SoftClip, 5),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 100],
-            &[30u8; 100],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("5S90M5S").into_riker_record();
         assert_eq!(cigar_stats(&record, false).three_prime_soft_clip, 5);
     }
 
     #[test]
     fn test_3prime_soft_clip_reverse_leading() {
         // 5S 90M 5S — reverse strand: 3′ clip is the leading 5S.
-        let cigar: Cigar = [
-            Op::new(CigarKind::SoftClip, 5),
-            Op::new(CigarKind::Match, 90),
-            Op::new(CigarKind::SoftClip, 5),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::REVERSE_COMPLEMENTED,
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 100],
-            &[30u8; 100],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().reverse().cigar("5S90M5S").into_riker_record();
         assert_eq!(cigar_stats(&record, true).three_prime_soft_clip, 5);
     }
 
     #[test]
     fn test_3prime_soft_clip_none() {
         // 5S 90M — only a leading soft clip (5′ on forward).
-        let cigar: Cigar =
-            [Op::new(CigarKind::SoftClip, 5), Op::new(CigarKind::Match, 90)].into_iter().collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 95],
-            &[30u8; 95],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("5S90M").into_riker_record();
         assert_eq!(cigar_stats(&record, false).three_prime_soft_clip, 0);
     }
 
@@ -1054,26 +901,7 @@ mod tests {
     #[test]
     fn test_process_cigar_indels_counted() {
         // 50M 2I 48M 1D — 2 indel events.
-        let cigar: Cigar = [
-            Op::new(CigarKind::Match, 50),
-            Op::new(CigarKind::Insertion, 2),
-            Op::new(CigarKind::Match, 48),
-            Op::new(CigarKind::Deletion, 1),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 100],
-            &[30u8; 100],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("50M2I48M1D").into_riker_record();
         let mut acc = CategoryAccumulator::new("TEST");
         let cs = acc.process_cigar(&record, false, false);
         assert_eq!(acc.indels, 2);
@@ -1086,18 +914,7 @@ mod tests {
     fn test_process_cigar_q20_bases() {
         // 10M, qualities: 5×Q30 + 5×Q10.
         let quals: Vec<u8> = (0..10).map(|i| if i < 5 { 30 } else { 10 }).collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            simple_cigar(10),
-            &[b'A'; 10],
-            &quals,
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().len(10).quals(quals).into_riker_record();
         let mut acc = CategoryAccumulator::new("TEST");
         acc.process_cigar(&record, true, false); // is_hq = true
         assert_eq!(acc.hq_aligned_bases, 10);
@@ -1109,21 +926,20 @@ mod tests {
         // Malformed BAM: CIGAR declares 15 read bases but the quality array is
         // only 3 bytes long. The first M block can still score 3 Q30 bytes;
         // the second runs entirely past the end of the quality array and must
-        // contribute 0 (silently) rather than panicking.
+        // contribute 0 (silently) rather than panicking. Built raw because the
+        // fluent builder deliberately rejects a quals/sequence length mismatch.
         let cigar: Cigar =
             [Op::new(CigarKind::Match, 5), Op::new(CigarKind::Match, 10)].into_iter().collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 15],
-            &[30u8, 30, 30],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = RecordBuf::builder()
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::new(1).expect("pos"))
+            .set_mapping_quality(MappingQuality::new(60).expect("mapq"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(vec![b'A'; 15]))
+            .set_quality_scores(QualityScores::from(vec![30u8, 30, 30]))
+            .build();
+        let record = RikerRecord::from_alignment_record(&Header::default(), &record).unwrap();
         let mut acc = CategoryAccumulator::new("TEST");
         acc.process_cigar(&record, true, false);
         assert_eq!(acc.hq_aligned_bases, 15);
@@ -1136,25 +952,7 @@ mod tests {
     fn test_cigar_stats_with_deletion() {
         // 50M 2D 48M → aligned_read_length = 50+48 = 98 (D not in read length),
         //              deletion_bases = 2, indels = 1
-        let cigar: Cigar = [
-            Op::new(CigarKind::Match, 50),
-            Op::new(CigarKind::Deletion, 2),
-            Op::new(CigarKind::Match, 48),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 98],
-            &[30u8; 98],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("50M2D48M").into_riker_record();
         let mut acc = CategoryAccumulator::new("TEST");
         let cs = acc.process_cigar(&record, false, false);
         assert_eq!(cs.aligned_read_length, 98);
@@ -1166,25 +964,7 @@ mod tests {
     #[test]
     fn test_cigar_stats_with_hard_clip() {
         // 5H 90M 5H — hard clips don't appear in sequence/CigarStats
-        let cigar: Cigar = [
-            Op::new(CigarKind::HardClip, 5),
-            Op::new(CigarKind::Match, 90),
-            Op::new(CigarKind::HardClip, 5),
-        ]
-        .into_iter()
-        .collect();
-        let record = make_record(
-            Flags::empty(),
-            Some(1),
-            60,
-            cigar,
-            &[b'A'; 90],
-            &[30u8; 90],
-            Some(0),
-            None,
-            0,
-            Data::default(),
-        );
+        let record = read().cigar("5H90M5H").into_riker_record();
         let cs = cigar_stats(&record, false);
         assert_eq!(cs.aligned_read_length, 90);
         assert_eq!(cs.soft_clip_bases, 0);
@@ -1322,9 +1102,9 @@ mod tests {
         let m = acc.compute_metric();
         assert_eq!(m.total_reads, 100);
         assert_eq!(m.aligned_reads, 80);
-        assert!((m.frac_aligned - 0.8).abs() < 1e-9);
-        assert!((m.mismatch_rate - 0.01).abs() < 1e-9); // 80/8000
-        assert!((m.strand_balance - 0.5).abs() < 1e-9); // 40/80
+        crate::assert_close!(m.frac_aligned, 0.8, 1e-9);
+        crate::assert_close!(m.mismatch_rate, 0.01, 1e-9); // 80/8000
+        crate::assert_close!(m.strand_balance, 0.5, 1e-9); // 40/80
     }
 
     #[test]

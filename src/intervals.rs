@@ -544,18 +544,14 @@ mod tests {
     use super::*;
 
     use std::io::Write;
-    use std::num::NonZeroUsize;
 
-    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+    use crate::test_support::SamBuilder;
 
     /// Build a header with the given contig names and lengths.
     fn make_header(contigs: &[(&str, usize)]) -> Header {
-        let mut builder = Header::builder();
-        for &(name, len) in contigs {
-            let ref_seq = Map::<ReferenceSequence>::new(NonZeroUsize::new(len).expect("len > 0"));
-            builder = builder.add_reference_sequence(name.as_bytes(), ref_seq);
-        }
-        builder.build()
+        let owned: Vec<(String, usize)> =
+            contigs.iter().map(|&(n, l)| (n.to_string(), l)).collect();
+        SamBuilder::with_contigs(&owned).header().clone()
     }
 
     /// Build a `SequenceDictionary` from contig names and lengths.
@@ -585,14 +581,13 @@ mod tests {
         contig_lengths: &[usize],
         raw: &[(usize, u32, u32)],
     ) -> Intervals {
-        let mut builder = Header::builder();
-        for (i, &len) in contig_lengths.iter().enumerate().take(n_contigs) {
-            let name = format!("seq{i}");
-            let ref_seq = Map::<ReferenceSequence>::new(NonZeroUsize::new(len).expect("len > 0"));
-            builder = builder.add_reference_sequence(name.as_bytes(), ref_seq);
-        }
-        let header = builder.build();
-        let dict = SequenceDictionary::from(&header);
+        let contigs: Vec<(String, usize)> = contig_lengths
+            .iter()
+            .enumerate()
+            .take(n_contigs)
+            .map(|(i, &len)| (format!("seq{i}"), len))
+            .collect();
+        let dict = SequenceDictionary::from(SamBuilder::with_contigs(&contigs).header());
 
         let raw_count = raw.len();
         let mut by_contig: Vec<Vec<Interval>> = (0..n_contigs).map(|_| Vec::new()).collect();

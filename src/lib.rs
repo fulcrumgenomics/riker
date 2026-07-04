@@ -20,3 +20,9 @@ pub mod sequence_dict;
 pub mod simd;
 pub mod vcf;
 pub mod version;
+
+/// Shared, test-only builders (record/CIGAR/FASTA) and assert helpers, usable
+/// from both the lib's unit tests and the integration-test crate. Compiled only
+/// under `cfg(test)` or the `test-support` feature, so it never ships in release.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
