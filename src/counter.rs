@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::{AddAssign, Index};
 
 use num_traits::{PrimInt, ToPrimitive};
+use rustc_hash::FxHashMap;
 
-/// A frequency counter backed by `HashMap<K, u64>`.
+/// A frequency counter backed by `FxHashMap<K, u64>`.
 ///
 /// Methods are gated by key type via separate `impl` blocks with progressively
 /// tighter trait bounds:
@@ -15,7 +15,7 @@ use num_traits::{PrimInt, ToPrimitive};
 /// - `PrimInt + ToPrimitive + Hash` — median, MAD (integer keys only)
 #[derive(Clone, Debug)]
 pub struct Counter<K> {
-    map: HashMap<K, u64>,
+    map: FxHashMap<K, u64>,
     total_count: u64,
 }
 
@@ -25,7 +25,7 @@ impl<K: Eq + Hash + Copy> Counter<K> {
     /// Create an empty counter.
     #[must_use]
     pub fn new() -> Self {
-        Self { map: HashMap::new(), total_count: 0 }
+        Self { map: FxHashMap::default(), total_count: 0 }
     }
 
     /// Increment the count for `key` by 1.

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::ops::Index;
 
 use noodles::fasta;
 use noodles::sam::Header;
+use rustc_hash::FxHashMap;
 
 /// Metadata for a single reference sequence (contig).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,9 @@ impl SequenceMetadata {
 #[derive(Debug, Clone)]
 pub struct SequenceDictionary {
     sequences: Vec<SequenceMetadata>,
-    name_to_index: HashMap<String, usize>,
+    /// Contig name → index. A non-cryptographic hasher keeps name lookups cheap if this
+    /// dictionary ever moves onto a hot path (today it is built and probed only at setup).
+    name_to_index: FxHashMap<String, usize>,
 }
 
 impl SequenceDictionary {
@@ -102,7 +104,7 @@ impl Index<&str> for SequenceDictionary {
 impl From<&Header> for SequenceDictionary {
     fn from(header: &Header) -> Self {
         let mut sequences = Vec::new();
-        let mut name_to_index = HashMap::new();
+        let mut name_to_index = FxHashMap::default();
 
         for (i, (name, rs)) in header.reference_sequences().iter().enumerate() {
             let name = String::from_utf8_lossy(name.as_ref()).into_owned();
@@ -118,7 +120,7 @@ impl From<&Header> for SequenceDictionary {
 impl From<&fasta::fai::Index> for SequenceDictionary {
     fn from(index: &fasta::fai::Index) -> Self {
         let mut sequences = Vec::new();
-        let mut name_to_index = HashMap::new();
+        let mut name_to_index = FxHashMap::default();
 
         for (i, record) in index.as_ref().iter().enumerate() {
             let name = String::from_utf8_lossy(record.name().as_ref()).to_string();

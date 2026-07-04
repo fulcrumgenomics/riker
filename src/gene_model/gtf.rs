@@ -7,10 +7,10 @@
 //! (`gene_name`→`gene_id` for the name; `gene_type`/`gene_biotype`/`biotype` for the biotype).
 //! Transcript span is derived from the exon extent; the coding region from the CDS extent.
 
-use std::collections::HashMap;
 use std::io::BufRead;
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::FxHashMap;
 
 use super::{Biotype, Exon, ParsedTranscript};
 
@@ -31,7 +31,7 @@ struct TxAccum {
 pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
     // Preserve first-seen transcript order for deterministic output.
     let mut order: Vec<String> = Vec::new();
-    let mut by_tx: HashMap<String, TxAccum> = HashMap::new();
+    let mut by_tx: FxHashMap<String, TxAccum> = FxHashMap::default();
 
     for (i, result) in reader.lines().enumerate() {
         let raw = result.with_context(|| format!("reading GTF line {}", i + 1))?;
