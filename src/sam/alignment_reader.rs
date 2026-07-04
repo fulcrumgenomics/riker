@@ -8,8 +8,8 @@
 //! answers region queries against an index. They stay separate types because
 //! the two access patterns want different backends. Sequential BAM is fastest
 //! through noodles (see below), but *indexed* access wants a persistent decode
-//! thread pool that survives seeks — which htslib provides and noodles'
-//! streaming `MultithreadedReader` does not (it joins and respawns its threads
+//! thread pool that survives seeks — which htslib provides and a streaming
+//! BGZF `MultithreadedReader` does not (it joins and respawns its threads
 //! on every seek, which collapses under a many-small-region `--intervals`
 //! workload). So [`IndexedAlignmentReader`] reads both BAM and CRAM through
 //! htslib, and is reserved for the standalone callers that need queries
@@ -36,12 +36,14 @@
 //! decoders run; on SAM noodles decodes eagerly so requirements are
 //! informational.
 //!
-//! ## BAM via noodles; CRAM via rust-htslib
+//! ## BAM via noodles + bgzf; CRAM via rust-htslib
 //!
-//! BAM reads through noodles. With `decode_threads == 0` it uses a
-//! single-threaded BGZF reader (the default, lowest RSS); with a non-zero
-//! count it engages `noodles-bgzf`'s `MultithreadedReader` for parallel BGZF
-//! decompression at no meaningful RSS cost.
+//! BAM records parse through noodles. With `decode_threads == 0` it uses
+//! noodles' single-threaded BGZF reader (the default, lowest RSS); with a
+//! non-zero count it engages the `bgzf` crate's `MultithreadedReader` for
+//! parallel BGZF decompression at no meaningful RSS cost. That reader sizes
+//! its read-ahead to `worker_count.max(8)`, avoiding the one-worker stall
+//! where noodles' own MT reader regressed below single-threaded.
 //!
 //! CRAM reads through `rust-htslib` rather than `noodles-cram`: benchmarks on
 //! a 3.1 GB exome CRAM showed htslib decoding ~3.8× faster than noodles-cram
@@ -92,7 +94,7 @@ pub struct AlignmentReader {
 }
 
 /// Format-specific reader state for [`AlignmentReader`]. `Bam` is
-/// single-threaded noodles; `BamMt` is noodles with a multithreaded BGZF
+/// single-threaded noodles; `BamMt` is noodles records over a multithreaded BGZF
 /// decoder (`decode_threads > 0`). The `Htslib` arm backs CRAM; it is
 /// `Box`-ed because `rust_htslib::bam::Reader` is large (a few hundred bytes
 /// of fields, dwarfing the noodles BAM/SAM readers) and boxing keeps the enum
@@ -101,7 +103,7 @@ enum Inner {
     Sam(sam::io::Reader<BufReader<File>>),
     GzippedSam(Box<sam::io::Reader<BufReader<MultiGzDecoder<File>>>>),
     Bam(bam::io::Reader<noodles_bgzf::io::Reader<BufReader<File>>>),
-    BamMt(bam::io::Reader<noodles_bgzf::io::MultithreadedReader<BufReader<File>>>),
+    BamMt(bam::io::Reader<bgzf::MultithreadedReader<BufReader<File>>>),
     Htslib(Box<rust_htslib::bam::Reader>),
 }
 
@@ -113,7 +115,7 @@ impl AlignmentReader {
     /// `decode_threads` is the number of BGZF/CRAM decode worker threads to
     /// run *in addition to* the calling thread (derived from `--threads` by
     /// the command). `0` reads single-threaded (the default, lowest RSS). For
-    /// BAM, a non-zero count engages `noodles-bgzf`'s `MultithreadedReader`;
+    /// BAM, a non-zero count engages the `bgzf` crate's `MultithreadedReader`;
     /// for CRAM it sizes htslib's decode pool. SAM ignores it.
     ///
     /// # Errors
@@ -143,10 +145,10 @@ impl AlignmentReader {
                         let header = reader.read_header().with_context(|| header_context(path))?;
                         Ok(Self { inner: Inner::Bam(reader), header })
                     }
-                    // Parallel BGZF decompression via noodles-bgzf.
+                    // Parallel BGZF decompression via the bgzf crate's reader, whose
+                    // read-ahead depth is `worker_count.max(8)` (avoids noodles' one-worker stall).
                     Some(workers) => {
-                        let mt =
-                            noodles_bgzf::io::MultithreadedReader::with_worker_count(workers, buf);
+                        let mt = bgzf::MultithreadedReader::with_worker_count(workers, buf);
                         let mut reader = bam::io::Reader::from(mt);
                         let header = reader.read_header().with_context(|| header_context(path))?;
                         Ok(Self { inner: Inner::BamMt(reader), header })

@@ -46,6 +46,11 @@ test-support = ["dep:tempfile"]
 
 [dependencies]
 anyhow = "1"
+# Fulcrum's BGZF crate. Its `MultithreadedReader` (feature `multithreading-simple`)
+# replaces noodles-bgzf's for parallel BAM decode: it sizes its read-ahead depth to
+# `worker_count.max(8)`, avoiding the depth-1 stall noodles hits at one worker (where
+# `--threads 2` regressed below single-threaded). Single-threaded decode stays on noodles.
+bgzf = { version = "0.4.0", features = ["multithreading-simple"] }
 bitvec = "1"
 bstr = "1"
 bytemuck = "1.25"
