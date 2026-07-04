@@ -19,7 +19,6 @@ pub struct ThreadPlan {
 }
 
 /// Trait implemented by every riker subcommand.
-#[enum_dispatch::enum_dispatch]
 pub trait Command {
     /// Execute the command.
     ///

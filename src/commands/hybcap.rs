@@ -473,9 +473,9 @@ impl HybCapCollector {
     /// Determine the 0-based reference position at which overlap clipping starts for
     /// this read, or `None` if the read should not be clipped.
     ///
-    /// Mirrors `count_overlapping_bases` logic: only the left-most read is clipped,
-    /// on ties the second-of-pair is clipped.  Returns the mate's 0-based alignment
-    /// start so the coverage walk can clip bases at or past that position.
+    /// Only the left-most read is clipped, and on ties the second-of-pair is clipped.
+    /// Returns the mate's 0-based alignment start so the coverage walk can clip bases
+    /// at or past that position.
     #[expect(clippy::cast_possible_truncation, reason = "genomic coordinates fit in u32")]
     fn compute_mate_clip_ref_pos(record: &RikerRecord) -> Option<u32> {
         let flags = record.flags();

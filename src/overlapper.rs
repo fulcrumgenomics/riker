@@ -1,7 +1,5 @@
 use rust_lapper::{Interval as LapperInterval, Lapper};
 
-use crate::intervals::{Interval, Intervals};
-
 /// An efficient overlap detector backed by one `Lapper` per contig.
 ///
 /// Built once from a set of intervals, then queried many times.  Internally
@@ -33,15 +31,6 @@ impl<T: Clone + Send + Sync + Eq> Overlapper<T> {
             .collect();
 
         Self { trees }
-    }
-
-    /// Build an overlapper from an `Intervals` collection, storing a clone of each
-    /// `Interval` as the associated value.
-    #[must_use]
-    pub fn from_intervals(intervals: &Intervals) -> Overlapper<Interval> {
-        Overlapper::<Interval>::new(
-            intervals.iter().map(|iv| (iv.ref_id, iv.start, iv.end, iv.clone())),
-        )
     }
 
     /// Return all values whose intervals overlap the query range `[start, end)`.
