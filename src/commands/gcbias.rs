@@ -8,7 +8,7 @@ use kuva::plot::LinePlot;
 use kuva::plot::legend::LegendPosition;
 use kuva::plot::scatter::ScatterPlot;
 use kuva::render::annotations::ReferenceLine;
-use kuva::render::layout::{Layout, TickFormat};
+use kuva::render::layout::TickFormat;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
 use riker_derive::MetricDocs;
@@ -22,7 +22,7 @@ use crate::intervals::Intervals;
 use crate::math::safe_div;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{
-    FG_BLUE, FG_GRAY, FG_GREEN, FG_SKY, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_twin_y_plot_pdf,
+    FG_BLUE, FG_GRAY, FG_GREEN, FG_SKY, FG_TEAL, standard_layout, write_twin_y_plot_pdf,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
@@ -585,9 +585,7 @@ impl GcBiasCollector {
             );
         }
 
-        let layout = Layout::auto_from_plots(&primary)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&primary)
             .with_x_axis_min(0.0)
             .with_x_axis_max(100.0)
             .with_y_axis_min(0.0)

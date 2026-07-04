@@ -38,6 +38,14 @@ pub const PLOT_WIDTH: f64 = 800.0;
 /// Standard plot height in pixels.
 pub const PLOT_HEIGHT: f64 = 600.0;
 
+/// A [`Layout`] auto-fitted to `plots` at the standard riker plot size
+/// ([`PLOT_WIDTH`] × [`PLOT_HEIGHT`]). Chain further `.with_*` setters for the
+/// per-plot title, labels, and axes.
+#[must_use]
+pub(crate) fn standard_layout(plots: &[Plot]) -> Layout {
+    Layout::auto_from_plots(plots).with_width(PLOT_WIDTH).with_height(PLOT_HEIGHT)
+}
+
 // ─── PDF rendering helpers ──────────────────────────────────────────────────
 
 /// Render plots to a PDF file.
@@ -141,9 +149,7 @@ pub fn write_insert_size_histogram_pdf(
     let x_tick_step = compute_tick_step(0.0, data_x_max, 10);
     let x_axis_max = (data_x_max / x_tick_step).ceil() * x_tick_step;
 
-    let layout = Layout::auto_from_plots(&plots)
-        .with_width(PLOT_WIDTH)
-        .with_height(PLOT_HEIGHT)
+    let layout = standard_layout(&plots)
         .with_title(title)
         .with_x_label("Insert Size (bp)")
         .with_y_label("Read Pairs")

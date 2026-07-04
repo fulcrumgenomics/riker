@@ -59,7 +59,7 @@ use crate::math::{safe_div, safe_div_f};
 use crate::metrics::{serialize_f64_5dp, serialize_opt_f64_5dp, write_tsv};
 use crate::overlapper::Overlapper;
 use crate::plotting::{
-    FG_BLUE, FG_GREEN, FG_NAVY, FG_TEAL, InsertSizeSeries, PLOT_HEIGHT, PLOT_WIDTH,
+    FG_BLUE, FG_GREEN, FG_NAVY, FG_TEAL, InsertSizeSeries, standard_layout,
     write_insert_size_histogram_pdf, write_plot_pdf,
 };
 use crate::progress::ProgressLogger;
@@ -986,7 +986,7 @@ impl RnaCollector {
     fn plot_biotypes(&self, rows: &[RnaBiotypeMetric]) -> Result<()> {
         use kuva::plot::BarPlot;
         use kuva::render::annotations::TextAnnotation;
-        use kuva::render::layout::{Layout, TickFormat};
+        use kuva::render::layout::TickFormat;
         use kuva::render::plots::Plot;
 
         /// Cap on the number of biotypes drawn (rows are sorted most-abundant first).
@@ -1001,9 +1001,7 @@ impl RnaCollector {
             top.iter().map(|r| (prettify_biotype(&r.biotype), r.reads as f64)).collect();
 
         let plots = vec![Plot::Bar(BarPlot::new().with_bars(bars).with_color(FG_NAVY))];
-        let mut layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let mut layout = standard_layout(&plots)
             .with_title(format!("Assigned Reads by Biotype of {}", self.sample))
             .with_x_label("Biotype")
             .with_y_label("Assigned reads (log scale)")
@@ -1090,7 +1088,7 @@ impl RnaCollector {
         noncoding_zero: usize,
     ) -> Result<()> {
         use kuva::plot::{Histogram, LegendEntry, LegendPosition, LegendShape};
-        use kuva::render::layout::Layout;
+
         use kuva::render::plots::Plot;
 
         // 8-digit hex (#RRGGBBAA) makes the fills semi-transparent so the overlap shows through.
@@ -1114,9 +1112,7 @@ impl RnaCollector {
             format!("{} protein coding genes with 0 reads", thousands(coding_zero as u64)),
             format!("{} non-coding genes with 0 reads", thousands(noncoding_zero as u64)),
         ];
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(format!("Gene Expression Distribution of {}", self.sample))
             .with_x_label("Reads per kilobase (RPK)")
             .with_y_label("Genes")
@@ -1283,7 +1279,7 @@ impl RnaCollector {
     /// Write the normalized-coverage-by-position line chart.
     fn plot_coverage(&self, entries: &[RnaCoverageEntry]) -> Result<()> {
         use kuva::plot::LinePlot;
-        use kuva::render::layout::Layout;
+
         use kuva::render::plots::Plot;
 
         let xy: Vec<(f64, f64)> = entries
@@ -1293,9 +1289,7 @@ impl RnaCollector {
         let plots = vec![Plot::Line(
             LinePlot::new().with_data(xy).with_color(FG_BLUE).with_fill().with_fill_opacity(0.3),
         )];
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(format!("Transcript Coverage of {}", self.sample))
             .with_x_label("Normalized Position (5' → 3')")
             .with_y_label("Normalized Coverage")

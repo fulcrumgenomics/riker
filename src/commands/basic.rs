@@ -5,7 +5,7 @@ use clap::Args;
 use kuva::plot::legend::LegendPosition;
 use kuva::plot::{Histogram, LinePlot};
 use kuva::render::annotations::{Orientation, ShadedRegion};
-use kuva::render::layout::{Layout, TickFormat};
+use kuva::render::layout::TickFormat;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
 use riker_derive::MetricDocs;
@@ -17,7 +17,7 @@ use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOpti
 use crate::math::safe_div;
 use crate::metrics::write_tsv;
 use crate::plotting::{
-    FG_BLUE, FG_GREEN, FG_PACIFIC, FG_RED, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf,
+    FG_BLUE, FG_GREEN, FG_PACIFIC, FG_RED, FG_TEAL, standard_layout, write_plot_pdf,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
@@ -387,9 +387,7 @@ impl BasicCollector {
             })
             .collect();
 
-        let mut layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let mut layout = standard_layout(&plots)
             .with_title(format!("{} Base Distribution by Cycle", self.plot_title_prefix))
             .with_x_label("Cycle")
             .with_y_label("Fraction")
@@ -451,9 +449,7 @@ impl BasicCollector {
         }
 
         let max_cycle = (r1_max + self.r2_cycles.len()) as f64;
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(format!("{} Mean Quality by Cycle", self.plot_title_prefix))
             .with_x_label("Cycle")
             .with_y_label("Mean Quality")
@@ -476,9 +472,7 @@ impl BasicCollector {
 
         let plots = vec![Plot::Histogram(Histogram::from_bins(edges, counts).with_color(FG_BLUE))];
 
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(format!("{} Quality Score Distribution", self.plot_title_prefix))
             .with_x_label("Quality Score")
             .with_y_label("Fraction of Bases")
