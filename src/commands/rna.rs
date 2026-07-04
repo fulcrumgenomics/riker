@@ -35,7 +35,6 @@
 //!   sample 101 non-overlapping normalized positions.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -339,7 +338,9 @@ pub struct RnaCollector {
     /// Merged, disjoint ribosomal intervals as `(start0, end0)` per the value; `None` when no
     /// ribosomal source is available (matches Picard leaving ribosomal metrics blank).
     ribosomal: Option<Overlapper<RibosomalInterval>>,
-    ignored_ref_ids: HashSet<usize>,
+    /// Reference ids whose reads are counted only as `ignored_reads`. Checked per record in
+    /// `accept`, so it uses a fast non-cryptographic hasher rather than std's SipHash.
+    ignored_ref_ids: FxHashSet<usize>,
 
     // Accumulated metrics.
     bases: u64,
@@ -457,7 +458,7 @@ impl RnaCollector {
             sample: String::new(),
             gene_model: None,
             ribosomal: None,
-            ignored_ref_ids: HashSet::new(),
+            ignored_ref_ids: FxHashSet::default(),
             bases: 0,
             aligned_bases: 0,
             ribosomal_bases: 0,
