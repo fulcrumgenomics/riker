@@ -382,7 +382,7 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
 }
 
 /// Reading a BAM single-threaded (`decode_threads == 0`, plain noodles BGZF)
-/// and multithreaded (`decode_threads > 0`, noodles-bgzf `MultithreadedReader`)
+/// and multithreaded (`decode_threads > 0`, the `bgzf` crate's `MultithreadedReader`)
 /// must surface byte-identical records. This is the core correctness guarantee
 /// for the parallel BAM decode path.
 #[test]
