@@ -105,6 +105,22 @@ where
     }
 }
 
+/// Serialize an `Option<u64>` as the integer, or empty string for `None`.
+///
+/// Use as `#[serde(serialize_with = "crate::metrics::serialize_opt_u64")]`.
+///
+/// # Errors
+/// Propagates serializer errors.
+pub fn serialize_opt_u64<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(v) => serializer.serialize_u64(*v),
+        None => serializer.serialize_str(""),
+    }
+}
+
 /// Write a slice of serializable rows to a tab-separated file.
 ///
 /// Produces lowercase headers (from serde field names), no metadata lines.

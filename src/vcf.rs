@@ -9,6 +9,7 @@ use noodles::vcf;
 use noodles_bgzf as bgzf;
 
 use crate::intervals::Intervals;
+use crate::sam::alignment_reader::append_extension;
 use crate::sequence_dict::SequenceDictionary;
 
 /// An indexed variant reader supporting both VCF (bgzip-compressed) and BCF formats.
@@ -42,16 +43,8 @@ impl IndexedVcf {
 
     /// Open an indexed VCF file (bgzip-compressed, .tbi or .csi index).
     fn open_vcf(path: &Path) -> Result<Self> {
-        let tbi_path = {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".tbi");
-            std::path::PathBuf::from(p)
-        };
-        let csi_path = {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".csi");
-            std::path::PathBuf::from(p)
-        };
+        let tbi_path = append_extension(path, ".tbi");
+        let csi_path = append_extension(path, ".csi");
 
         if !tbi_path.exists() && !csi_path.exists() {
             bail!(
@@ -76,11 +69,7 @@ impl IndexedVcf {
 
     /// Open an indexed BCF file (.csi index).
     fn open_bcf(path: &Path) -> Result<Self> {
-        let csi_path = {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".csi");
-            std::path::PathBuf::from(p)
-        };
+        let csi_path = append_extension(path, ".csi");
 
         if !csi_path.exists() {
             bail!(

@@ -17,7 +17,8 @@ use crate::fasta::Fasta;
 use crate::intervals::{Interval, Intervals};
 use crate::math::{safe_div, safe_div_f};
 use crate::metrics::{
-    serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, tsv_writer, write_tsv,
+    serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, serialize_opt_u64, tsv_writer,
+    write_tsv,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
@@ -1762,19 +1763,6 @@ fn compute_bases_at_or_above(histogram: &[u64]) -> Vec<u64> {
     }
 
     result
-}
-
-// ─── Serializer for Option<u64> ───────────────────────────────────────────────
-
-#[allow(clippy::ref_option)]
-fn serialize_opt_u64<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        Some(v) => serializer.serialize_u64(*v),
-        None => serializer.serialize_str(""),
-    }
 }
 
 #[cfg(test)]

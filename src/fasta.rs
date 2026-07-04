@@ -91,9 +91,7 @@ impl Fasta {
             .with_context(|| format!("Failed to read contig '{contig_name}' from FASTA"))?;
 
         if uppercase {
-            for b in &mut seq {
-                *b = b.to_ascii_uppercase();
-            }
+            seq.make_ascii_uppercase();
         }
         Ok(seq)
     }
