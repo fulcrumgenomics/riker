@@ -355,6 +355,16 @@ impl RikerRecord {
         }
     }
 
+    /// Extract an integer value from an auxiliary BAM tag, returning `None` if the
+    /// tag is absent. Negative signed values clamp to zero (matching historical
+    /// behaviour where a negative `NM` has no sensible interpretation).
+    #[allow(clippy::cast_sign_loss)]
+    #[must_use]
+    pub fn get_integer_tag(&self, tag: TagKey) -> Option<u32> {
+        let value = self.aux_tag(tag)?.as_int()?;
+        Some(u32::try_from(value.max(0)).unwrap_or(u32::MAX))
+    }
+
     /// Cheaper companion to [`Self::aux_tag`] when only existence
     /// matters. On the BAM fast path returns `true` if the scanner
     /// observed the tag — either because the consumer requested its
@@ -2152,5 +2162,70 @@ mod tests {
         let b = RikerRecordRequirements::NONE;
         assert!(a.clone().union(b.clone()).needs_sequence());
         assert!(b.union(a).needs_sequence());
+    }
+
+    // ── get_integer_tag ──
+
+    use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
+
+    fn record_with_tag(tag_name: TagKey, value: DataValue) -> RikerRecord {
+        // Unmapped so the builder derives no NM tag of its own, leaving only the tag under
+        // test in the aux block.
+        let buf = read().unmapped().tag(tag_name, value).build();
+        RikerRecord::from_alignment_record(&sam::Header::default(), &buf).unwrap()
+    }
+
+    #[test]
+    fn get_integer_tag_reads_uint8() {
+        assert_eq!(record_with_tag(*b"NM", DataValue::UInt8(42)).get_integer_tag(*b"NM"), Some(42));
+    }
+
+    #[test]
+    fn get_integer_tag_reads_uint16() {
+        let rec = record_with_tag(*b"NM", DataValue::UInt16(1000));
+        assert_eq!(rec.get_integer_tag(*b"NM"), Some(1000));
+    }
+
+    #[test]
+    fn get_integer_tag_reads_uint32() {
+        let rec = record_with_tag(*b"NM", DataValue::UInt32(100_000));
+        assert_eq!(rec.get_integer_tag(*b"NM"), Some(100_000));
+    }
+
+    #[test]
+    fn get_integer_tag_reads_positive_int8() {
+        let rec = record_with_tag(*b"NM", DataValue::Int8(50));
+        assert_eq!(rec.get_integer_tag(*b"NM"), Some(50));
+    }
+
+    #[test]
+    fn get_integer_tag_clamps_negative_int8_to_zero() {
+        let rec = record_with_tag(*b"NM", DataValue::Int8(-5));
+        assert_eq!(rec.get_integer_tag(*b"NM"), Some(0));
+    }
+
+    #[test]
+    fn get_integer_tag_clamps_negative_int16_to_zero() {
+        let rec = record_with_tag(*b"NM", DataValue::Int16(-100));
+        assert_eq!(rec.get_integer_tag(*b"NM"), Some(0));
+    }
+
+    #[test]
+    fn get_integer_tag_clamps_negative_int32_to_zero() {
+        let rec = record_with_tag(*b"NM", DataValue::Int32(-1));
+        assert_eq!(rec.get_integer_tag(*b"NM"), Some(0));
+    }
+
+    #[test]
+    fn get_integer_tag_missing_is_none() {
+        let buf = read().unmapped().build();
+        let rec = RikerRecord::from_alignment_record(&sam::Header::default(), &buf).unwrap();
+        assert_eq!(rec.get_integer_tag(*b"NM"), None);
+    }
+
+    #[test]
+    fn get_integer_tag_non_integer_is_none() {
+        let rec = record_with_tag(*b"BC", DataValue::String("ACGT".into()));
+        assert_eq!(rec.get_integer_tag(*b"BC"), None);
     }
 }

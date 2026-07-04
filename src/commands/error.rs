@@ -271,7 +271,7 @@ impl Command for Error {
             ErrorCollector::new(&self.input.input, &self.output.output, fasta, &self.options)?;
         // Standalone path bypasses `Collector::initialize`, so resolve the
         // sample directly from the header here.
-        collector.sample = crate::sam::record_utils::derive_sample(&self.input.input, &header);
+        collector.sample = crate::sam::derive_sample(&self.input.input, &header);
 
         let (parsed_intervals, intervals) = Self::build_intervals(&self.options, &dict)?;
 
@@ -984,7 +984,7 @@ impl ErrorCollector {
 
 impl Collector for ErrorCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
-        self.sample = crate::sam::record_utils::derive_sample(&self.input_path, header);
+        self.sample = crate::sam::derive_sample(&self.input_path, header);
         let dict = SequenceDictionary::from(header);
         if let Some(interval_path) = &self.interval_path {
             self.intervals =
@@ -1799,7 +1799,7 @@ impl ReadLevelCache {
 
         let mapq = record.mapping_quality().map(|m| CovariateValue::Int(u32::from(m.get())));
 
-        let nm_raw = crate::sam::record_utils::get_integer_tag(record, *b"NM");
+        let nm_raw = record.get_integer_tag(*b"NM");
 
         Self { read_num, strand, pair_orientation, isize_val, gc, mapq, nm_raw }
     }

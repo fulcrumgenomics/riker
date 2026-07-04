@@ -26,7 +26,7 @@ use crate::plotting::{
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::record_utils::{derive_sample, get_integer_tag};
+use crate::sam::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 
@@ -392,7 +392,7 @@ impl GcBiasCollector {
         self.bases_by_gc[gc] += read_len;
 
         // NM tag
-        let nm = get_integer_tag(record, *b"NM").unwrap_or(0);
+        let nm = record.get_integer_tag(*b"NM").unwrap_or(0);
         self.errors_by_gc[gc] += u64::from(nm);
 
         // Base quality accumulation (integer)

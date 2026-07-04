@@ -24,8 +24,8 @@ use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{FG_BLUE, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::derive_sample;
 use crate::sam::mate_buffer::{MateBuffer, Peek};
-use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 

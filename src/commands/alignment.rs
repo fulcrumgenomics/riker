@@ -16,8 +16,8 @@ use crate::math::{safe_div, safe_div_f};
 use crate::metrics::write_tsv;
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::derive_sample;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
-use crate::sam::record_utils::{derive_sample, get_integer_tag};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::simd;
 
@@ -453,7 +453,7 @@ impl CategoryAccumulator {
         // NM-tag based mismatch tracking.
         // NM = substitutions + insertion_bases + deletion_bases; subtract indel bases
         // to obtain a pure substitution count (matching Picard's reference-comparison approach).
-        let nm = u64::from(get_integer_tag(record, *b"NM").unwrap_or(0));
+        let nm = u64::from(record.get_integer_tag(*b"NM").unwrap_or(0));
         let indel_bases = cs.insertion_bases + cs.deletion_bases;
         let adjusted_nm = nm.saturating_sub(indel_bases);
         self.total_nm += adjusted_nm;
@@ -476,7 +476,7 @@ impl CategoryAccumulator {
             }
 
             // Chimera denominator: both mapped, and either no MQ tag or both HQ.
-            let mate_mq = get_integer_tag(record, *b"MQ");
+            let mate_mq = record.get_integer_tag(*b"MQ");
             let include_chimera_check = mate_mq.is_none_or(|mq| {
                 mq >= u32::from(min_mapq) && u32::from(mapq) >= u32::from(min_mapq)
             });

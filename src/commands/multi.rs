@@ -114,7 +114,7 @@ use crate::commands::wgs::{MultiWgsOptions, WgsCollector};
 use crate::fasta::Fasta;
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::{AlignmentFormat, AlignmentReader, detect_format};
-use crate::sam::record_utils::derive_sample;
+use crate::sam::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
 /// Number of records per batch sent through the work queue.

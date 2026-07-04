@@ -21,7 +21,7 @@ use crate::plotting::{
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::record_utils::derive_sample;
+use crate::sam::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
 // ─── Output file suffixes ────────────────────────────────────────────────────

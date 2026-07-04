@@ -42,7 +42,6 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER};
 use riker_derive::MetricDocs;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -66,8 +65,8 @@ use crate::plotting::{
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
-use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{AuxValue, RikerRecord, RikerRecordRequirements};
+use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
 
 // ─── Type aliases ──────────────────────────────────────────────────────────────
@@ -1993,14 +1992,6 @@ struct MateSpan<'a> {
 }
 
 // ─── Module-level helpers ──────────────────────────────────────────────────────
-
-/// True if the header declares coordinate sort order (`@HD SO:coordinate`).
-fn is_coordinate_sorted(header: &Header) -> bool {
-    header
-        .header()
-        .and_then(|hdr| hdr.other_fields().get(&SORT_ORDER))
-        .is_some_and(|so| AsRef::<[u8]>::as_ref(so) == COORDINATE)
-}
 
 /// Bin `values` into `n_bins` equal-width bins spanning the data min..max, returning the
 /// `n_bins + 1` bin edges and the per-bin counts. Returns empty vectors when `values` is empty
