@@ -56,6 +56,7 @@ use crate::commands::common::{
 use crate::counter::Counter;
 use crate::gene_model::{Biotype, GeneModel};
 use crate::intervals::Intervals;
+use crate::math::{safe_div, safe_div_f};
 use crate::metrics::{serialize_f64_5dp, serialize_opt_f64_5dp, write_tsv};
 use crate::overlapper::Overlapper;
 use crate::plotting::{
@@ -970,7 +971,7 @@ impl RnaCollector {
                 sample: self.sample.clone(),
                 biotype,
                 reads,
-                frac_reads: if assigned > 0.0 { reads as f64 / assigned } else { 0.0 },
+                frac_reads: safe_div_f(reads as f64, assigned),
             })
             .collect();
         rows.sort_by(|a, b| b.reads.cmp(&a.reads).then_with(|| a.biotype.cmp(&b.biotype)));
@@ -1557,7 +1558,7 @@ impl Collector for RnaCollector {
         };
 
         let aligned = self.aligned_bases as f64;
-        let frac = |n: u64| if aligned > 0.0 { n as f64 / aligned } else { 0.0 };
+        let frac = |n: u64| safe_div_f(n as f64, aligned);
         let frac_coding = frac(self.coding_bases);
         let frac_utr = frac(self.utr_bases);
         let strand_total = correct + incorrect;
@@ -1566,7 +1567,7 @@ impl Collector for RnaCollector {
 
         // Read-level fractions are over mapped (primary, non-supplementary) reads.
         let mapped = self.mapped_reads as f64;
-        let frac_reads = |n: u64| if mapped > 0.0 { n as f64 / mapped } else { 0.0 };
+        let frac_reads = |n: u64| safe_div_f(n as f64, mapped);
         let genes_detected = self.count_genes_detected();
 
         // Distinct-junction totals: classify each distinct observed intron once.
@@ -1579,8 +1580,7 @@ impl Collector for RnaCollector {
             }
         }
         let total_juncs = known_juncs + partial_juncs + novel_juncs;
-        let frac_known_juncs =
-            if total_juncs > 0 { known_juncs as f64 / total_juncs as f64 } else { 0.0 };
+        let frac_known_juncs = safe_div(known_juncs, total_juncs);
 
         let metric = RnaSeqMetric {
             sample: self.sample.clone(),
@@ -1589,11 +1589,7 @@ impl Collector for RnaCollector {
             mapped_reads: self.mapped_reads,
             unmapped_reads: self.unmapped_reads,
             ignored_reads: self.ignored_reads,
-            duplicate_rate: if self.mapped_reads > 0 {
-                self.duplicate_reads as f64 / self.mapped_reads as f64
-            } else {
-                0.0
-            },
+            duplicate_rate: safe_div(self.duplicate_reads, self.mapped_reads),
 
             ribosomal_reads: has_ribosomal.then_some(self.ribosomal_reads),
             exonic_reads: self.exonic_reads,
@@ -1633,32 +1629,16 @@ impl Collector for RnaCollector {
             frac_intergenic_bases: frac(self.intergenic_bases),
             frac_mrna_bases: frac_coding + frac_utr,
             // Picard `PCT_USABLE_BASES` is intentionally relative to all sequenced bases.
-            frac_usable_bases: if self.bases > 0 {
-                (self.coding_bases + self.utr_bases) as f64 / self.bases as f64
-            } else {
-                0.0
-            },
+            frac_usable_bases: safe_div(self.coding_bases + self.utr_bases, self.bases),
 
             detected_strand: detected.to_string(),
             correct_strand_reads: correct,
-            frac_correct_strand_reads: if strand_total > 0 {
-                correct as f64 / strand_total as f64
-            } else {
-                0.0
-            },
+            frac_correct_strand_reads: safe_div(correct, strand_total),
             r1_tx_strand_reads: self.num_r1,
             r2_tx_strand_reads: self.num_r2,
             unexplained_reads: self.num_unexplained,
-            frac_r1_tx_strand_reads: if r_total > 0 {
-                self.num_r1 as f64 / r_total as f64
-            } else {
-                0.0
-            },
-            frac_r2_tx_strand_reads: if r_total > 0 {
-                self.num_r2 as f64 / r_total as f64
-            } else {
-                0.0
-            },
+            frac_r1_tx_strand_reads: safe_div(self.num_r1, r_total),
+            frac_r2_tx_strand_reads: safe_div(self.num_r2, r_total),
 
             median_cv_coverage: coverage.cv,
             median_5prime_bias: coverage.five_prime,

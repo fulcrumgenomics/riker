@@ -19,6 +19,7 @@ use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::counter::Counter;
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
+use crate::math::safe_div_f;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{FG_BLUE, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
 use crate::progress::ProgressLogger;
@@ -367,10 +368,9 @@ impl WgsCollector {
 
         let total_raw = total_excl as f64 + sum_depth;
 
-        let frac_excl =
-            |n: u64| -> f64 { if total_raw == 0.0 { 0.0 } else { n as f64 / total_raw } };
+        let frac_excl = |n: u64| safe_div_f(n as f64, total_raw);
 
-        let frac_excl_total = if total_raw == 0.0 { 0.0 } else { total_excl as f64 / total_raw };
+        let frac_excl_total = safe_div_f(total_excl as f64, total_raw);
 
         let metrics = WgsMetrics {
             sample: self.sample.clone(),

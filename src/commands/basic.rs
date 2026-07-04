@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
+use crate::math::safe_div;
 use crate::metrics::write_tsv;
 use crate::plotting::{
     FG_BLUE, FG_GREEN, FG_PACIFIC, FG_RED, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf,
@@ -332,7 +333,6 @@ impl BasicCollector {
             }
         }
         let total: u64 = combined.iter().sum();
-        let total_f = total as f64;
         combined
             .iter()
             .enumerate()
@@ -341,7 +341,7 @@ impl BasicCollector {
                 sample: self.sample.clone(),
                 quality: q as u8,
                 count: *count,
-                frac_bases: if total > 0 { *count as f64 / total_f } else { 0.0 },
+                frac_bases: safe_div(*count, total),
             })
             .collect()
     }
