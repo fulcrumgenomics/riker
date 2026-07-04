@@ -16,8 +16,8 @@ use crate::plotting::{
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::derive_sample;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
-use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 
 /// File suffix appended to the output prefix for the metrics file.

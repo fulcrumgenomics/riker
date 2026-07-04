@@ -509,11 +509,13 @@ fn build_loci(transcripts: Vec<ParsedTranscript>, dict: &SequenceDictionary) -> 
     let mut order: Vec<String> = Vec::new();
     let mut by_gene: HashMap<String, Vec<ParsedTranscript>> = HashMap::new();
     for tx in transcripts {
-        by_gene.entry(tx.gene_name.clone()).or_insert_with(|| {
-            order.push(tx.gene_name.clone());
-            Vec::new()
-        });
-        by_gene.get_mut(&tx.gene_name).unwrap().push(tx);
+        by_gene
+            .entry(tx.gene_name.clone())
+            .or_insert_with(|| {
+                order.push(tx.gene_name.clone());
+                Vec::new()
+            })
+            .push(tx);
     }
 
     let mut loci: Vec<GeneLocus> = Vec::new();

@@ -65,6 +65,8 @@ use noodles::sam::Header;
 use noodles::{bam, sam};
 use rust_htslib::bam::Read as HtsRead;
 
+use crate::path_util::append_extension;
+
 use super::riker_record::{
     AuxTagRequirements, BamRec, FallbackRec, HtslibRec, RikerRecord, RikerRecordRequirements,
 };
@@ -694,14 +696,6 @@ pub(crate) fn detect_format(path: &Path) -> Result<AlignmentFormat> {
             path.display()
         ),
     }
-}
-
-/// Returns `path` with `suffix` (e.g. `".bai"`) appended after the
-/// existing extension. Used to derive index-file paths.
-pub(crate) fn append_extension(path: &Path, suffix: &str) -> PathBuf {
-    let mut p = path.as_os_str().to_owned();
-    p.push(suffix);
-    PathBuf::from(p)
 }
 
 /// Confirm that an index for the CRAM at `path` exists in either of

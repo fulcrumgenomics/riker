@@ -16,8 +16,8 @@ use crate::math::{safe_div, safe_div_f};
 use crate::metrics::write_tsv;
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::derive_sample;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
-use crate::sam::record_utils::{derive_sample, get_integer_tag};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::simd;
 
@@ -344,9 +344,8 @@ struct CategoryAccumulator {
     hq_nm: u64,    // sum of NM for HQ aligned reads
     hq_nm_histogram: Counter<u64>,
     // Read length tracking
-    read_length_histogram: Counter<u64>,
+    read_length_hist: Vec<u64>,
     read_length_sum: u64,
-    read_length_sum_sq: u64,
     aligned_read_length_sum: u64,
     // Bad cycle tracking: cycle number -> no-call count
     bad_cycle_nocalls: Counter<u64>,
@@ -376,9 +375,8 @@ impl CategoryAccumulator {
             total_nm: 0,
             hq_nm: 0,
             hq_nm_histogram: Counter::new(),
-            read_length_histogram: Counter::new(),
+            read_length_hist: vec![0u64; 512],
             read_length_sum: 0,
-            read_length_sum_sq: 0,
             aligned_read_length_sum: 0,
             bad_cycle_nocalls: Counter::new(),
         }
@@ -401,9 +399,14 @@ impl CategoryAccumulator {
         let seq: &[u8] = record.sequence();
         let read_len = seq.len() as u64;
 
-        self.read_length_histogram.count(read_len);
+        let idx = seq.len();
+        if let Some(slot) = self.read_length_hist.get_mut(idx) {
+            *slot += 1;
+        } else {
+            self.read_length_hist.resize(idx + 1, 0);
+            self.read_length_hist[idx] += 1;
+        }
         self.read_length_sum += read_len;
-        self.read_length_sum_sq += read_len * read_len;
 
         // Hard-clipped bases from all PF reads.
         self.num_hard_clipped += sum_cigar_op(record, Kind::HardClip);
@@ -450,7 +453,7 @@ impl CategoryAccumulator {
         // NM-tag based mismatch tracking.
         // NM = substitutions + insertion_bases + deletion_bases; subtract indel bases
         // to obtain a pure substitution count (matching Picard's reference-comparison approach).
-        let nm = u64::from(get_integer_tag(record, *b"NM").unwrap_or(0));
+        let nm = u64::from(record.get_integer_tag(*b"NM").unwrap_or(0));
         let indel_bases = cs.insertion_bases + cs.deletion_bases;
         let adjusted_nm = nm.saturating_sub(indel_bases);
         self.total_nm += adjusted_nm;
@@ -473,7 +476,7 @@ impl CategoryAccumulator {
             }
 
             // Chimera denominator: both mapped, and either no MQ tag or both HQ.
-            let mate_mq = get_integer_tag(record, *b"MQ");
+            let mate_mq = record.get_integer_tag(*b"MQ");
             let include_chimera_check = mate_mq.is_none_or(|mq| {
                 mq >= u32::from(min_mapq) && u32::from(mapq) >= u32::from(min_mapq)
             });
@@ -583,8 +586,7 @@ impl CategoryAccumulator {
     /// counts per key.  Used to synthesize the `pair` metric row from `first` and
     /// `second` without a third accumulator.
     fn merge(&self, other: &Self) -> Self {
-        let mut read_length_histogram = self.read_length_histogram.clone();
-        read_length_histogram += &other.read_length_histogram;
+        let read_length_hist = merge_dense(&self.read_length_hist, &other.read_length_hist);
         let mut hq_nm_histogram = self.hq_nm_histogram.clone();
         hq_nm_histogram += &other.hq_nm_histogram;
         let mut bad_cycle_nocalls = self.bad_cycle_nocalls.clone();
@@ -613,9 +615,8 @@ impl CategoryAccumulator {
             total_nm: self.total_nm + other.total_nm,
             hq_nm: self.hq_nm + other.hq_nm,
             hq_nm_histogram,
-            read_length_histogram,
+            read_length_hist,
             read_length_sum: self.read_length_sum + other.read_length_sum,
-            read_length_sum_sq: self.read_length_sum_sq + other.read_length_sum_sq,
             aligned_read_length_sum: self.aligned_read_length_sum + other.aligned_read_length_sum,
             bad_cycle_nocalls,
         }
@@ -626,17 +627,14 @@ impl CategoryAccumulator {
         let pf_reads = self.pf_reads;
         let pf_bases = self.read_length_sum; // denominator for clip fractions
 
-        // Read length stats.
-        let mean_rl = safe_div_f(self.read_length_sum as f64, pf_reads as f64);
-        let var_rl = if pf_reads > 0 {
-            (self.read_length_sum_sq as f64 / pf_reads as f64) - mean_rl * mean_rl
-        } else {
-            0.0
-        };
-        let sd_rl = var_rl.max(0.0).sqrt();
-        let (median_rl, mad_rl) = self.read_length_histogram.median_and_mad();
-        let min_rl = self.read_length_histogram.min().unwrap_or(0);
-        let max_read_len = self.read_length_histogram.max().unwrap_or(0);
+        // Read length stats: mean and population SD over the read-length histogram —
+        // identical to the old sum/sum_sq formula (see Counter::mean_and_stddev), since
+        // the histogram's total_count equals pf_reads and its keys are the read lengths.
+        let read_length_histogram = dense_to_counter(&self.read_length_hist);
+        let (mean_rl, sd_rl) = read_length_histogram.mean_and_stddev();
+        let (median_rl, mad_rl) = read_length_histogram.median_and_mad();
+        let min_rl = read_length_histogram.min().unwrap_or(0);
+        let max_read_len = read_length_histogram.max().unwrap_or(0);
 
         // Aligned read length.
         // NOTE: Picard computes mean_aligned_read_length over ALL PF reads (including unmapped,
@@ -796,6 +794,28 @@ fn count_bad_cycles(nocall_map: &Counter<u64>, total_reads: u64) -> u64 {
 // `crate::metrics::serialize_f64_6dp` path in #[serde(serialize_with = ...)] above.
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
+
+/// Build a `Counter` from a dense read-length histogram (index = read length, value =
+/// count) for the once-per-run finalization stats.
+fn dense_to_counter(hist: &[u64]) -> Counter<u64> {
+    let mut counter = Counter::new();
+    for (length, &count) in hist.iter().enumerate() {
+        if count > 0 {
+            counter.count_n(length as u64, count);
+        }
+    }
+    counter
+}
+
+/// Sum two dense read-length histograms element-wise, growing to the longer length.
+fn merge_dense(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let mut out = longer.to_vec();
+    for (slot, &count) in out.iter_mut().zip(shorter) {
+        *slot += count;
+    }
+    out
+}
 
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
@@ -1095,8 +1115,7 @@ mod tests {
         acc.hq_nm = 70;
         acc.num_positive_strand = 40;
         acc.read_length_sum = 10000;
-        acc.read_length_sum_sq = 1_000_000;
-        acc.read_length_histogram.count_n(100, 100);
+        acc.read_length_hist[100] += 100;
         acc.aligned_read_length_sum = 8000;
 
         let m = acc.compute_metric();
@@ -1105,6 +1124,8 @@ mod tests {
         crate::assert_close!(m.frac_aligned, 0.8, 1e-9);
         crate::assert_close!(m.mismatch_rate, 0.01, 1e-9); // 80/8000
         crate::assert_close!(m.strand_balance, 0.5, 1e-9); // 40/80
+        crate::assert_close!(m.mean_read_length, 100.0, 1e-9); // 100 reads of length 100
+        assert_eq!(m.sd_read_length, 0.0);
     }
 
     #[test]
@@ -1127,7 +1148,7 @@ mod tests {
         // Cycle 1: 80% → bad; Cycle 2: 79% → not bad
         acc.bad_cycle_nocalls.count_n(1, 80);
         acc.bad_cycle_nocalls.count_n(2, 79);
-        acc.read_length_histogram.count_n(100, 100);
+        acc.read_length_hist[100] += 100;
         acc.read_length_sum = 10000;
 
         let m = acc.compute_metric();
@@ -1146,8 +1167,7 @@ mod tests {
         a.indels = 5;
         a.total_nm = 10;
         a.read_length_sum = 5000;
-        a.read_length_sum_sq = 500_000;
-        a.read_length_histogram.count_n(100, 50);
+        a.read_length_hist[100] += 50;
         a.hq_nm_histogram.count_n(1, 10);
         a.bad_cycle_nocalls.count_n(1, 20);
 
@@ -1159,8 +1179,7 @@ mod tests {
         b.indels = 3;
         b.total_nm = 15;
         b.read_length_sum = 6000;
-        b.read_length_sum_sq = 600_000;
-        b.read_length_histogram.count_n(100, 60);
+        b.read_length_hist[100] += 60;
         b.hq_nm_histogram.count_n(1, 15);
         b.bad_cycle_nocalls.count_n(1, 25);
 
@@ -1173,9 +1192,30 @@ mod tests {
         assert_eq!(merged.indels, 8);
         assert_eq!(merged.total_nm, 25);
         assert_eq!(merged.read_length_sum, 11000);
-        assert_eq!(merged.read_length_sum_sq, 1_100_000);
-        assert_eq!(merged.read_length_histogram.count_of(&100), 110);
+        assert_eq!(merged.read_length_hist[100], 110);
         assert_eq!(merged.hq_nm_histogram.count_of(&1), 25);
         assert_eq!(merged.bad_cycle_nocalls.count_of(&1), 45);
+    }
+
+    #[test]
+    fn read_length_histogram_grows_past_preallocation() {
+        // A read longer than the 512-slot preallocation exercises the grow-on-demand path.
+        let mut acc = CategoryAccumulator::new("read1");
+        acc.process_record(&read().len(600).into_riker_record(), 0, 10_000);
+        assert_eq!(acc.read_length_hist[600], 1);
+        assert_eq!(acc.read_length_sum, 600);
+    }
+
+    #[test]
+    fn merge_sums_read_length_histograms_of_different_lengths() {
+        let mut a = CategoryAccumulator::new("read1");
+        a.read_length_hist[100] += 3;
+        let mut b = CategoryAccumulator::new("read2");
+        b.read_length_hist.resize(701, 0); // b saw a read longer than a's histogram
+        b.read_length_hist[700] += 2;
+        b.read_length_hist[100] += 1;
+        let merged = a.merge(&b);
+        assert_eq!(merged.read_length_hist[100], 4);
+        assert_eq!(merged.read_length_hist[700], 2);
     }
 }

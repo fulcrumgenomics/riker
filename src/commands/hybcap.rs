@@ -5,7 +5,6 @@ use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::Op;
 use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER};
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -17,12 +16,13 @@ use crate::fasta::Fasta;
 use crate::intervals::{Interval, Intervals};
 use crate::math::{safe_div, safe_div_f};
 use crate::metrics::{
-    serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, tsv_writer, write_tsv,
+    serialize_f64_2dp, serialize_f64_5dp, serialize_f64_6dp, serialize_opt_u64, tsv_writer,
+    write_tsv,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
+use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
 use crate::simd;
 
@@ -473,9 +473,9 @@ impl HybCapCollector {
     /// Determine the 0-based reference position at which overlap clipping starts for
     /// this read, or `None` if the read should not be clipped.
     ///
-    /// Mirrors `count_overlapping_bases` logic: only the left-most read is clipped,
-    /// on ties the second-of-pair is clipped.  Returns the mate's 0-based alignment
-    /// start so the coverage walk can clip bases at or past that position.
+    /// Only the left-most read is clipped, and on ties the second-of-pair is clipped.
+    /// Returns the mate's 0-based alignment start so the coverage walk can clip bases
+    /// at or past that position.
     #[expect(clippy::cast_possible_truncation, reason = "genomic coordinates fit in u32")]
     fn compute_mate_clip_ref_pos(record: &RikerRecord) -> Option<u32> {
         let flags = record.flags();
@@ -1693,14 +1693,6 @@ fn sweep_run(ivs: &[(u32, u32, u32)], cursor: &mut usize, start: u32, end: u32) 
     (lo, hi)
 }
 
-/// True if the header declares coordinate sort order (`@HD SO:coordinate`).
-fn is_coordinate_sorted(header: &Header) -> bool {
-    header
-        .header()
-        .and_then(|hdr| hdr.other_fields().get(&SORT_ORDER))
-        .is_some_and(|so| AsRef::<[u8]>::as_ref(so) == COORDINATE)
-}
-
 // ─── Histogram helper functions ───────────────────────────────────────────────
 
 /// Compute the median from a depth histogram.
@@ -1762,19 +1754,6 @@ fn compute_bases_at_or_above(histogram: &[u64]) -> Vec<u64> {
     }
 
     result
-}
-
-// ─── Serializer for Option<u64> ───────────────────────────────────────────────
-
-#[allow(clippy::ref_option)]
-fn serialize_opt_u64<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        Some(v) => serializer.serialize_u64(*v),
-        None => serializer.serialize_str(""),
-    }
 }
 
 #[cfg(test)]

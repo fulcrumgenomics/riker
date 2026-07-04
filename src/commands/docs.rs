@@ -20,6 +20,46 @@ use crate::commands::rna::{
 use crate::commands::wgs::{WgsCoverageEntry, WgsMetrics};
 use crate::metrics::{render_metric_docs_markdown, render_metric_docs_text};
 
+/// Render docs for every metric type, in a fixed order, separated by blank lines, with
+/// the given per-type renderer (`render_metric_docs_text` / `render_metric_docs_markdown`).
+/// The type list lives here once so the output formats can't drift — adding a metric means
+/// editing one place, and every format stays in sync.
+macro_rules! render_all_metric_docs {
+    ($render:ident, $out:expr) => {
+        render_all_metric_docs!(@seq $render, $out,
+            AlignmentSummaryMetric,
+            BaseDistributionByCycleMetric,
+            GcBiasDetailMetric,
+            GcBiasSummaryMetric,
+            HybCapMetric,
+            PerTargetCoverage,
+            PerBaseCoverage,
+            InsertSizeMetric,
+            InsertSizeHistogramEntry,
+            RnaSeqMetric,
+            RnaBiotypeMetric,
+            RnaInsertSizeMetric,
+            RnaInsertSizeHistogramEntry,
+            MeanQualityByCycleMetric,
+            QualityScoreDistributionMetric,
+            WgsMetrics,
+            WgsCoverageEntry,
+            MismatchMetric,
+            OverlappingMismatchMetric,
+            IndelMetric,
+        )
+    };
+    // Blank line between entries, none after the last: render the first, then
+    // `writeln` + render for each of the rest.
+    (@seq $render:ident, $out:expr, $first:ty, $($rest:ty,)*) => {{
+        $render::<$first>($out)?;
+        $(
+            writeln!($out)?;
+            $render::<$rest>($out)?;
+        )*
+    }};
+}
+
 /// Print documentation for all metric types produced by riker.
 ///
 /// Lists every metric field with its description for each output file
@@ -48,88 +88,8 @@ impl Command for Docs {
         };
 
         match self.format.as_str() {
-            "text" => {
-                render_metric_docs_text::<AlignmentSummaryMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<BaseDistributionByCycleMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<GcBiasDetailMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<GcBiasSummaryMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<HybCapMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<PerTargetCoverage>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<PerBaseCoverage>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<InsertSizeMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<InsertSizeHistogramEntry>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<RnaSeqMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<RnaBiotypeMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<RnaInsertSizeMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<RnaInsertSizeHistogramEntry>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<MeanQualityByCycleMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<QualityScoreDistributionMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<WgsMetrics>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<WgsCoverageEntry>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<MismatchMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<OverlappingMismatchMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_text::<IndelMetric>(&mut out)?;
-            }
-            "markdown" => {
-                render_metric_docs_markdown::<AlignmentSummaryMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<BaseDistributionByCycleMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<GcBiasDetailMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<GcBiasSummaryMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<HybCapMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<PerTargetCoverage>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<PerBaseCoverage>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<InsertSizeMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<InsertSizeHistogramEntry>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<RnaSeqMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<RnaBiotypeMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<RnaInsertSizeMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<RnaInsertSizeHistogramEntry>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<MeanQualityByCycleMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<QualityScoreDistributionMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<WgsMetrics>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<WgsCoverageEntry>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<MismatchMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<OverlappingMismatchMetric>(&mut out)?;
-                writeln!(out)?;
-                render_metric_docs_markdown::<IndelMetric>(&mut out)?;
-            }
+            "text" => render_all_metric_docs!(render_metric_docs_text, &mut out),
+            "markdown" => render_all_metric_docs!(render_metric_docs_markdown, &mut out),
             other => {
                 anyhow::bail!("Unknown format '{other}'. Use 'text' or 'markdown'.");
             }

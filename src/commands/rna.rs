@@ -42,7 +42,6 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER};
 use riker_derive::MetricDocs;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -56,17 +55,18 @@ use crate::commands::common::{
 use crate::counter::Counter;
 use crate::gene_model::{Biotype, GeneModel};
 use crate::intervals::Intervals;
+use crate::math::{safe_div, safe_div_f};
 use crate::metrics::{serialize_f64_5dp, serialize_opt_f64_5dp, write_tsv};
 use crate::overlapper::Overlapper;
 use crate::plotting::{
-    FG_BLUE, FG_GREEN, FG_NAVY, FG_TEAL, InsertSizeSeries, PLOT_HEIGHT, PLOT_WIDTH,
+    FG_BLUE, FG_GREEN, FG_NAVY, FG_TEAL, InsertSizeSeries, standard_layout,
     write_insert_size_histogram_pdf, write_plot_pdf,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
-use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{AuxValue, RikerRecord, RikerRecordRequirements};
+use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
 
 // ─── Type aliases ──────────────────────────────────────────────────────────────
@@ -970,7 +970,7 @@ impl RnaCollector {
                 sample: self.sample.clone(),
                 biotype,
                 reads,
-                frac_reads: if assigned > 0.0 { reads as f64 / assigned } else { 0.0 },
+                frac_reads: safe_div_f(reads as f64, assigned),
             })
             .collect();
         rows.sort_by(|a, b| b.reads.cmp(&a.reads).then_with(|| a.biotype.cmp(&b.biotype)));
@@ -986,7 +986,7 @@ impl RnaCollector {
     fn plot_biotypes(&self, rows: &[RnaBiotypeMetric]) -> Result<()> {
         use kuva::plot::BarPlot;
         use kuva::render::annotations::TextAnnotation;
-        use kuva::render::layout::{Layout, TickFormat};
+        use kuva::render::layout::TickFormat;
         use kuva::render::plots::Plot;
 
         /// Cap on the number of biotypes drawn (rows are sorted most-abundant first).
@@ -1001,9 +1001,7 @@ impl RnaCollector {
             top.iter().map(|r| (prettify_biotype(&r.biotype), r.reads as f64)).collect();
 
         let plots = vec![Plot::Bar(BarPlot::new().with_bars(bars).with_color(FG_NAVY))];
-        let mut layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let mut layout = standard_layout(&plots)
             .with_title(format!("Assigned Reads by Biotype of {}", self.sample))
             .with_x_label("Biotype")
             .with_y_label("Assigned reads (log scale)")
@@ -1090,7 +1088,7 @@ impl RnaCollector {
         noncoding_zero: usize,
     ) -> Result<()> {
         use kuva::plot::{Histogram, LegendEntry, LegendPosition, LegendShape};
-        use kuva::render::layout::Layout;
+
         use kuva::render::plots::Plot;
 
         // 8-digit hex (#RRGGBBAA) makes the fills semi-transparent so the overlap shows through.
@@ -1114,9 +1112,7 @@ impl RnaCollector {
             format!("{} protein coding genes with 0 reads", thousands(coding_zero as u64)),
             format!("{} non-coding genes with 0 reads", thousands(noncoding_zero as u64)),
         ];
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(format!("Gene Expression Distribution of {}", self.sample))
             .with_x_label("Reads per kilobase (RPK)")
             .with_y_label("Genes")
@@ -1283,7 +1279,7 @@ impl RnaCollector {
     /// Write the normalized-coverage-by-position line chart.
     fn plot_coverage(&self, entries: &[RnaCoverageEntry]) -> Result<()> {
         use kuva::plot::LinePlot;
-        use kuva::render::layout::Layout;
+
         use kuva::render::plots::Plot;
 
         let xy: Vec<(f64, f64)> = entries
@@ -1293,9 +1289,7 @@ impl RnaCollector {
         let plots = vec![Plot::Line(
             LinePlot::new().with_data(xy).with_color(FG_BLUE).with_fill().with_fill_opacity(0.3),
         )];
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(format!("Transcript Coverage of {}", self.sample))
             .with_x_label("Normalized Position (5' → 3')")
             .with_y_label("Normalized Coverage")
@@ -1557,7 +1551,7 @@ impl Collector for RnaCollector {
         };
 
         let aligned = self.aligned_bases as f64;
-        let frac = |n: u64| if aligned > 0.0 { n as f64 / aligned } else { 0.0 };
+        let frac = |n: u64| safe_div_f(n as f64, aligned);
         let frac_coding = frac(self.coding_bases);
         let frac_utr = frac(self.utr_bases);
         let strand_total = correct + incorrect;
@@ -1566,7 +1560,7 @@ impl Collector for RnaCollector {
 
         // Read-level fractions are over mapped (primary, non-supplementary) reads.
         let mapped = self.mapped_reads as f64;
-        let frac_reads = |n: u64| if mapped > 0.0 { n as f64 / mapped } else { 0.0 };
+        let frac_reads = |n: u64| safe_div_f(n as f64, mapped);
         let genes_detected = self.count_genes_detected();
 
         // Distinct-junction totals: classify each distinct observed intron once.
@@ -1579,8 +1573,7 @@ impl Collector for RnaCollector {
             }
         }
         let total_juncs = known_juncs + partial_juncs + novel_juncs;
-        let frac_known_juncs =
-            if total_juncs > 0 { known_juncs as f64 / total_juncs as f64 } else { 0.0 };
+        let frac_known_juncs = safe_div(known_juncs, total_juncs);
 
         let metric = RnaSeqMetric {
             sample: self.sample.clone(),
@@ -1589,11 +1582,7 @@ impl Collector for RnaCollector {
             mapped_reads: self.mapped_reads,
             unmapped_reads: self.unmapped_reads,
             ignored_reads: self.ignored_reads,
-            duplicate_rate: if self.mapped_reads > 0 {
-                self.duplicate_reads as f64 / self.mapped_reads as f64
-            } else {
-                0.0
-            },
+            duplicate_rate: safe_div(self.duplicate_reads, self.mapped_reads),
 
             ribosomal_reads: has_ribosomal.then_some(self.ribosomal_reads),
             exonic_reads: self.exonic_reads,
@@ -1633,32 +1622,16 @@ impl Collector for RnaCollector {
             frac_intergenic_bases: frac(self.intergenic_bases),
             frac_mrna_bases: frac_coding + frac_utr,
             // Picard `PCT_USABLE_BASES` is intentionally relative to all sequenced bases.
-            frac_usable_bases: if self.bases > 0 {
-                (self.coding_bases + self.utr_bases) as f64 / self.bases as f64
-            } else {
-                0.0
-            },
+            frac_usable_bases: safe_div(self.coding_bases + self.utr_bases, self.bases),
 
             detected_strand: detected.to_string(),
             correct_strand_reads: correct,
-            frac_correct_strand_reads: if strand_total > 0 {
-                correct as f64 / strand_total as f64
-            } else {
-                0.0
-            },
+            frac_correct_strand_reads: safe_div(correct, strand_total),
             r1_tx_strand_reads: self.num_r1,
             r2_tx_strand_reads: self.num_r2,
             unexplained_reads: self.num_unexplained,
-            frac_r1_tx_strand_reads: if r_total > 0 {
-                self.num_r1 as f64 / r_total as f64
-            } else {
-                0.0
-            },
-            frac_r2_tx_strand_reads: if r_total > 0 {
-                self.num_r2 as f64 / r_total as f64
-            } else {
-                0.0
-            },
+            frac_r1_tx_strand_reads: safe_div(self.num_r1, r_total),
+            frac_r2_tx_strand_reads: safe_div(self.num_r2, r_total),
 
             median_cv_coverage: coverage.cv,
             median_5prime_bias: coverage.five_prime,
@@ -2013,14 +1986,6 @@ struct MateSpan<'a> {
 }
 
 // ─── Module-level helpers ──────────────────────────────────────────────────────
-
-/// True if the header declares coordinate sort order (`@HD SO:coordinate`).
-fn is_coordinate_sorted(header: &Header) -> bool {
-    header
-        .header()
-        .and_then(|hdr| hdr.other_fields().get(&SORT_ORDER))
-        .is_some_and(|so| AsRef::<[u8]>::as_ref(so) == COORDINATE)
-}
 
 /// Bin `values` into `n_bins` equal-width bins spanning the data min..max, returning the
 /// `n_bins + 1` bin edges and the per-bin counts. Returns empty vectors when `values` is empty

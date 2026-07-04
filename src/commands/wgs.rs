@@ -6,7 +6,6 @@ use bitvec::prelude::*;
 use clap::Args;
 use kuva::plot::LinePlot;
 use kuva::plot::legend::LegendPosition;
-use kuva::render::layout::Layout;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::op::Kind;
@@ -19,12 +18,13 @@ use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::counter::Counter;
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
+use crate::math::safe_div_f;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
-use crate::plotting::{FG_BLUE, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_plot_pdf};
+use crate::plotting::{FG_BLUE, FG_TEAL, standard_layout, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::derive_sample;
 use crate::sam::mate_buffer::{MateBuffer, Peek};
-use crate::sam::record_utils::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 
@@ -367,10 +367,9 @@ impl WgsCollector {
 
         let total_raw = total_excl as f64 + sum_depth;
 
-        let frac_excl =
-            |n: u64| -> f64 { if total_raw == 0.0 { 0.0 } else { n as f64 / total_raw } };
+        let frac_excl = |n: u64| safe_div_f(n as f64, total_raw);
 
-        let frac_excl_total = if total_raw == 0.0 { 0.0 } else { total_excl as f64 / total_raw };
+        let frac_excl_total = safe_div_f(total_excl as f64, total_raw);
 
         let metrics = WgsMetrics {
             sample: self.sample.clone(),
@@ -530,9 +529,7 @@ impl WgsCollector {
 
         let plots: Vec<Plot> = vec![observed.into(), theoretical.into()];
 
-        let layout = Layout::auto_from_plots(&plots)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&plots)
             .with_title(&self.plot_title)
             .with_x_label("Coverage Depth (X)")
             .with_y_label("Fraction of Genome")

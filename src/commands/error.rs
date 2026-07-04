@@ -18,8 +18,9 @@ use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions};
 use crate::fasta::Fasta;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_6dp, write_tsv};
+use crate::path_util::append_extension;
 use crate::progress::ProgressLogger;
-use crate::sam::alignment_reader::{IndexedAlignmentReader, append_extension};
+use crate::sam::alignment_reader::IndexedAlignmentReader;
 use crate::sam::mate_buffer::{MateAction, MateBuffer};
 use crate::sam::pair_orientation::{PairOrientation, get_pair_orientation};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
@@ -271,7 +272,7 @@ impl Command for Error {
             ErrorCollector::new(&self.input.input, &self.output.output, fasta, &self.options)?;
         // Standalone path bypasses `Collector::initialize`, so resolve the
         // sample directly from the header here.
-        collector.sample = crate::sam::record_utils::derive_sample(&self.input.input, &header);
+        collector.sample = crate::sam::derive_sample(&self.input.input, &header);
 
         let (parsed_intervals, intervals) = Self::build_intervals(&self.options, &dict)?;
 
@@ -984,7 +985,7 @@ impl ErrorCollector {
 
 impl Collector for ErrorCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
-        self.sample = crate::sam::record_utils::derive_sample(&self.input_path, header);
+        self.sample = crate::sam::derive_sample(&self.input_path, header);
         let dict = SequenceDictionary::from(header);
         if let Some(interval_path) = &self.interval_path {
             self.intervals =
@@ -1799,7 +1800,7 @@ impl ReadLevelCache {
 
         let mapq = record.mapping_quality().map(|m| CovariateValue::Int(u32::from(m.get())));
 
-        let nm_raw = get_nm_tag(record);
+        let nm_raw = record.get_integer_tag(*b"NM");
 
         Self { read_num, strand, pair_orientation, isize_val, gc, mapq, nm_raw }
     }
@@ -2008,12 +2009,6 @@ fn compute_hp_length(record: &RikerRecord, read_offset: usize, is_reverse: bool)
         }
         count
     }
-}
-
-/// Extract the NM tag value from a record.
-fn get_nm_tag(record: &RikerRecord) -> Option<u32> {
-    let v = record.aux_tag(*b"NM")?.as_int()?;
-    u32::try_from(v).ok()
 }
 
 /// Compute a phred-scaled Q-score from error count and total.

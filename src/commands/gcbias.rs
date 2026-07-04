@@ -8,7 +8,7 @@ use kuva::plot::LinePlot;
 use kuva::plot::legend::LegendPosition;
 use kuva::plot::scatter::ScatterPlot;
 use kuva::render::annotations::ReferenceLine;
-use kuva::render::layout::{Layout, TickFormat};
+use kuva::render::layout::TickFormat;
 use kuva::render::plots::Plot;
 use noodles::sam::Header;
 use riker_derive::MetricDocs;
@@ -19,13 +19,14 @@ use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
+use crate::math::safe_div;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{
-    FG_BLUE, FG_GRAY, FG_GREEN, FG_SKY, FG_TEAL, PLOT_HEIGHT, PLOT_WIDTH, write_twin_y_plot_pdf,
+    FG_BLUE, FG_GRAY, FG_GREEN, FG_SKY, FG_TEAL, standard_layout, write_twin_y_plot_pdf,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::record_utils::{derive_sample, get_integer_tag};
+use crate::sam::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sequence_dict::SequenceDictionary;
 
@@ -391,7 +392,7 @@ impl GcBiasCollector {
         self.bases_by_gc[gc] += read_len;
 
         // NM tag
-        let nm = get_integer_tag(record, *b"NM").unwrap_or(0);
+        let nm = record.get_integer_tag(*b"NM").unwrap_or(0);
         self.errors_by_gc[gc] += u64::from(nm);
 
         // Base quality accumulation (integer)
@@ -421,8 +422,7 @@ impl GcBiasCollector {
         let total_windows: u64 = self.windows_by_gc.iter().sum();
 
         // Compute mean reads per window
-        let mean_reads_per_window =
-            if total_windows > 0 { reads_used as f64 / total_windows as f64 } else { 0.0 };
+        let mean_reads_per_window = safe_div(reads_used, total_windows);
 
         // Filtered reads are aligned reads that never landed in a GC bin, for any
         // reason (duplicate/supplementary when excluded, low MAPQ, excluded
@@ -431,11 +431,7 @@ impl GcBiasCollector {
         // holds and the subtraction cannot underflow (saturating_sub is belt-and-
         // suspenders for that invariant).
         let filtered_reads = self.aligned_reads.saturating_sub(reads_used);
-        let frac_filtered_reads = if self.aligned_reads > 0 {
-            filtered_reads as f64 / self.aligned_reads as f64
-        } else {
-            0.0
-        };
+        let frac_filtered_reads = safe_div(filtered_reads, self.aligned_reads);
 
         // Build detail metrics (101 rows)
         let detail_rows: Vec<GcBiasDetailMetric> = (0..NUM_GC_BINS)
@@ -589,9 +585,7 @@ impl GcBiasCollector {
             );
         }
 
-        let layout = Layout::auto_from_plots(&primary)
-            .with_width(PLOT_WIDTH)
-            .with_height(PLOT_HEIGHT)
+        let layout = standard_layout(&primary)
             .with_x_axis_min(0.0)
             .with_x_axis_max(100.0)
             .with_y_axis_min(0.0)
@@ -778,7 +772,7 @@ fn normalized_coverage_and_error(reads: u64, windows: u64, mean_rpw: f64) -> (f6
 /// Mean reported base quality for a GC bin: the average of the per-base quality scores of
 /// the reads binned here, or `0.0` when the bin has no quality bases.
 fn mean_base_quality(quality_sum: u64, quality_bases: u64) -> f64 {
-    if quality_bases > 0 { quality_sum as f64 / quality_bases as f64 } else { 0.0 }
+    safe_div(quality_sum, quality_bases)
 }
 
 /// Empirical (Phred-scaled) base quality for a GC bin, derived from the observed error rate
