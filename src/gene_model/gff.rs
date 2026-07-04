@@ -11,10 +11,10 @@
 //! GENCODE (`gene_name`/`gene_type`), Ensembl (`Name`/`biotype`), and RefSeq
 //! (`Name`/`gene_biotype`) all parse without a provider flag.
 
-use std::collections::HashMap;
 use std::io::BufRead;
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::FxHashMap;
 
 use super::{Biotype, Exon, ParsedTranscript};
 
@@ -35,13 +35,13 @@ struct FeatureRec {
 /// # Errors
 /// Returns an error if a feature line is malformed (too few columns, unparseable coordinates).
 pub(super) fn parse<R: BufRead>(reader: R) -> Result<Vec<ParsedTranscript>> {
-    let mut features: HashMap<String, FeatureRec> = HashMap::new();
-    let mut exons_by_parent: HashMap<String, Vec<Exon>> = HashMap::new();
-    let mut cds_by_parent: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    let mut features: FxHashMap<String, FeatureRec> = FxHashMap::default();
+    let mut exons_by_parent: FxHashMap<String, Vec<Exon>> = FxHashMap::default();
+    let mut cds_by_parent: FxHashMap<String, Vec<(u32, u32)>> = FxHashMap::default();
     // Maps a sequence accession (e.g. `NC_000001.11`) to its common chromosome name (e.g. `1`),
     // read from `region`/`chromosome` feature attributes. RefSeq GFFs refer to contigs by
     // accession; this lets us recover the names that reconcile against a BAM header.
-    let mut seqid_names: HashMap<String, String> = HashMap::new();
+    let mut seqid_names: FxHashMap<String, String> = FxHashMap::default();
     // Preserve first-seen transcript order for deterministic output.
     let mut tx_order: Vec<String> = Vec::new();
 

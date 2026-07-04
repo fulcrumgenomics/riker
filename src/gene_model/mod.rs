@@ -31,12 +31,12 @@ mod gff;
 mod gtf;
 mod refflat;
 
-use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use fgoxide::io::Io;
+use rustc_hash::FxHashMap;
 
 use crate::sequence_dict::{SequenceDictionary, SequenceMetadata};
 
@@ -507,7 +507,7 @@ pub fn detect_format<R: BufRead>(reader: R) -> Result<Option<GeneModelFormat>> {
 fn build_loci(transcripts: Vec<ParsedTranscript>, dict: &SequenceDictionary) -> Vec<GeneLocus> {
     // Preserve first-seen gene order for deterministic output.
     let mut order: Vec<String> = Vec::new();
-    let mut by_gene: HashMap<String, Vec<ParsedTranscript>> = HashMap::new();
+    let mut by_gene: FxHashMap<String, Vec<ParsedTranscript>> = FxHashMap::default();
     for tx in transcripts {
         by_gene
             .entry(tx.gene_name.clone())
