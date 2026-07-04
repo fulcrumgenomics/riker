@@ -1649,25 +1649,17 @@ fn record_buf_value_to_aux(v: &sam::alignment::record_buf::data::field::Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{pair, read};
     use noodles::sam::alignment::record::cigar::op::Kind as OpKind;
-    use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
 
     // ── Helpers ──
 
-    fn make_record_buf_with_cigar(ops: Vec<Op>) -> RecordBuf {
-        let cigar: Cigar = ops.into_iter().collect();
-        RecordBuf::builder()
-            .set_name(b"r1".to_vec())
-            .set_flags(Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED)
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(101).unwrap())
-            .set_mate_reference_sequence_id(0)
-            .set_mate_alignment_start(Position::new(201).unwrap())
-            .set_template_length(200)
-            .set_cigar(cigar)
-            .set_sequence(Sequence::from(vec![b'A'; 100]))
-            .set_quality_scores(QualityScores::from(vec![30u8; 100]))
-            .build()
+    /// A paired, both-ends-mapped read on chr1:101 with its mate at 201 (TLEN 200) and the
+    /// given CIGAR. `no_nm`/`no_mc` keep the aux block empty so the aux-tag tests see only
+    /// the tags they insert themselves.
+    fn make_record_buf_with_cigar(cigar: &str) -> RecordBuf {
+        let (r1, _r2) = pair("r1").at("chr1", 101, 201).cigar(cigar).no_nm().no_mc().build();
+        r1
     }
 
     /// Inverse of `code_to_kind` — BAM packed op code for a given
@@ -1725,8 +1717,7 @@ mod tests {
 
     #[test]
     fn fallback_scalar_accessors_are_infallible() {
-        let ops = vec![Op::new(OpKind::Match, 100)];
-        let buf = make_record_buf_with_cigar(ops);
+        let buf = make_record_buf_with_cigar("100M");
         let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
         assert!(record.flags().is_segmented());
         assert_eq!(record.reference_sequence_id(), Some(0));
@@ -1738,12 +1729,7 @@ mod tests {
     #[test]
     fn fallback_alignment_end_computed_from_ref_span() {
         // 50M + 5I + 45M → ref span = 50 + 45 = 95. pos=101 → end=195.
-        let ops = vec![
-            Op::new(OpKind::Match, 50),
-            Op::new(OpKind::Insertion, 5),
-            Op::new(OpKind::Match, 45),
-        ];
-        let buf = make_record_buf_with_cigar(ops);
+        let buf = make_record_buf_with_cigar("50M5I45M");
         let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
         assert_eq!(record.alignment_end().unwrap().get(), 195);
     }
@@ -1752,9 +1738,9 @@ mod tests {
     fn fallback_sequence_is_always_populated() {
         // RecordBuf already holds ASCII bases, so Fallback's sequence
         // accessor returns the bases regardless of whether any filler
-        // has run on the BAM side.
-        let ops = vec![Op::new(OpKind::Match, 100)];
-        let buf = make_record_buf_with_cigar(ops);
+        // has run on the BAM side. Explicit all-`A` bases so the content
+        // assertion below is independent of the reference.
+        let buf = read().at("chr1", 101).cigar("100M").bases(vec![b'A'; 100]).build();
         let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
 
         let seq = record.sequence();
@@ -1765,16 +1751,16 @@ mod tests {
 
     #[test]
     fn fallback_cigar_iteration_matches_input() {
-        let ops = vec![
+        let buf = make_record_buf_with_cigar("50M5I45M");
+        let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
+
+        let round_tripped: Vec<Op> = record.cigar_ops().collect();
+        let expected = vec![
             Op::new(OpKind::Match, 50),
             Op::new(OpKind::Insertion, 5),
             Op::new(OpKind::Match, 45),
         ];
-        let buf = make_record_buf_with_cigar(ops.clone());
-        let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
-
-        let round_tripped: Vec<Op> = record.cigar_ops().collect();
-        assert_eq!(round_tripped, ops);
+        assert_eq!(round_tripped, expected);
     }
 
     #[test]
@@ -1782,7 +1768,7 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::data::field::Value;
 
-        let mut buf = make_record_buf_with_cigar(vec![Op::new(OpKind::Match, 100)]);
+        let mut buf = make_record_buf_with_cigar("100M");
         // `ALIGNMENT_HIT_COUNT` is the `NH` tag; `MISMATCHED_POSITIONS`
         // is `MD`. Insert via noodles' `Tag` constants; look up via the
         // raw wire bytes so the public API is the one under test.
@@ -1798,7 +1784,7 @@ mod tests {
 
     #[test]
     fn fallback_aux_tag_returns_none_for_missing() {
-        let buf = make_record_buf_with_cigar(vec![Op::new(OpKind::Match, 100)]);
+        let buf = make_record_buf_with_cigar("100M");
         let record = RikerRecord::Fallback(FallbackRec::from_record_buf(buf));
         assert!(record.aux_tag(*b"NM").is_none());
     }
@@ -1951,7 +1937,7 @@ mod tests {
         assert_eq!(dst.get(*b"MD").and_then(AuxValue::as_str).unwrap(), "50ACGT");
         assert_eq!(dst.get(*b"XC").and_then(AuxValue::as_char), Some(b'N'));
         let f = dst.get(*b"XF").and_then(AuxValue::as_float).unwrap();
-        assert!((f - 0.75).abs() < 1e-6);
+        crate::assert_close!(f64::from(f), 0.75);
     }
 
     #[test]

@@ -812,14 +812,8 @@ mod tests {
     // ── Contig resolution ─────────────────────────────────────────────────────
 
     fn dict_of(contigs: &[&str]) -> SequenceDictionary {
-        use noodles::sam::Header;
-        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
-        let mut builder = Header::builder();
-        for &name in contigs {
-            let rs = Map::<ReferenceSequence>::new(std::num::NonZeroUsize::new(1000).unwrap());
-            builder = builder.add_reference_sequence(name.as_bytes(), rs);
-        }
-        SequenceDictionary::from(&builder.build())
+        let owned: Vec<(String, usize)> = contigs.iter().map(|&n| (n.to_string(), 1000)).collect();
+        SequenceDictionary::from(crate::test_support::SamBuilder::with_contigs(&owned).header())
     }
 
     #[test]

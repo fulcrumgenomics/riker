@@ -343,6 +343,7 @@ impl<T> Default for MateBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{pair, read};
     use noodles::core::Position;
     use noodles::sam::Header;
     use noodles::sam::alignment::RecordBuf;
@@ -358,38 +359,18 @@ mod tests {
 
     /// Build a minimal paired, mapped, mate-mapped `RecordBuf` on a single
     /// contig with a 100M CIGAR and the requested positions.
-    fn paired_record(
-        name: &[u8],
-        ref_id: usize,
-        pos_1based: usize,
-        mate_pos_1based: usize,
-    ) -> RecordBuf {
-        let cigar: Cigar = [Op::new(Kind::Match, 100)].into_iter().collect();
-        RecordBuf::builder()
-            .set_name(name.to_vec())
-            .set_flags(Flags::SEGMENTED)
-            .set_reference_sequence_id(ref_id)
-            .set_mate_reference_sequence_id(ref_id)
-            .set_alignment_start(Position::new(pos_1based).expect("pos"))
-            .set_mate_alignment_start(Position::new(mate_pos_1based).expect("mate_pos"))
-            .set_cigar(cigar)
-            .set_sequence(Sequence::from(vec![b'A'; 100]))
-            .set_quality_scores(QualityScores::from(vec![30u8; 100]))
-            .build()
+    fn paired_record(name: &[u8], pos_1based: usize, mate_pos_1based: usize) -> RecordBuf {
+        let name = std::str::from_utf8(name).expect("read name is valid UTF-8");
+        // `pair().at(..)` derives the mate ref/pos, strand, and a 100M CIGAR; read 1
+        // carries this read's own coordinates plus the mate's start, which is all the
+        // buffer's routing looks at.
+        let (read1, _) = pair(name).at("chr1", pos_1based, mate_pos_1based).build();
+        read1
     }
 
     /// Build an unpaired record (no SEGMENTED flag).
     fn unpaired_record(pos_1based: usize) -> RecordBuf {
-        let cigar: Cigar = [Op::new(Kind::Match, 50)].into_iter().collect();
-        RecordBuf::builder()
-            .set_name(b"unpaired".to_vec())
-            .set_flags(Flags::empty())
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(pos_1based).expect("pos"))
-            .set_cigar(cigar)
-            .set_sequence(Sequence::from(vec![b'A'; 50]))
-            .set_quality_scores(QualityScores::from(vec![30u8; 50]))
-            .build()
+        read().name("unpaired").at("chr1", pos_1based).len(50).build()
     }
 
     /// A minimal cache that just remembers the mate's read name for assertions.
@@ -414,7 +395,7 @@ mod tests {
     #[test]
     fn test_accept_unmapped_is_alone() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let mut r = paired_record(b"q", 0, 100, 120);
+        let mut r = paired_record(b"q", 100, 120);
         *r.flags_mut() = Flags::SEGMENTED | Flags::UNMAPPED;
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Alone));
         assert!(buf.is_empty());
@@ -423,7 +404,7 @@ mod tests {
     #[test]
     fn test_accept_mate_unmapped_is_alone() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let mut r = paired_record(b"q", 0, 100, 120);
+        let mut r = paired_record(b"q", 100, 120);
         *r.flags_mut() = Flags::SEGMENTED | Flags::MATE_UNMAPPED;
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Alone));
         assert!(buf.is_empty());
@@ -432,7 +413,7 @@ mod tests {
     #[test]
     fn test_accept_cross_contig_is_alone() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let mut r = paired_record(b"q", 0, 100, 120);
+        let mut r = paired_record(b"q", 100, 120);
         *r.mate_reference_sequence_id_mut() = Some(1);
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Alone));
         assert!(buf.is_empty());
@@ -484,7 +465,7 @@ mod tests {
         // mate_start (50) < read_start (100) — shouldn't buffer; the mate has
         // already gone past us (or we've gone past it) and won't be seen later.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q", 0, 100, 50);
+        let r = paired_record(b"q", 100, 50);
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Alone));
         assert!(buf.is_empty());
     }
@@ -493,7 +474,7 @@ mod tests {
     fn test_accept_mate_past_read_end_is_alone() {
         // mate_start (500) > read_end (199) — no overlap possible, don't buffer.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q", 0, 100, 500);
+        let r = paired_record(b"q", 100, 500);
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Alone));
         assert!(buf.is_empty());
     }
@@ -504,7 +485,7 @@ mod tests {
     fn test_accept_mate_in_span_is_buffered() {
         // mate_start (150) within read's [100, 199] → buffer.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q", 0, 100, 150);
+        let r = paired_record(b"q", 100, 150);
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Buffered));
         assert_eq!(buf.len(), 1);
     }
@@ -513,7 +494,7 @@ mod tests {
     fn test_accept_mate_at_read_start_is_buffered() {
         // mate_start == read_start (boundary): within span (inclusive).
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q", 0, 100, 100);
+        let r = paired_record(b"q", 100, 100);
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Buffered));
     }
 
@@ -521,17 +502,17 @@ mod tests {
     fn test_accept_mate_at_read_end_is_buffered() {
         // mate_start at exact read_end (1-based inclusive): within span.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q", 0, 100, 199); // 100-bp read spans 100..=199
+        let r = paired_record(b"q", 100, 199); // 100-bp read spans 100..=199
         assert!(matches!(buf.accept(&to_riker(&r)), MateAction::Buffered));
     }
 
     #[test]
     fn test_accept_pair_returns_cached_mate() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let first = paired_record(b"qname", 0, 100, 150);
+        let first = paired_record(b"qname", 100, 150);
         assert!(matches!(buf.accept(&to_riker(&first)), MateAction::Buffered));
 
-        let second = paired_record(b"qname", 0, 150, 100);
+        let second = paired_record(b"qname", 150, 100);
         match buf.accept(&to_riker(&second)) {
             MateAction::PairWith(cache) => assert_eq!(cache.0, b"qname"),
             other => panic!("expected PairWith, got {other:?}"),
@@ -544,7 +525,7 @@ mod tests {
     #[test]
     fn test_flush_behind_yields_orphans_on_earlier_contig() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q1", 0, 100, 150);
+        let r = paired_record(b"q1", 100, 150);
         let _ = buf.accept(&to_riker(&r));
 
         // We're now scanning contig 1 — anything on contig 0 is behind.
@@ -558,8 +539,8 @@ mod tests {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
         // Two buffered reads with different mate positions: 150 (0-based 149)
         // and 750 (0-based 749).
-        let _ = buf.accept(&to_riker(&paired_record(b"q1", 0, 100, 150)));
-        let _ = buf.accept(&to_riker(&paired_record(b"q2", 0, 700, 750)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q1", 100, 150)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q2", 700, 750)));
 
         // Scanning past 500: q1's mate (149) is behind, q2's (749) is not.
         let orphans = buf.flush_behind(0, 500);
@@ -570,7 +551,7 @@ mod tests {
     #[test]
     fn test_flush_behind_empty_when_none_match() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let _ = buf.accept(&to_riker(&paired_record(b"q1", 0, 100, 150)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q1", 100, 150)));
 
         // Scanning at pos 0 of the same contig — nothing is strictly behind.
         let orphans = buf.flush_behind(0, 0);
@@ -584,7 +565,7 @@ mod tests {
         // pos == 149, only when pos > 149. `flush_behind` is documented as
         // "strictly before" the given position.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let _ = buf.accept(&to_riker(&paired_record(b"q1", 0, 100, 150))); // mate_pos_0based = 149
+        let _ = buf.accept(&to_riker(&paired_record(b"q1", 100, 150))); // mate_pos_0based = 149
 
         let stay = buf.flush_behind(0, 149);
         assert!(stay.is_empty());
@@ -598,8 +579,8 @@ mod tests {
     #[test]
     fn test_flush_drains_all() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let _ = buf.accept(&to_riker(&paired_record(b"q1", 0, 100, 150)));
-        let _ = buf.accept(&to_riker(&paired_record(b"q2", 0, 200, 250)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q1", 100, 150)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q2", 200, 250)));
         let all = buf.flush();
         assert_eq!(all.len(), 2);
         assert!(buf.is_empty());
@@ -608,8 +589,8 @@ mod tests {
     #[test]
     fn test_clear_behind_discards_without_yield() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let _ = buf.accept(&to_riker(&paired_record(b"q1", 0, 100, 150)));
-        let _ = buf.accept(&to_riker(&paired_record(b"q2", 0, 700, 750)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q1", 100, 150)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q2", 700, 750)));
 
         buf.clear_behind(0, 500);
         assert_eq!(buf.len(), 1);
@@ -618,8 +599,8 @@ mod tests {
     #[test]
     fn test_clear_empties_buffer() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let _ = buf.accept(&to_riker(&paired_record(b"q1", 0, 100, 150)));
-        let _ = buf.accept(&to_riker(&paired_record(b"q2", 0, 200, 250)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q1", 100, 150)));
+        let _ = buf.accept(&to_riker(&paired_record(b"q2", 200, 250)));
         buf.clear();
         assert!(buf.is_empty());
     }
@@ -629,10 +610,10 @@ mod tests {
     #[test]
     fn test_rikerrecord_cache_roundtrip() {
         let mut buf: MateBuffer<RikerRecord> = MateBuffer::new();
-        let first = paired_record(b"qname", 0, 100, 150);
+        let first = paired_record(b"qname", 100, 150);
         assert!(matches!(buf.accept(&to_riker(&first)), MateAction::Buffered));
 
-        let second = paired_record(b"qname", 0, 150, 100);
+        let second = paired_record(b"qname", 150, 100);
         match buf.accept(&to_riker(&second)) {
             MateAction::PairWith(cached) => {
                 let name = cached.name().unwrap();
@@ -659,7 +640,7 @@ mod tests {
         // Overlap region: mate_start..=read_end == 150..=199 in 1-based,
         // i.e. overlap_start=149 (0-based), overlap_len=50.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let r = paired_record(b"q", 0, 100, 150);
+        let r = paired_record(b"q", 100, 150);
         match buf.probe(&to_riker(&r)) {
             Peek::WouldBuffer { overlap_start, overlap_len } => {
                 assert_eq!(overlap_start, 149);
@@ -674,7 +655,7 @@ mod tests {
     #[test]
     fn test_probe_then_insert_makes_entry_visible_to_accept() {
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let first = paired_record(b"qn", 0, 100, 150);
+        let first = paired_record(b"qn", 100, 150);
         let Peek::WouldBuffer { .. } = buf.probe(&to_riker(&first)) else {
             panic!("expected WouldBuffer")
         };
@@ -682,7 +663,7 @@ mod tests {
         assert_eq!(buf.len(), 1);
 
         // Now the mate arriving via accept should retrieve the buffered entry.
-        let second = paired_record(b"qn", 0, 150, 100);
+        let second = paired_record(b"qn", 150, 100);
         match buf.accept(&to_riker(&second)) {
             MateAction::PairWith(cache) => assert_eq!(cache.0, b"qn"),
             _ => panic!("expected PairWith"),
@@ -734,13 +715,13 @@ mod tests {
     fn test_probe_consumes_buffered_mate() {
         // probe on the second read should find and remove the buffered mate.
         let mut buf: MateBuffer<NameCache> = MateBuffer::new();
-        let first = paired_record(b"qn", 0, 100, 150);
+        let first = paired_record(b"qn", 100, 150);
         let Peek::WouldBuffer { .. } = buf.probe(&to_riker(&first)) else {
             panic!("expected WouldBuffer")
         };
         buf.insert(&to_riker(&first), NameCache(b"qn".to_vec()));
 
-        let second = paired_record(b"qn", 0, 150, 100);
+        let second = paired_record(b"qn", 150, 100);
         assert!(matches!(buf.probe(&to_riker(&second)), Peek::PairWith(_)));
         assert!(buf.is_empty());
     }

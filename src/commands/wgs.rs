@@ -1166,7 +1166,7 @@ mod tests {
         // hist[0]=1, hist[1]=1, hist[2]=1 → total=3
         // 20th pct: threshold=ceil(0.2*3)=1, running after d=0 is 1 ≥ 1 → depth=0
         let hist = [1u64, 1, 1];
-        assert!((percentile_from_hist(&hist, 0.20, 3) - 0.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&hist, 0.20, 3), 0.0, f64::EPSILON);
     }
 
     #[test]
@@ -1175,19 +1175,19 @@ mod tests {
         // All at depth=10, so after depth=10 running=10 ≥ 2 → depth=10
         let mut hist = vec![0u64; 11];
         hist[10] = 10;
-        assert!((percentile_from_hist(&hist, 0.20, 10) - 10.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&hist, 0.20, 10), 10.0, f64::EPSILON);
     }
 
     #[test]
     fn test_percentile_empty_histogram() {
-        assert!((percentile_from_hist(&[], 0.5, 0) - 0.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&[], 0.5, 0), 0.0, f64::EPSILON);
     }
 
     #[test]
     fn test_percentile_single_bin() {
         // All 10 positions at depth 0
         let hist = [10u64];
-        assert!((percentile_from_hist(&hist, 0.5, 10) - 0.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&hist, 0.5, 10), 0.0, f64::EPSILON);
     }
 
     #[test]
@@ -1196,7 +1196,7 @@ mod tests {
         let mut hist = vec![0u64; 11];
         hist[0] = 5;
         hist[10] = 5;
-        assert!((percentile_from_hist(&hist, 0.0, 10) - 0.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&hist, 0.0, 10), 0.0, f64::EPSILON);
     }
 
     #[test]
@@ -1206,7 +1206,7 @@ mod tests {
         let mut hist = vec![0u64; 11];
         hist[5] = 5;
         hist[10] = 5;
-        assert!((percentile_from_hist(&hist, 1.0, 10) - 10.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&hist, 1.0, 10), 10.0, f64::EPSILON);
     }
 
     #[test]
@@ -1216,7 +1216,7 @@ mod tests {
         let mut hist = vec![0u64; 11];
         hist[5] = 5;
         hist[10] = 5;
-        assert!((percentile_from_hist(&hist, 0.5, 10) - 5.0).abs() < f64::EPSILON);
+        crate::assert_close!(percentile_from_hist(&hist, 0.5, 10), 5.0, f64::EPSILON);
     }
 
     // ── ContigDepth tests ────────────────────────────────────────────────────

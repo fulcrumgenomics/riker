@@ -117,104 +117,69 @@ pub fn count_overlapping_bases(record: &RecordBuf) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noodles::core::Position;
-    use noodles::sam::alignment::record::cigar::Op;
-    use noodles::sam::alignment::record::{Flags, MappingQuality};
-    use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+    use crate::test_support::{pair, read};
 
-    /// Build a paired record with the given alignment start, mate start, cigar, and flags.
+    /// A paired, both-ends-mapped record on chr1 at `alignment_start` whose mate maps at
+    /// `mate_start`, with the given CIGAR. `is_first_of_pair` selects which mate the
+    /// record represents; either way the returned record itself sits at `alignment_start`.
     fn make_record(
         alignment_start: usize,
         mate_start: usize,
-        cigar_ops: &[Op],
+        cigar: &str,
         is_first_of_pair: bool,
     ) -> RecordBuf {
-        let read_len: usize = cigar_ops
-            .iter()
-            .filter(|op| {
-                matches!(
-                    op.kind(),
-                    Kind::Match
-                        | Kind::SequenceMatch
-                        | Kind::SequenceMismatch
-                        | Kind::Insertion
-                        | Kind::SoftClip
-                )
-            })
-            .map(|op| op.len())
-            .sum();
-        let mut flags = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED;
+        // `pair().at` puts read 1 (first) at the first position and read 2 (last) at the
+        // second, each carrying the other's start as its mate; pick the one that lands at
+        // `alignment_start`.
         if is_first_of_pair {
-            flags |= Flags::FIRST_SEGMENT;
+            let (r1, _) =
+                pair("read1").at("chr1", alignment_start, mate_start).cigar(cigar).build();
+            r1
         } else {
-            flags |= Flags::LAST_SEGMENT;
+            let (_, r2) =
+                pair("read1").at("chr1", mate_start, alignment_start).cigar(cigar).build();
+            r2
         }
-
-        let cigar: Cigar = cigar_ops.iter().copied().collect();
-        let seq: Sequence = vec![b'A'; read_len].into();
-        let qual = QualityScores::from(vec![30u8; read_len]);
-        let mq = MappingQuality::new(60).unwrap();
-
-        RecordBuf::builder()
-            .set_name("read1")
-            .set_flags(flags)
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(alignment_start).unwrap())
-            .set_mapping_quality(mq)
-            .set_cigar(cigar)
-            .set_mate_reference_sequence_id(0)
-            .set_mate_alignment_start(Position::new(mate_start).unwrap())
-            .set_template_length(0)
-            .set_sequence(seq)
-            .set_quality_scores(qual)
-            .build()
     }
 
     #[test]
     fn test_simple_overlap() {
         // 10M read starting at pos 1, mate starts at pos 6 → 5 bases overlap
-        let rec = make_record(1, 6, &[Op::new(Kind::Match, 10)], true);
+        let rec = make_record(1, 6, "10M", true);
         assert_eq!(count_overlapping_bases(&rec), 5);
     }
 
     #[test]
     fn test_no_overlap() {
         // 10M read starting at pos 1, mate starts at pos 20 → no overlap
-        let rec = make_record(1, 20, &[Op::new(Kind::Match, 10)], true);
+        let rec = make_record(1, 20, "10M", true);
         assert_eq!(count_overlapping_bases(&rec), 0);
     }
 
     #[test]
     fn test_full_overlap() {
         // 10M read starting at pos 1, mate starts at pos 1, second of pair → 10 bases
-        let rec = make_record(1, 1, &[Op::new(Kind::Match, 10)], false);
+        let rec = make_record(1, 1, "10M", false);
         assert_eq!(count_overlapping_bases(&rec), 10);
     }
 
     #[test]
     fn test_first_of_pair_tie_not_clipped() {
         // At same position, first of pair should NOT be clipped
-        let rec = make_record(1, 1, &[Op::new(Kind::Match, 10)], true);
+        let rec = make_record(1, 1, "10M", true);
         assert_eq!(count_overlapping_bases(&rec), 0);
     }
 
     #[test]
     fn test_right_most_read_not_clipped() {
         // Mate starts before this read → this read is right-most → not clipped
-        let rec = make_record(10, 5, &[Op::new(Kind::Match, 10)], true);
+        let rec = make_record(10, 5, "10M", true);
         assert_eq!(count_overlapping_bases(&rec), 0);
     }
 
     #[test]
     fn test_unpaired_not_clipped() {
-        let rec = RecordBuf::builder()
-            .set_flags(Flags::empty())
-            .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(1).unwrap())
-            .set_cigar([Op::new(Kind::Match, 10)].into_iter().collect::<Cigar>())
-            .set_sequence(vec![b'A'; 10].into())
-            .set_quality_scores(QualityScores::from(vec![30u8; 10]))
-            .build();
+        let rec = read().at("chr1", 1).cigar("10M").build();
         assert_eq!(count_overlapping_bases(&rec), 0);
     }
 
@@ -223,12 +188,7 @@ mod tests {
         // 5M2D5M at pos 1, mate starts at pos 9
         // Ref positions: M covers 1-5, D covers 6-7, M covers 8-12
         // Mate starts at 9 → overlap is positions 9-12 = 4 M bases, plus 0 D bases
-        let rec = make_record(
-            1,
-            9,
-            &[Op::new(Kind::Match, 5), Op::new(Kind::Deletion, 2), Op::new(Kind::Match, 5)],
-            true,
-        );
+        let rec = make_record(1, 9, "5M2D5M", true);
         assert_eq!(count_overlapping_bases(&rec), 4);
     }
 
@@ -237,12 +197,7 @@ mod tests {
         // 5M3I5M at pos 1, mate starts at pos 4
         // Ref positions: first M covers 1-5, I has no ref positions, second M covers 6-10
         // Mate starts at 4 → from first M: 2 bases (pos 4-5), all of I: 3 bases, all of second M: 5 bases = 10
-        let rec = make_record(
-            1,
-            4,
-            &[Op::new(Kind::Match, 5), Op::new(Kind::Insertion, 3), Op::new(Kind::Match, 5)],
-            true,
-        );
+        let rec = make_record(1, 4, "5M3I5M", true);
         assert_eq!(count_overlapping_bases(&rec), 10);
     }
 }

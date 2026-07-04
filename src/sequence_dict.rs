@@ -135,18 +135,14 @@ impl From<&fasta::fai::Index> for SequenceDictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroUsize;
 
-    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+    use crate::test_support::SamBuilder;
 
     /// Build a header with the given contig names and lengths.
     fn make_header(contigs: &[(&str, usize)]) -> Header {
-        let mut builder = Header::builder();
-        for &(name, len) in contigs {
-            let ref_seq = Map::<ReferenceSequence>::new(NonZeroUsize::new(len).expect("len > 0"));
-            builder = builder.add_reference_sequence(name.as_bytes(), ref_seq);
-        }
-        builder.build()
+        let owned: Vec<(String, usize)> =
+            contigs.iter().map(|&(n, l)| (n.to_string(), l)).collect();
+        SamBuilder::with_contigs(&owned).header().clone()
     }
 
     #[test]

@@ -33,16 +33,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use noodles::sam::header::record::value::map::read_group::tag;
-    use noodles::sam::header::record::value::{Map, map::ReadGroup};
+    use crate::test_support::{SamBuilder, read};
 
     // ── derive_sample ────────────────────────────────────────────────────────
 
     #[test]
     fn test_derive_sample_from_read_group() {
-        let mut rg = Map::<ReadGroup>::default();
-        rg.other_fields_mut().insert(tag::SAMPLE, "SampleA".into());
-        let header = Header::builder().add_read_group("rg0", rg).build();
+        let header = SamBuilder::new().read_group("rg0", "SampleA").header().clone();
 
         let input = PathBuf::from("/data/sample.bam");
         assert_eq!(derive_sample(&input, &header), "SampleA");
@@ -51,8 +48,7 @@ mod tests {
     #[test]
     fn test_derive_sample_fallback_to_filename() {
         // Read group present but no SM tag → falls back to file stem
-        let rg = Map::<ReadGroup>::default();
-        let header = Header::builder().add_read_group("rg0", rg).build();
+        let header = SamBuilder::new().read_group_without_sample("rg0").header().clone();
 
         let input = PathBuf::from("/data/my_file.bam");
         assert_eq!(derive_sample(&input, &header), "my_file");
@@ -75,13 +71,12 @@ mod tests {
 
     // ── get_integer_tag ──────────────────────────────────────────────────────
 
-    use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record_buf::data::field::Value as DataValue;
 
     fn record_with_tag(tag_name: [u8; 2], value: DataValue) -> RikerRecord {
-        let mut data = noodles::sam::alignment::record_buf::Data::default();
-        data.insert(tag_name.into(), value);
-        let buf = RecordBuf::builder().set_data(data).build();
+        // Unmapped so the builder derives no NM tag of its own, leaving only the tag under
+        // test in the aux block.
+        let buf = read().unmapped().tag(tag_name, value).build();
         RikerRecord::from_alignment_record(&Header::default(), &buf).unwrap()
     }
 
@@ -129,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_get_integer_tag_missing() {
-        let buf = RecordBuf::default();
+        let buf = read().unmapped().build();
         let rec = RikerRecord::from_alignment_record(&Header::default(), &buf).unwrap();
         assert_eq!(get_integer_tag(&rec, *b"NM"), None);
     }

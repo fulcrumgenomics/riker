@@ -169,13 +169,15 @@ Performance-critical design choices (benchmarked):
 
 ## Testing Conventions
 
-- **No checked-in test data** — all BAM/FASTA/interval data is built programmatically
+- **No checked-in test data** — all BAM/FASTA/interval/VCF data is built programmatically
 - Integration tests live in `tests/test_<command>.rs`; unit tests are inline `#[cfg(test)]` modules
-- Test helpers in `tests/helpers/mod.rs`:
-  - `SamBuilder` — builds `RecordBuf` instances and writes to a temp BAM (`to_temp_bam()` or `to_temp_indexed_bam()` with BAI index)
-  - `FastaBuilder` — builds a temp FASTA with `.fai` index
-  - `read_metrics_tsv::<T>(path)` — deserializes TSV output for assertions
-  - `assert_float_eq!(a, b, eps)` macro for float comparisons
+- Shared fluent builders live in `src/test_support/` behind the `test-support` feature (also compiled under `cfg(test)` for the lib's own unit tests), so `tests/` and inline unit tests use one vocabulary. Import as `riker_lib::test_support::*` (integration) or `crate::test_support::*` (inline):
+  - `read()` / `pair()` — build a `RecordBuf` / FR pair; bases derive from a frozen reference, so `.sub(off, base)` plants a mismatch, `.matching_ref(&fasta)` uses a custom one
+  - `SamBuilder` / `coord_builder()` — collect records and write a temp BAM/SAM/CRAM (`to_temp_bam()` / `to_temp_indexed_bam()` with a BAI index); resolves contig names against its own header
+  - `FastaBuilder` — temp FASTA + `.fai` (frozen hg38-mini default, or custom contigs); `BedBuilder` / `VcfBuilder` — temp BED / bgzip+tabix VCF
+  - `drive_collector(collector, bam)` — run a `Collector` over a BAM; `cigar::parse("10S80M10S")`
+  - `crate::assert_close!(a, b[, eps])` — inclusive float comparison (`|a - b| <= eps`)
+- `tests/helpers/mod.rs` keeps only `read_metrics_tsv::<T>(path)` for deserializing TSV output
 
 ## Output Format Conventions
 

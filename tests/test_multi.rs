@@ -1,7 +1,8 @@
 mod helpers;
 
 use anyhow::Result;
-use helpers::{FastaBuilder, SamBuilder, SortOrder, read_metrics_tsv};
+use helpers::read_metrics_tsv;
+use riker_lib::assert_close;
 use riker_lib::commands::alignment::{
     AlignmentSummaryMetric, METRICS_SUFFIX as ALIGNMENT_SUFFIX, MultiAlignmentOptions,
 };
@@ -26,10 +27,16 @@ use riker_lib::commands::wgs::{
     COVERAGE_SUFFIX as WGS_COVERAGE_SUFFIX, METRICS_SUFFIX as WGS_SUFFIX, MultiWgsOptions, Wgs,
     WgsMetrics, WgsOptions,
 };
-use std::path::PathBuf;
+use riker_lib::test_support::{FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read};
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build an output file path by appending a tool's `suffix` to the run `prefix`.
+fn out_path(prefix: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", prefix.display()))
+}
 
 /// Create default per-tool options for the multi command.
 ///
@@ -65,9 +72,12 @@ fn default_per_tool_opts() -> (
     )
 }
 
-fn make_multi(
-    bam_path: &std::path::Path,
-    prefix: &std::path::Path,
+/// Build a `Multi` over `bam_path` writing to `prefix`, optionally with a
+/// `reference`, running `collectors` with default per-tool options.
+fn build_multi(
+    bam_path: &Path,
+    prefix: &Path,
+    reference: Option<&Path>,
     collectors: Vec<CollectorKind>,
 ) -> Multi {
     let (wgs_opts, isize_opts, hybcap_opts, gcbias_opts, alignment_opts, error_opts) =
@@ -75,7 +85,7 @@ fn make_multi(
     Multi {
         input: InputOptions { input: bam_path.to_path_buf() },
         output: OutputOptions { output: prefix.to_path_buf() },
-        reference: OptionalReferenceOptions { reference: None },
+        reference: OptionalReferenceOptions { reference: reference.map(Path::to_path_buf) },
 
         tools: collectors,
         wgs_opts,
@@ -84,60 +94,42 @@ fn make_multi(
         gcbias_opts,
         alignment_opts,
         error_opts,
-        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
+        rna_opts: RnaOptions::default().into(),
     }
 }
 
+/// A `Multi` with no reference.
+fn make_multi(bam_path: &Path, prefix: &Path, collectors: Vec<CollectorKind>) -> Multi {
+    build_multi(bam_path, prefix, None, collectors)
+}
+
+/// A `Multi` with a reference (required by wgs/gcbias).
 fn make_multi_with_ref(
-    bam_path: &std::path::Path,
-    prefix: &std::path::Path,
-    ref_path: &std::path::Path,
+    bam_path: &Path,
+    prefix: &Path,
+    ref_path: &Path,
     collectors: Vec<CollectorKind>,
 ) -> Multi {
-    let (wgs_opts, isize_opts, hybcap_opts, gcbias_opts, alignment_opts, error_opts) =
-        default_per_tool_opts();
-    Multi {
-        input: InputOptions { input: bam_path.to_path_buf() },
-        output: OutputOptions { output: prefix.to_path_buf() },
-        reference: OptionalReferenceOptions { reference: Some(ref_path.to_path_buf()) },
-
-        tools: collectors,
-        wgs_opts,
-        isize_opts,
-        hybcap_opts,
-        gcbias_opts,
-        alignment_opts,
-        error_opts,
-        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
-    }
+    build_multi(bam_path, prefix, Some(ref_path), collectors)
 }
 
+/// Five FR pairs (insert 200) spread across chr1 — the standard multi input.
 fn build_test_bam() -> Result<tempfile::NamedTempFile> {
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     for i in 0..5 {
-        builder.add_pair(
-            &format!("read{i}"),
-            0,
-            100 + i * 200,
-            300 + i * 200,
-            200,
-            60,
-            100,
-            false,
-            false,
-        );
+        sam.add(pair(sam.next_id()).fr("chr1", (100 + i * 200)..(300 + i * 200)));
     }
-    builder.to_temp_bam()
+    sam.to_temp_bam()
 }
 
 /// Build a coordinate-sorted BAM with a known contig length for WGS tests.
 fn build_wgs_test_bam(contig_len: usize) -> Result<tempfile::NamedTempFile> {
-    let contigs = vec![("chr1".to_string(), contig_len)];
-    let mut builder = SamBuilder::with_contigs(&contigs).sort_order(SortOrder::Coordinate);
-    for i in 0..5 {
-        builder.add_pair(&format!("r{i}"), 0, 1, 11, 20, 60, 10, false, false);
+    let mut sam = SamBuilder::with_contigs(&[("chr1".to_string(), contig_len)])
+        .sort_order(SortOrder::Coordinate);
+    for _ in 0..5 {
+        sam.add(pair(sam.next_id()).fr("chr1", 1..21).len(10));
     }
-    builder.to_temp_bam()
+    sam.to_temp_bam()
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -152,8 +144,8 @@ fn test_both_collectors() -> Result<()> {
         .execute(None)?;
 
     // Both output files should exist and contain data.
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
 
     assert!(isize_path.exists(), "isize metrics file should exist");
     assert!(alignment_path.exists(), "alignment metrics file should exist");
@@ -179,8 +171,8 @@ fn test_isize_only() -> Result<()> {
 
     make_multi(bam.path(), &prefix, vec![CollectorKind::Isize]).execute(None)?;
 
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
 
     assert!(isize_path.exists(), "isize metrics file should exist");
     assert!(!alignment_path.exists(), "alignment metrics file should NOT exist");
@@ -199,8 +191,8 @@ fn test_alignment_only() -> Result<()> {
 
     make_multi(bam.path(), &prefix, vec![CollectorKind::Alignment]).execute(None)?;
 
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
 
     assert!(!isize_path.exists(), "isize metrics file should NOT exist");
     assert!(alignment_path.exists(), "alignment metrics file should exist");
@@ -217,12 +209,12 @@ fn test_rna_through_multi_writes_metrics() -> Result<()> {
     // rna is wired into multi (CollectorKind::Rna + MultiRnaOptions); exercise that path
     // end-to-end so an integration break in build_collectors/execute is caught. rna needs a
     // coordinate-sorted input and a gene model.
-    let mut b = SamBuilder::with_contigs(&[("chr1".to_string(), 100_000)])
+    let mut sam = SamBuilder::with_contigs(&[("chr1".to_string(), 100_000)])
         .sort_order(SortOrder::Coordinate);
-    b.add_unpaired("coding", 0, 1500, 60, 100, false, false, false, None);
-    b.add_unpaired("utr", 0, 1000, 60, 100, false, false, false, None);
-    b.add_unpaired("intron", 0, 2400, 60, 100, false, false, false, None);
-    let bam = b.to_temp_bam()?;
+    sam.add(read().name("coding").at("chr1", 1500));
+    sam.add(read().name("utr").at("chr1", 1000));
+    sam.add(read().name("intron").at("chr1", 2400));
+    let bam = sam.to_temp_bam()?;
 
     // Two-exon coding gene MYGENE on chr1 (refFlat, 0-based half-open).
     let gm = tempfile::NamedTempFile::new()?;
@@ -233,25 +225,12 @@ fn test_rna_through_multi_writes_metrics() -> Result<()> {
 
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
-    let (wgs_opts, isize_opts, hybcap_opts, gcbias_opts, alignment_opts, error_opts) =
-        default_per_tool_opts();
-    let multi = Multi {
-        input: InputOptions { input: bam.path().to_path_buf() },
-        output: OutputOptions { output: prefix.clone() },
-        reference: OptionalReferenceOptions { reference: None },
-        tools: vec![CollectorKind::Rna],
-        wgs_opts,
-        isize_opts,
-        hybcap_opts,
-        gcbias_opts,
-        alignment_opts,
-        error_opts,
-        rna_opts: RnaOptions { gene_model: gm.path().to_path_buf(), ..Default::default() }.into(),
-    };
+    let mut multi = build_multi(bam.path(), &prefix, None, vec![CollectorKind::Rna]);
+    multi.rna_opts =
+        RnaOptions { gene_model: gm.path().to_path_buf(), ..Default::default() }.into();
     multi.execute(None)?;
 
-    let metrics: Vec<RnaSeqMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{RNA_METRICS_SUFFIX}", prefix.display())))?;
+    let metrics: Vec<RnaSeqMetric> = read_metrics_tsv(&out_path(&prefix, RNA_METRICS_SUFFIX))?;
     assert_eq!(metrics.len(), 1, "rna via multi should write exactly one summary row");
     assert_eq!(metrics[0].mapped_reads, 3, "all three mapped reads should be counted");
 
@@ -281,17 +260,17 @@ fn test_matches_standalone_isize() -> Result<()> {
     standalone.execute(None)?;
 
     let multi_metrics: Vec<InsertSizeMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix_multi.display())))?;
+        read_metrics_tsv(&out_path(&prefix_multi, ISIZE_SUFFIX))?;
     let standalone_metrics: Vec<InsertSizeMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix_standalone.display())))?;
+        read_metrics_tsv(&out_path(&prefix_standalone, ISIZE_SUFFIX))?;
 
     assert_eq!(multi_metrics.len(), standalone_metrics.len());
     for (m, s) in multi_metrics.iter().zip(standalone_metrics.iter()) {
         assert_eq!(m.pair_orientation, s.pair_orientation);
         assert_eq!(m.read_pairs, s.read_pairs);
-        assert!((m.mean_insert_size - s.mean_insert_size).abs() < 1e-6);
-        assert!((m.median_insert_size - s.median_insert_size).abs() < 1e-6);
-        assert!((m.standard_deviation - s.standard_deviation).abs() < 1e-6);
+        assert_close!(m.mean_insert_size, s.mean_insert_size, 1e-6);
+        assert_close!(m.median_insert_size, s.median_insert_size, 1e-6);
+        assert_close!(m.standard_deviation, s.standard_deviation, 1e-6);
     }
 
     Ok(())
@@ -299,8 +278,8 @@ fn test_matches_standalone_isize() -> Result<()> {
 
 #[test]
 fn test_empty_bam() -> Result<()> {
-    let builder = SamBuilder::new();
-    let bam = builder.to_temp_bam()?;
+    let sam = SamBuilder::new();
+    let bam = sam.to_temp_bam()?;
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
@@ -308,8 +287,8 @@ fn test_empty_bam() -> Result<()> {
         .execute(None)?;
 
     // Both files should exist (even if empty / with zero counts).
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
 
     assert!(isize_path.exists(), "isize metrics file should exist for empty BAM");
     assert!(alignment_path.exists(), "alignment metrics file should exist for empty BAM");
@@ -321,7 +300,7 @@ fn test_empty_bam() -> Result<()> {
 
 #[test]
 fn test_wgs_collector() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let bam = build_wgs_test_bam(20)?;
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
@@ -329,8 +308,8 @@ fn test_wgs_collector() -> Result<()> {
     make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::Wgs])
         .execute(None)?;
 
-    let wgs_path = PathBuf::from(format!("{}{WGS_SUFFIX}", prefix.display()));
-    let cov_path = PathBuf::from(format!("{}{WGS_COVERAGE_SUFFIX}", prefix.display()));
+    let wgs_path = out_path(&prefix, WGS_SUFFIX);
+    let cov_path = out_path(&prefix, WGS_COVERAGE_SUFFIX);
 
     assert!(wgs_path.exists(), "WGS metrics file should exist");
     assert!(cov_path.exists(), "WGS coverage file should exist");
@@ -344,7 +323,7 @@ fn test_wgs_collector() -> Result<()> {
 
 #[test]
 fn test_all_collectors() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let bam = build_wgs_test_bam(20)?;
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
@@ -357,9 +336,9 @@ fn test_all_collectors() -> Result<()> {
     )
     .execute(None)?;
 
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
-    let wgs_path = PathBuf::from(format!("{}{WGS_SUFFIX}", prefix.display()));
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
+    let wgs_path = out_path(&prefix, WGS_SUFFIX);
 
     assert!(alignment_path.exists(), "alignment metrics file should exist");
     assert!(isize_path.exists(), "isize metrics file should exist");
@@ -370,7 +349,7 @@ fn test_all_collectors() -> Result<()> {
 
 #[test]
 fn test_matches_standalone_wgs() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let bam = build_wgs_test_bam(20)?;
 
     // Run multi with WGS only.
@@ -391,21 +370,20 @@ fn test_matches_standalone_wgs() -> Result<()> {
     };
     standalone.execute(None)?;
 
-    let multi_metrics: Vec<WgsMetrics> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{WGS_SUFFIX}", prefix_multi.display())))?;
+    let multi_metrics: Vec<WgsMetrics> = read_metrics_tsv(&out_path(&prefix_multi, WGS_SUFFIX))?;
     let standalone_metrics: Vec<WgsMetrics> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{WGS_SUFFIX}", prefix_standalone.display())))?;
+        read_metrics_tsv(&out_path(&prefix_standalone, WGS_SUFFIX))?;
 
     assert_eq!(multi_metrics.len(), standalone_metrics.len());
     assert_eq!(multi_metrics.len(), 1);
     let m = &multi_metrics[0];
     let s = &standalone_metrics[0];
     assert_eq!(m.genome_territory, s.genome_territory);
-    assert!((m.mean_coverage - s.mean_coverage).abs() < 1e-6);
-    assert!((m.median_coverage - s.median_coverage).abs() < 1e-6);
-    assert!((m.sd_coverage - s.sd_coverage).abs() < 1e-6);
-    assert!((m.frac_bases_at_1x - s.frac_bases_at_1x).abs() < 1e-6);
-    assert!((m.frac_bases_at_5x - s.frac_bases_at_5x).abs() < 1e-6);
+    assert_close!(m.mean_coverage, s.mean_coverage, 1e-6);
+    assert_close!(m.median_coverage, s.median_coverage, 1e-6);
+    assert_close!(m.sd_coverage, s.sd_coverage, 1e-6);
+    assert_close!(m.frac_bases_at_1x, s.frac_bases_at_1x, 1e-6);
+    assert_close!(m.frac_bases_at_5x, s.frac_bases_at_5x, 1e-6);
 
     Ok(())
 }
@@ -430,7 +408,7 @@ fn test_wgs_requires_reference() {
 
 #[test]
 fn test_gcbias_collector() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let bam = build_wgs_test_bam(20)?;
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
@@ -438,8 +416,8 @@ fn test_gcbias_collector() -> Result<()> {
     make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::GcBias])
         .execute(None)?;
 
-    let detail_path = PathBuf::from(format!("{}{GCBIAS_DETAIL_SUFFIX}", prefix.display()));
-    let summary_path = PathBuf::from(format!("{}{GCBIAS_SUMMARY_SUFFIX}", prefix.display()));
+    let detail_path = out_path(&prefix, GCBIAS_DETAIL_SUFFIX);
+    let summary_path = out_path(&prefix, GCBIAS_SUMMARY_SUFFIX);
 
     assert!(detail_path.exists(), "gcbias detail file should exist");
     assert!(summary_path.exists(), "gcbias summary file should exist");
@@ -478,8 +456,8 @@ fn test_duplicate_collectors_deduplicated() -> Result<()> {
     )
     .execute(None)?;
 
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
 
     assert!(alignment_path.exists(), "alignment metrics should exist");
     assert!(isize_path.exists(), "isize metrics should exist");
@@ -514,23 +492,21 @@ fn test_parallel_matches_single_threaded_isize_alignment() -> Result<()> {
 
     // Compare isize metrics.
     let single_isize: Vec<InsertSizeMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", single_prefix.display())))?;
+        read_metrics_tsv(&out_path(&single_prefix, ISIZE_SUFFIX))?;
     let parallel_isize: Vec<InsertSizeMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", parallel_prefix.display())))?;
+        read_metrics_tsv(&out_path(&parallel_prefix, ISIZE_SUFFIX))?;
     assert_eq!(single_isize.len(), parallel_isize.len());
     for (s, p) in single_isize.iter().zip(parallel_isize.iter()) {
         assert_eq!(s.pair_orientation, p.pair_orientation);
         assert_eq!(s.read_pairs, p.read_pairs);
-        assert!((s.mean_insert_size - p.mean_insert_size).abs() < 1e-6);
+        assert_close!(s.mean_insert_size, p.mean_insert_size, 1e-6);
     }
 
     // Compare alignment metrics.
     let single_align: Vec<AlignmentSummaryMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", single_prefix.display())))?;
-    let parallel_align: Vec<AlignmentSummaryMetric> = read_metrics_tsv(&PathBuf::from(format!(
-        "{}{ALIGNMENT_SUFFIX}",
-        parallel_prefix.display()
-    )))?;
+        read_metrics_tsv(&out_path(&single_prefix, ALIGNMENT_SUFFIX))?;
+    let parallel_align: Vec<AlignmentSummaryMetric> =
+        read_metrics_tsv(&out_path(&parallel_prefix, ALIGNMENT_SUFFIX))?;
     assert_eq!(single_align.len(), parallel_align.len());
     for (s, p) in single_align.iter().zip(parallel_align.iter()) {
         assert_eq!(s.category, p.category);
@@ -577,7 +553,7 @@ fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
 
 #[test]
 fn test_parallel_all_collectors() -> Result<()> {
-    let refa = FastaBuilder::new().add_contig("chr1", &[b'A'; 20]).to_temp_fasta()?;
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
     let bam = build_wgs_test_bam(20)?;
 
     // Single-threaded.
@@ -598,21 +574,17 @@ fn test_parallel_all_collectors() -> Result<()> {
     make_multi_with_ref(bam.path(), &parallel_prefix, refa.path(), collectors).execute(Some(3))?;
 
     // Compare WGS metrics.
-    let single_wgs: Vec<WgsMetrics> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{WGS_SUFFIX}", single_prefix.display())))?;
-    let parallel_wgs: Vec<WgsMetrics> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{WGS_SUFFIX}", parallel_prefix.display())))?;
+    let single_wgs: Vec<WgsMetrics> = read_metrics_tsv(&out_path(&single_prefix, WGS_SUFFIX))?;
+    let parallel_wgs: Vec<WgsMetrics> = read_metrics_tsv(&out_path(&parallel_prefix, WGS_SUFFIX))?;
     assert_eq!(single_wgs.len(), parallel_wgs.len());
     assert_eq!(single_wgs[0].genome_territory, parallel_wgs[0].genome_territory);
-    assert!((single_wgs[0].mean_coverage - parallel_wgs[0].mean_coverage).abs() < 1e-6);
+    assert_close!(single_wgs[0].mean_coverage, parallel_wgs[0].mean_coverage, 1e-6);
 
     // Compare alignment metrics.
     let single_align: Vec<AlignmentSummaryMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", single_prefix.display())))?;
-    let parallel_align: Vec<AlignmentSummaryMetric> = read_metrics_tsv(&PathBuf::from(format!(
-        "{}{ALIGNMENT_SUFFIX}",
-        parallel_prefix.display()
-    )))?;
+        read_metrics_tsv(&out_path(&single_prefix, ALIGNMENT_SUFFIX))?;
+    let parallel_align: Vec<AlignmentSummaryMetric> =
+        read_metrics_tsv(&out_path(&parallel_prefix, ALIGNMENT_SUFFIX))?;
     assert_eq!(single_align.len(), parallel_align.len());
     for (s, p) in single_align.iter().zip(parallel_align.iter()) {
         assert_eq!(s.category, p.category);
@@ -630,21 +602,11 @@ fn test_parallel_all_collectors() -> Result<()> {
 fn test_parallel_more_threads_than_collectors() -> Result<()> {
     // BATCH_SIZE is 128 inside multi.rs — build enough pairs to produce
     // several batches so the worker drains across multiple channel fills.
-    let mut builder = SamBuilder::new();
+    let mut sam = SamBuilder::new();
     for i in 0..1000 {
-        builder.add_pair(
-            &format!("read{i}"),
-            0,
-            100 + i * 50,
-            300 + i * 50,
-            200,
-            60,
-            100,
-            false,
-            false,
-        );
+        sam.add(pair(sam.next_id()).fr("chr1", (100 + i * 50)..(300 + i * 50)));
     }
-    let bam = builder.to_temp_bam()?;
+    let bam = sam.to_temp_bam()?;
 
     // Single-threaded baseline.
     let single_dir = TempDir::new()?;
@@ -658,32 +620,31 @@ fn test_parallel_more_threads_than_collectors() -> Result<()> {
     let parallel_prefix = parallel_dir.path().join("out");
     make_multi(bam.path(), &parallel_prefix, vec![CollectorKind::Isize]).execute(Some(4))?;
 
-    let single: Vec<InsertSizeMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", single_prefix.display())))?;
+    let single: Vec<InsertSizeMetric> = read_metrics_tsv(&out_path(&single_prefix, ISIZE_SUFFIX))?;
     let parallel: Vec<InsertSizeMetric> =
-        read_metrics_tsv(&PathBuf::from(format!("{}{ISIZE_SUFFIX}", parallel_prefix.display())))?;
+        read_metrics_tsv(&out_path(&parallel_prefix, ISIZE_SUFFIX))?;
     assert_eq!(single.len(), parallel.len());
     assert!(!single.is_empty());
     for (s, p) in single.iter().zip(parallel.iter()) {
         assert_eq!(s.pair_orientation, p.pair_orientation);
         assert_eq!(s.read_pairs, p.read_pairs);
-        assert!((s.mean_insert_size - p.mean_insert_size).abs() < 1e-6);
+        assert_close!(s.mean_insert_size, p.mean_insert_size, 1e-6);
     }
     Ok(())
 }
 
 #[test]
 fn test_parallel_empty_bam() -> Result<()> {
-    let builder = SamBuilder::new();
-    let bam = builder.to_temp_bam()?;
+    let sam = SamBuilder::new();
+    let bam = sam.to_temp_bam()?;
     let dir = TempDir::new()?;
     let prefix = dir.path().join("out");
 
     make_multi(bam.path(), &prefix, vec![CollectorKind::Isize, CollectorKind::Alignment])
         .execute(Some(2))?;
 
-    let isize_path = PathBuf::from(format!("{}{ISIZE_SUFFIX}", prefix.display()));
-    let alignment_path = PathBuf::from(format!("{}{ALIGNMENT_SUFFIX}", prefix.display()));
+    let isize_path = out_path(&prefix, ISIZE_SUFFIX);
+    let alignment_path = out_path(&prefix, ALIGNMENT_SUFFIX);
 
     assert!(isize_path.exists(), "isize metrics file should exist for empty BAM");
     assert!(alignment_path.exists(), "alignment metrics file should exist for empty BAM");
@@ -722,7 +683,6 @@ fn test_hybcap_targets_not_required_when_not_selected() -> Result<()> {
 
 #[test]
 fn test_hybcap_via_multi() -> Result<()> {
-    use helpers::coord_builder;
     use std::io::Write;
 
     let dir = TempDir::new()?;
@@ -742,39 +702,21 @@ fn test_hybcap_via_multi() -> Result<()> {
     // Build a BAM with reads overlapping the target.
     let mut bld = coord_builder(&[("chr1", 10_000)]);
     for i in 0..5 {
-        bld.add_pair(&format!("r{i}"), 0, 101 + i * 10, 151 + i * 10, 50, 60, 50, false, false);
+        bld.add(pair(bld.next_id()).at("chr1", 101 + i * 10, 151 + i * 10).len(50));
     }
     let bam = bld.to_temp_bam()?;
 
     let prefix = dir.path().join("out");
-    let (wgs_opts, isize_opts, _, gcbias_opts, alignment_opts, error_opts) =
-        default_per_tool_opts();
-
-    // Build hybcap multi opts with the required baits/targets paths.
-    let hybcap_opts: MultiHybCapOptions = riker_lib::commands::hybcap::HybCapOptions {
+    let mut multi = build_multi(bam.path(), &prefix, None, vec![CollectorKind::HybCap]);
+    multi.hybcap_opts = riker_lib::commands::hybcap::HybCapOptions {
         baits: bait_path,
         targets: target_path,
         ..riker_lib::commands::hybcap::HybCapOptions::default()
     }
     .into();
-
-    let multi = Multi {
-        input: InputOptions { input: bam.path().to_path_buf() },
-        output: OutputOptions { output: prefix.clone() },
-        reference: OptionalReferenceOptions { reference: None },
-
-        tools: vec![CollectorKind::HybCap],
-        wgs_opts,
-        isize_opts,
-        hybcap_opts,
-        gcbias_opts,
-        alignment_opts,
-        error_opts,
-        rna_opts: riker_lib::commands::rna::RnaOptions::default().into(),
-    };
     multi.execute(None)?;
 
-    let metrics_path = PathBuf::from(format!("{}{HYBCAP_SUFFIX}", prefix.display()));
+    let metrics_path = out_path(&prefix, HYBCAP_SUFFIX);
     assert!(metrics_path.exists(), "hybcap metrics file should exist");
 
     let metrics: Vec<HybCapMetric> = read_metrics_tsv(&metrics_path)?;
