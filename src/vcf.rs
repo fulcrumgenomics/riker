@@ -9,7 +9,7 @@ use noodles::vcf;
 use noodles_bgzf as bgzf;
 
 use crate::intervals::Intervals;
-use crate::sam::alignment_reader::append_extension;
+use crate::path_util::append_extension;
 use crate::sequence_dict::SequenceDictionary;
 
 /// An indexed variant reader supporting both VCF (bgzip-compressed) and BCF formats.

@@ -592,21 +592,25 @@ mod tests {
 
     #[test]
     fn high_nibble_mask_prevents_cross_byte_leak() {
-        // This test would fail if we forgot the `& 0x0F0F` after the u16
-        // shift: when packed[i] has bit 7 set AND packed[i+1] has a low
-        // nibble with bit 0 clear, the u16 shift would pull packed[i+1]
-        // bits into packed[i]'s high-nibble output.
-        let packed = vec![0xF8, 0x18, 0xF0, 0x01]; // 8 bases
-        // Per-byte decode:
+        // This test would fail if we forgot the `& 0x0F0F` after the u16 shift: when
+        // packed[i] has bit 7 set AND packed[i+1] has a low nibble with bit 0 clear, the
+        // u16 shift would pull packed[i+1]'s bits into packed[i]'s high-nibble output.
+        //
+        // Pad to a full 16-byte chunk so the leak-prone bytes go through the SIMD path
+        // (u16 shift + mask), not the scalar tail.
+        let mut packed = vec![0xF8, 0x18, 0xF0, 0x01];
+        packed.resize(16, 0x00); // padding bytes → nibble 0 → '=' bases
+        // First four bytes decode as:
         //   0xF8 → high=F(N), low=8(T)
         //   0x18 → high=1(A), low=8(T)
         //   0xF0 → high=F(N), low=0(=)
         //   0x01 → high=0(=), low=1(A)
-        let expected: Vec<u8> = b"NTATN==A".to_vec();
+        let mut expected = b"NTATN==A".to_vec();
+        expected.resize(32, b'='); // 12 padding bytes → 24 '=' bases
         // Sanity check: b'=' is 0x3D.
         assert_eq!(expected[5], b'=');
         let mut out = Vec::new();
-        decode_packed_sequence_into(&packed, 8, &mut out);
+        decode_packed_sequence_into(&packed, 32, &mut out);
         assert_eq!(out, expected);
     }
 }

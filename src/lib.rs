@@ -13,6 +13,7 @@ pub mod intervals;
 pub mod math;
 pub mod metrics;
 pub mod overlapper;
+pub mod path_util;
 pub mod plotting;
 pub mod progress;
 pub mod sam;

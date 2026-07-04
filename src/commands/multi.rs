@@ -200,16 +200,6 @@ pub struct Multi {
 }
 
 impl Multi {
-    /// The `--reference` path for a [`CollectorKind::requires_reference`] tool. Reference
-    /// presence is validated up-front in `execute`, so this errors only if a caller reaches
-    /// `build_collectors` for such a tool without validating first.
-    fn required_reference_path(&self) -> Result<&Path> {
-        self.reference
-            .reference
-            .as_deref()
-            .ok_or_else(|| anyhow!("a reference is required but --reference was not provided"))
-    }
-
     /// Build the list of collectors based on the deduplicated kinds.
     fn build_collectors(
         &self,
@@ -305,6 +295,16 @@ impl Multi {
             }
         }
         Ok(collectors)
+    }
+
+    /// The `--reference` path for a [`CollectorKind::requires_reference`] tool. Reference
+    /// presence is validated up-front in `execute`, so this errors only if a caller reaches
+    /// `build_collectors` for such a tool without validating first.
+    fn required_reference_path(&self) -> Result<&Path> {
+        self.reference
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow!("a reference is required but --reference was not provided"))
     }
 }
 

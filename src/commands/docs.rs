@@ -20,23 +20,6 @@ use crate::commands::rna::{
 use crate::commands::wgs::{WgsCoverageEntry, WgsMetrics};
 use crate::metrics::{render_metric_docs_markdown, render_metric_docs_text};
 
-/// Print documentation for all metric types produced by riker.
-///
-/// Lists every metric field with its description for each output file
-/// type. Supports plain text and markdown table formats. Output is
-/// written to stdout, or to the file specified by -o/--output.
-#[derive(Args, Debug, Clone)]
-#[command(long_about)]
-pub struct Docs {
-    /// Output format: "text" for plain text, "markdown" for markdown tables.
-    #[arg(long, default_value = "text")]
-    pub format: String,
-
-    /// Output file path. Defaults to stdout when not specified.
-    #[arg(short = 'o', long)]
-    pub output: Option<PathBuf>,
-}
-
 /// Render docs for every metric type, in a fixed order, separated by blank lines, with
 /// the given per-type renderer (`render_metric_docs_text` / `render_metric_docs_markdown`).
 /// The type list lives here once so the output formats can't drift — adding a metric means
@@ -75,6 +58,23 @@ macro_rules! render_all_metric_docs {
             $render::<$rest>($out)?;
         )*
     }};
+}
+
+/// Print documentation for all metric types produced by riker.
+///
+/// Lists every metric field with its description for each output file
+/// type. Supports plain text and markdown table formats. Output is
+/// written to stdout, or to the file specified by -o/--output.
+#[derive(Args, Debug, Clone)]
+#[command(long_about)]
+pub struct Docs {
+    /// Output format: "text" for plain text, "markdown" for markdown tables.
+    #[arg(long, default_value = "text")]
+    pub format: String,
+
+    /// Output file path. Defaults to stdout when not specified.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
 }
 
 impl Command for Docs {
