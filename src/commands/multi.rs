@@ -200,6 +200,16 @@ pub struct Multi {
 }
 
 impl Multi {
+    /// The `--reference` path for a [`CollectorKind::requires_reference`] tool. Reference
+    /// presence is validated up-front in `execute`, so this errors only if a caller reaches
+    /// `build_collectors` for such a tool without validating first.
+    fn required_reference_path(&self) -> Result<&Path> {
+        self.reference
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow!("a reference is required but --reference was not provided"))
+    }
+
     /// Build the list of collectors based on the deduplicated kinds.
     fn build_collectors(
         &self,
@@ -225,12 +235,12 @@ impl Multi {
                     )));
                 }
                 CollectorKind::Error => {
-                    let ref_path = self.reference.reference.as_ref().unwrap();
+                    let ref_path = self.required_reference_path()?;
                     let reference = Fasta::from_path(ref_path)?;
                     let mut error_opts = self.error_opts.clone();
                     // Fall back to global --reference if --error::reference not set
                     if error_opts.error_reference.is_none() {
-                        error_opts.error_reference = Some(ref_path.clone());
+                        error_opts.error_reference = Some(ref_path.to_path_buf());
                     }
                     let opts = error_opts.validate()?;
                     collectors.push(Box::new(ErrorCollector::new(
@@ -241,8 +251,7 @@ impl Multi {
                     )?));
                 }
                 CollectorKind::GcBias => {
-                    let ref_path = self.reference.reference.as_ref().unwrap();
-                    let reference = Fasta::from_path(ref_path)?;
+                    let reference = Fasta::from_path(self.required_reference_path()?)?;
                     let opts = self.gcbias_opts.clone().validate()?;
                     collectors.push(Box::new(GcBiasCollector::new(
                         &self.input.input,
@@ -284,8 +293,7 @@ impl Multi {
                     )));
                 }
                 CollectorKind::Wgs => {
-                    let ref_path = self.reference.reference.as_ref().unwrap();
-                    let reference = Fasta::from_path(ref_path)?;
+                    let reference = Fasta::from_path(self.required_reference_path()?)?;
                     let opts = self.wgs_opts.clone().validate()?;
                     collectors.push(Box::new(WgsCollector::new(
                         &self.input.input,
@@ -315,19 +323,11 @@ impl Command for Multi {
             }
         }
 
-        // Validate required inputs for selected collectors.
+        // Validate required inputs for selected collectors. The set of tools that need a
+        // reference lives once on CollectorKind::requires_reference.
         for kind in &seen {
-            match kind {
-                CollectorKind::Error if self.reference.reference.is_none() => {
-                    return Err(anyhow!("Error collector requires --reference"));
-                }
-                CollectorKind::GcBias if self.reference.reference.is_none() => {
-                    return Err(anyhow!("GC bias collector requires --reference"));
-                }
-                CollectorKind::Wgs if self.reference.reference.is_none() => {
-                    return Err(anyhow!("WGS collector requires --reference"));
-                }
-                _ => {}
+            if kind.requires_reference() && self.reference.reference.is_none() {
+                return Err(anyhow!("{kind} collector requires --reference"));
             }
         }
 
@@ -388,6 +388,13 @@ pub enum CollectorKind {
     Rna,
     /// Whole-genome sequencing coverage metrics.
     Wgs,
+}
+
+impl CollectorKind {
+    /// Whether this collector needs `--reference` to run (error, gcbias, wgs).
+    fn requires_reference(self) -> bool {
+        matches!(self, Self::Error | Self::GcBias | Self::Wgs)
+    }
 }
 
 impl fmt::Display for CollectorKind {
