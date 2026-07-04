@@ -1799,7 +1799,7 @@ impl ReadLevelCache {
 
         let mapq = record.mapping_quality().map(|m| CovariateValue::Int(u32::from(m.get())));
 
-        let nm_raw = get_nm_tag(record);
+        let nm_raw = crate::sam::record_utils::get_integer_tag(record, *b"NM");
 
         Self { read_num, strand, pair_orientation, isize_val, gc, mapq, nm_raw }
     }
@@ -2008,12 +2008,6 @@ fn compute_hp_length(record: &RikerRecord, read_offset: usize, is_reverse: bool)
         }
         count
     }
-}
-
-/// Extract the NM tag value from a record.
-fn get_nm_tag(record: &RikerRecord) -> Option<u32> {
-    let v = record.aux_tag(*b"NM")?.as_int()?;
-    u32::try_from(v).ok()
 }
 
 /// Compute a phred-scaled Q-score from error count and total.
