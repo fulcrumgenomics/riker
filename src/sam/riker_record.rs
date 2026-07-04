@@ -490,11 +490,7 @@ impl BamRec {
     pub(crate) fn decode_sequence(&mut self) {
         let seq_view = self.inner.sequence();
         let packed: &[u8] = seq_view.as_ref();
-        super::simd_seq::decode_packed_sequence_into(
-            packed,
-            seq_view.len(),
-            &mut self.sequence_buf,
-        );
+        crate::simd::decode_packed_sequence_into(packed, seq_view.len(), &mut self.sequence_buf);
         self.sequence_populated = true;
     }
 
@@ -736,11 +732,7 @@ impl HtslibRec {
     /// layout as BAM, so the noodles-side decoder works unmodified.
     pub(crate) fn decode_sequence(&mut self) {
         let seq = self.inner.seq();
-        super::simd_seq::decode_packed_sequence_into(
-            seq.encoded,
-            seq.len(),
-            &mut self.sequence_buf,
-        );
+        crate::simd::decode_packed_sequence_into(seq.encoded, seq.len(), &mut self.sequence_buf);
         self.sequence_populated = true;
     }
 
