@@ -237,7 +237,7 @@ impl WgsCollector {
             plot_path,
             plot_title: String::new(),
             input_path: input.to_path_buf(),
-            depth: ContigDepth::new(options.coverage_cap),
+            depth: ContigDepth::new(),
             mate_buffer: MateBuffer::new(),
             reference,
             intervals,
@@ -462,31 +462,49 @@ impl WgsCollector {
         let intervals_bv = self.intervals.as_ref().map(|intervals| intervals.contig_bitvec(ref_id));
 
         let contig_len = self.depth.len();
-        let capped = self.coverage_cap;
-        let n_runs = runs.len();
-        let mut run_idx = 0usize;
+        let cap = self.coverage_cap;
+
+        // Walk the non-N runs directly rather than every position: only run
+        // positions can be eligible (finalize masks N gaps out), so histogram
+        // each run's contiguous depth slice and bulk-zero the N gaps between
+        // them. The whole array still ends up zeroed for the next contig, but
+        // the per-position run-pointer and interval branch fall out of the hot
+        // slice loop, and gap positions cost one vectorized fill instead of a
+        // read-modify-write each.
         let mut eligible: u64 = 0;
-        for pos in 0..contig_len {
-            // Drain (and zero) every slot so the array is reset for the next
-            // contig without a separate memset — including N-gap positions,
-            // which reads can push depth into via deletions.
-            let depth = self.depth.take(pos);
-            // Advance the pointer so `runs[run_idx]` is the first run whose end
-            // is past `pos`; the runs are sorted and non-overlapping.
-            while run_idx < n_runs && pos >= runs[run_idx].1 as usize {
-                run_idx += 1;
+        let mut cursor = 0usize;
+        for &(start, end) in &runs {
+            let (start, end) = (start as usize, end as usize);
+            self.depth.zero_range(cursor, start);
+            let slice = self.depth.slice_mut(start, end - start);
+            match &intervals_bv {
+                None => {
+                    // Every position in the run is eligible.
+                    for slot in slice.iter_mut() {
+                        let idx = (*slot).min(cap) as usize;
+                        self.depth_histogram[idx] += 1;
+                        *slot = 0;
+                    }
+                    eligible += (end - start) as u64;
+                }
+                Some(bv) => {
+                    // Only positions inside the interval mask are eligible; all
+                    // positions are still zeroed for reuse.
+                    for (offset, slot) in slice.iter_mut().enumerate() {
+                        let pos = start + offset;
+                        if pos < bv.len() && bv[pos] {
+                            let idx = (*slot).min(cap) as usize;
+                            self.depth_histogram[idx] += 1;
+                            eligible += 1;
+                        }
+                        *slot = 0;
+                    }
+                }
             }
-            // Non-N iff `pos` has entered the current run. Also require the
-            // optional intervals mask.
-            let non_n_ok = run_idx < n_runs && pos >= runs[run_idx].0 as usize;
-            let interval_ok = intervals_bv.as_ref().is_none_or(|bv| pos < bv.len() && bv[pos]);
-            if !non_n_ok || !interval_ok {
-                continue;
-            }
-            eligible += 1;
-            let idx = depth.min(capped) as usize;
-            self.depth_histogram[idx] += 1;
+            cursor = end;
         }
+        // Zero the trailing N gap after the last run.
+        self.depth.zero_range(cursor, contig_len);
         self.genome_territory += eligible;
     }
 
@@ -612,6 +630,13 @@ impl WgsCollector {
         let quals: &[u8] = record.quality_scores();
         let contig_len_u64 = self.depth.len() as u64;
         let min_bq = self.min_bq;
+        let cap = self.coverage_cap;
+        // Per-record exclusion tallies, folded into the collector's counters once
+        // at the end so the hot per-base loop touches only locals and the depth
+        // slice, never scattered `self` fields.
+        let mut excl_baseq: u64 = 0;
+        let mut excl_overlap: u64 = 0;
+        let mut excl_capped: u64 = 0;
 
         for (ref_off, read_off, len) in iter_aligned_blocks(record) {
             let block_ref_start = ref_start_u64 + u64::from(ref_off);
@@ -635,28 +660,41 @@ impl WgsCollector {
             let read_start = (read_off as usize).min(quals.len());
             let read_end = (read_start + usable as usize).min(quals.len());
             let available = &quals[read_start..read_end];
+            let n = available.len();
             #[allow(clippy::cast_possible_truncation)]
             let base_pos = block_ref_start as u32;
-            for (i, &q) in available.iter().enumerate() {
+
+            // The block's `n` BQ-scored bases map to the contiguous depth range
+            // `[base_pos, base_pos + n)` (already clamped to the contig), so walk
+            // each depth slot and its qual in lockstep.
+            let depth_slice = self.depth.slice_mut(base_pos as usize, n);
+            for (i, (slot, &q)) in depth_slice.iter_mut().zip(available).enumerate() {
                 if q < min_bq {
-                    self.bases_excl_baseq += 1;
+                    excl_baseq += 1;
+                    continue;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let ref_pos = base_pos + i as u32;
+                if action.is_mate_covered(ref_pos) {
+                    excl_overlap += 1;
                 } else {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let ref_pos = base_pos + i as u32;
-                    if action.is_mate_covered(ref_pos) {
-                        self.bases_excl_overlap += 1;
+                    if *slot < cap {
+                        *slot += 1;
                     } else {
-                        self.depth.push(ref_pos);
-                        action.on_depth_counted(ref_pos);
+                        excl_capped += 1;
                     }
+                    action.on_depth_counted(ref_pos);
                 }
             }
-            // If the qual array is shorter than the CIGAR claims the block
-            // spans (malformed BAM — the spec says they match), the missing
-            // quals can't have passed BQ, so we fold them into the BQ-fail
-            // counter to keep the exclusion totals accurate.
-            self.bases_excl_baseq += (usable as usize - available.len()) as u64;
+            // If the qual array is shorter than the CIGAR claims the block spans
+            // (malformed BAM — the spec says they match), the missing quals can't
+            // have passed BQ, so fold them into the BQ-fail counter.
+            excl_baseq += (usable as usize - n) as u64;
         }
+
+        self.bases_excl_baseq += excl_baseq;
+        self.bases_excl_overlap += excl_overlap;
+        self.depth.add_excl_capped(excl_capped);
     }
 }
 
@@ -915,15 +953,14 @@ pub struct WgsCoverageEntry {
 /// "fresh" state for the next contig (no separate memset needed).
 struct ContigDepth {
     depth: Vec<u16>,
-    coverage_cap: u16,
     /// Running count of bases that arrived at a position already at the cap.
     /// Finalize drains this into the collector-level accumulator.
     excl_capped: u64,
 }
 
 impl ContigDepth {
-    fn new(coverage_cap: u16) -> Self {
-        Self { depth: Vec::new(), coverage_cap, excl_capped: 0 }
+    fn new() -> Self {
+        Self { depth: Vec::new(), excl_capped: 0 }
     }
 
     /// Length of the currently-active contig's depth array.
@@ -939,27 +976,35 @@ impl ContigDepth {
         self.depth.resize(contig_len, 0);
     }
 
-    /// Increment the depth at `ref_pos`, saturating at `coverage_cap`. Attempts
-    /// to push past the cap bump the capped-exclusion counter instead.
-    fn push(&mut self, ref_pos: u32) {
-        let pos = ref_pos as usize;
-        // Defensive: `walk_depth` already truncates each block to the contig
-        // length, so this branch should never hit.
-        if pos >= self.depth.len() {
-            return;
-        }
-        let d = &mut self.depth[pos];
-        if *d < self.coverage_cap {
-            *d += 1;
-        } else {
-            self.excl_capped += 1;
-        }
+    /// Mutable view of the depth slots for the half-open range `[start, start+len)`.
+    /// The caller (`walk_depth`) has already clamped the range to the contig, so
+    /// iterating this slice elides the per-base bounds check and lets the cap /
+    /// increment loop run over contiguous memory. The saturating increment and
+    /// capped-exclusion accounting live at the call site (interleaved with the
+    /// per-base BQ filter and mate-overlap hooks), so this is a plain slice.
+    ///
+    /// Panics if `[start, start+len)` is out of range; `walk_depth` guarantees it
+    /// is in bounds (each CIGAR block is clamped to the contig length before the
+    /// call), so the assert documents that invariant rather than guarding a
+    /// reachable case.
+    fn slice_mut(&mut self, start: usize, len: usize) -> &mut [u16] {
+        debug_assert!(start + len <= self.depth.len(), "slice_mut range past contig end");
+        &mut self.depth[start..start + len]
     }
 
-    /// Read the depth at `pos` and zero the slot in one step (used by
-    /// `finalize_contig` as it walks the array).
-    fn take(&mut self, pos: usize) -> u16 {
-        std::mem::take(&mut self.depth[pos])
+    /// Zero the depth slots in `[start, end)` in bulk (a vectorized fill). Used by
+    /// `finalize_contig` to reset the N-gap positions between non-N runs — those
+    /// carry no eligible coverage but may have accrued depth from deletion-
+    /// spanning reads, so they still must be cleared before the next contig.
+    fn zero_range(&mut self, start: usize, end: usize) {
+        self.depth[start..end].fill(0);
+    }
+
+    /// Add to the running capped-exclusion counter (bases that arrived at a
+    /// position already at the cap). `walk_depth` accumulates these per record
+    /// and folds them in once.
+    fn add_excl_capped(&mut self, n: u64) {
+        self.excl_capped += n;
     }
 
     /// Drain and return the running capped-exclusion counter.
@@ -1318,52 +1363,45 @@ mod tests {
     // ── ContigDepth tests ────────────────────────────────────────────────────
 
     #[test]
-    fn test_contig_depth_basic_push_and_take() {
-        let mut d = ContigDepth::new(250);
+    fn contig_depth_slice_increments_then_zero_range_resets() {
+        let mut d = ContigDepth::new();
         d.reset_for_contig(10);
-        d.push(3);
-        d.push(3);
-        d.push(7);
-
-        assert_eq!(d.take(0), 0);
-        assert_eq!(d.take(3), 2);
-        assert_eq!(d.take(7), 1);
-        // `take` zeroes the slot:
-        assert_eq!(d.take(3), 0);
+        // Increment through the mutable slice (walk_depth's path).
+        let s = d.slice_mut(3, 5); // positions 3..8
+        s[0] += 1; // pos 3
+        s[0] += 1; // pos 3 again → depth 2
+        s[4] += 1; // pos 7 → depth 1
+        assert_eq!(d.slice_mut(3, 1)[0], 2);
+        assert_eq!(d.slice_mut(7, 1)[0], 1);
+        assert_eq!(d.slice_mut(0, 1)[0], 0);
+        // `zero_range` clears a span in bulk (finalize's gap reset).
+        d.zero_range(3, 8);
+        assert_eq!(d.slice_mut(3, 1)[0], 0);
+        assert_eq!(d.slice_mut(7, 1)[0], 0);
     }
 
     #[test]
-    fn test_contig_depth_saturates_at_cap() {
-        let mut d = ContigDepth::new(3);
-        d.reset_for_contig(5);
-        for _ in 0..10 {
-            d.push(2);
-        }
-        assert_eq!(d.take(2), 3);
-        // 10 pushes, cap=3 → 7 counted as capped.
+    fn contig_depth_excl_capped_accumulates_then_drains() {
+        let mut d = ContigDepth::new();
+        d.add_excl_capped(3);
+        d.add_excl_capped(4);
         assert_eq!(d.take_excl_capped(), 7);
+        // `take` drains the counter.
+        assert_eq!(d.take_excl_capped(), 0);
     }
 
     #[test]
-    fn test_contig_depth_resize_between_contigs() {
-        let mut d = ContigDepth::new(250);
+    fn contig_depth_resize_grows_and_reuses_backing() {
+        let mut d = ContigDepth::new();
         d.reset_for_contig(10);
-        d.push(5);
-        d.take(5);
-        // Switch to a larger contig; existing backing store grows via resize.
+        d.slice_mut(5, 1)[0] += 1;
+        d.zero_range(5, 6);
+        // Switch to a larger contig; the backing store grows via resize, with
+        // the new slots zero-filled.
         d.reset_for_contig(100);
         assert_eq!(d.len(), 100);
-        d.push(99);
-        assert_eq!(d.take(99), 1);
-    }
-
-    #[test]
-    fn test_contig_depth_ignores_out_of_range() {
-        let mut d = ContigDepth::new(250);
-        d.reset_for_contig(10);
-        d.push(42); // out of range — silently ignored
-        assert_eq!(d.take_excl_capped(), 0);
-        assert_eq!(d.take(0), 0);
+        d.slice_mut(99, 1)[0] += 1;
+        assert_eq!(d.slice_mut(99, 1)[0], 1);
     }
 
     // ── CachedMate tests ─────────────────────────────────────────────────────
