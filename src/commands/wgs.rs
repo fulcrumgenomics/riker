@@ -186,8 +186,13 @@ pub struct WgsCollector {
 
     // Per-contig working state
     current_ref_id: Option<usize>,
-    current_non_n: BitVec,
     processed_contigs: HashSet<usize>,
+
+    // Per-contig non-N runs (half-open `[start, end)`, 0-based), indexed by BAM
+    // ref_id. Precomputed once up front in `initialize`; consulted only at
+    // finalize and zero-coverage time, never per-read. Replaces a per-contig
+    // ~31 MB bitset (and its build) with a handful of compact intervals.
+    non_n_runs: Vec<Vec<(u32, u32)>>,
 
     // Global accumulators
     genome_territory: u64,
@@ -243,8 +248,8 @@ impl WgsCollector {
             coverage_cap: options.coverage_cap,
             dict: None,
             current_ref_id: None,
-            current_non_n: BitVec::EMPTY,
             processed_contigs: HashSet::new(),
+            non_n_runs: Vec::new(),
             genome_territory: 0,
             depth_histogram: vec![0u64; hist_len],
             bases_excl_mapq: 0,
@@ -260,17 +265,19 @@ impl WgsCollector {
     /// Finalize the last contig, process any un-pileup'd contigs, and write output.
     ///
     /// # Errors
-    /// Returns an error if reference contigs cannot be loaded or output files cannot be written.
+    /// Returns an error if output files cannot be written. (Reference contigs are
+    /// loaded up front in [`Collector::initialize`], not here.)
     #[expect(clippy::too_many_lines, reason = "sequential finalization logic")]
     fn finish_metrics(&mut self) -> Result<()> {
         // Finalize whatever contig was being processed last.
         self.finalize_contig();
         self.current_ref_id = None;
 
-        // Process contigs that had zero reads (never appeared in pileup).
+        // Process contigs that had zero reads (never appeared in pileup). Their
+        // non-N runs were precomputed for every contig in `initialize`, so this
+        // just tallies eligible positions as all-zero-depth territory.
         // `dict` is set in `initialize`, which always runs before `finish`.
-        let dict = self.dict.as_ref().unwrap();
-        let n_contigs = dict.len();
+        let n_contigs = self.dict.as_ref().unwrap().len();
         for ref_id in 0..n_contigs {
             if self.processed_contigs.contains(&ref_id) {
                 continue;
@@ -283,18 +290,9 @@ impl WgsCollector {
                 continue;
             }
 
-            let name = dict[ref_id].name();
-            match self.reference.load_contig(name, false) {
-                Err(e) => {
-                    log::warn!("wgs: could not load contig '{name}': {e}");
-                }
-                Ok(seq) => {
-                    let bv = build_non_n_bitvec(&seq);
-                    let non_n = self.count_eligible_positions(ref_id, &bv);
-                    self.genome_territory += non_n;
-                    self.depth_histogram[0] += non_n;
-                }
-            }
+            let non_n = self.count_eligible_positions(ref_id, &self.non_n_runs[ref_id]);
+            self.genome_territory += non_n;
+            self.depth_histogram[0] += non_n;
         }
 
         let total = self.genome_territory;
@@ -458,17 +456,29 @@ impl WgsCollector {
         // Global capped-exclusion counter absorbs the per-contig cap overflow.
         self.bases_excl_capped += self.depth.take_excl_capped();
 
-        let non_n_bv = std::mem::take(&mut self.current_non_n);
+        // Take the runs out to sidestep the borrow against `self.depth` below;
+        // each contig is finalized exactly once, so we don't put them back.
+        let runs = std::mem::take(&mut self.non_n_runs[ref_id]);
         let intervals_bv = self.intervals.as_ref().map(|intervals| intervals.contig_bitvec(ref_id));
 
         let contig_len = self.depth.len();
         let capped = self.coverage_cap;
+        let n_runs = runs.len();
+        let mut run_idx = 0usize;
         let mut eligible: u64 = 0;
         for pos in 0..contig_len {
+            // Drain (and zero) every slot so the array is reset for the next
+            // contig without a separate memset — including N-gap positions,
+            // which reads can push depth into via deletions.
             let depth = self.depth.take(pos);
-            // Skip positions that are N in the reference, or outside the
+            // Advance the pointer so `runs[run_idx]` is the first run whose end
+            // is past `pos`; the runs are sorted and non-overlapping.
+            while run_idx < n_runs && pos >= runs[run_idx].1 as usize {
+                run_idx += 1;
+            }
+            // Non-N iff `pos` has entered the current run. Also require the
             // optional intervals mask.
-            let non_n_ok = pos < non_n_bv.len() && non_n_bv[pos];
+            let non_n_ok = run_idx < n_runs && pos >= runs[run_idx].0 as usize;
             let interval_ok = intervals_bv.as_ref().is_none_or(|bv| pos < bv.len() && bv[pos]);
             if !non_n_ok || !interval_ok {
                 continue;
@@ -478,10 +488,6 @@ impl WgsCollector {
             self.depth_histogram[idx] += 1;
         }
         self.genome_territory += eligible;
-
-        // All positions in the active contig have been read-and-zeroed above,
-        // so the depth array is ready for the next contig without an explicit
-        // memset.
     }
 
     /// Write a PDF area-chart of the coverage depth distribution to [`Self::plot_path`].
@@ -540,29 +546,37 @@ impl WgsCollector {
         write_plot_pdf(plots, layout, &self.plot_path)
     }
 
-    /// Count non-N positions in `non_n` that fall within the configured intervals
-    /// for `ref_id` (or all positions if no intervals are configured). Used
-    /// only by `finish_metrics` for contigs that had zero eligible reads and
-    /// therefore never triggered `finalize_contig`.
-    fn count_eligible_positions(&self, ref_id: usize, non_n: &BitVec) -> u64 {
+    /// Count non-N positions in `runs` that fall within the configured intervals
+    /// for `ref_id` (or all non-N positions if no intervals are configured).
+    /// Used only by `finish_metrics` for contigs that had zero eligible reads
+    /// and therefore never triggered `finalize_contig`.
+    fn count_eligible_positions(&self, ref_id: usize, runs: &[(u32, u32)]) -> u64 {
         match &self.intervals {
-            None => non_n.count_ones() as u64,
+            None => runs.iter().map(|&(start, end)| u64::from(end - start)).sum(),
             Some(intervals) => {
                 let ivl = intervals.contig_bitvec(ref_id);
                 if ivl.is_empty() {
                     return 0;
                 }
-                // AND the two bitvecs over their shared length, then count ones.
-                let len = non_n.len().min(ivl.len());
-                (non_n[..len].to_bitvec() & &ivl[..len]).count_ones() as u64
+                // Count run positions that also fall inside the interval mask,
+                // word-parallel over each run's bit range (both bounds clamped to
+                // the mask length, so `lo <= hi` always and the slice is valid).
+                let mut count: u64 = 0;
+                for &(start, end) in runs {
+                    let lo = (start as usize).min(ivl.len());
+                    let hi = (end as usize).min(ivl.len());
+                    count += ivl[lo..hi].count_ones() as u64;
+                }
+                count
             }
         }
     }
 
-    /// Begin processing a new contig: load the reference sequence to build the
-    /// non-N bitvec, resize the per-position depth array, and reset the mate
-    /// buffer (mates cannot straddle contigs).
-    fn begin_contig(&mut self, ref_id: usize) -> Result<()> {
+    /// Begin processing a new contig: resize the per-position depth array and
+    /// reset the mate buffer (mates cannot straddle contigs). The non-N runs
+    /// for every contig were precomputed in `initialize`, so no reference read
+    /// happens here.
+    fn begin_contig(&mut self, ref_id: usize) {
         // `dict` is set in `initialize` before any record arrives; `accept`
         // is the only caller that drives contig transitions.
         let name = self.dict.as_ref().unwrap().get_by_index(ref_id).map_or("", |m| m.name());
@@ -571,13 +585,10 @@ impl WgsCollector {
         // the cast is lossless.
         #[allow(clippy::cast_possible_truncation)]
         let contig_len = self.reference.contig_length(name).map_or(0, |n| n as usize);
-        let seq = self.reference.load_contig(name, false)?;
-        self.current_non_n = build_non_n_bitvec(&seq);
         self.depth.reset_for_contig(contig_len);
         self.mate_buffer.clear();
         self.current_ref_id = Some(ref_id);
         self.processed_contigs.insert(ref_id);
-        Ok(())
     }
 
     /// Walk the CIGAR of `record` and apply its per-base depth contribution,
@@ -655,8 +666,39 @@ impl Collector for WgsCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
         self.reference.validate_bam_header(header)?;
 
-        self.dict = Some(SequenceDictionary::from(header));
+        let dict = SequenceDictionary::from(header);
 
+        // Precompute non-N runs for every relevant contig up front, reusing one
+        // caller-owned sequence buffer across all loads. The runs are consulted
+        // only at finalize / zero-coverage time, never per-read, so we never keep
+        // a per-contig sequence or bitset resident; dropping `seq_buf` after the
+        // loop means steady-state processing holds essentially just the depth
+        // array.
+        let n_contigs = dict.len();
+        let mut runs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n_contigs];
+        let mut seq_buf: Vec<u8> = Vec::new();
+        for ref_id in 0..n_contigs {
+            // When `--intervals` is set, a contig with no interval overlap
+            // contributes nothing: finalize masks out every position and the
+            // zero-coverage loop skips it, so its runs are never read. Leaving
+            // `runs[ref_id]` empty avoids reading the whole contig off disk —
+            // otherwise a small `-L` run would still scan the entire reference.
+            if self.intervals.as_ref().is_some_and(|ivl| !ivl.has_contig(ref_id)) {
+                continue;
+            }
+            let name = dict[ref_id].name();
+            // A load failure here aborts the whole run. validate_bam_header (above)
+            // already guaranteed every contig is present in the reference index, so
+            // this only fires on an unreadable/truncated reference — a broken input
+            // where failing loud beats silently under-counting genome_territory.
+            // (The pre-refactor code warn+skipped this only for zero-read contigs.)
+            self.reference.load_contig_into(name, false, &mut seq_buf)?;
+            runs[ref_id] = non_n_intervals(&seq_buf);
+        }
+        drop(seq_buf);
+        self.non_n_runs = runs;
+
+        self.dict = Some(dict);
         self.sample = derive_sample(&self.input_path, header);
         self.plot_title = format!("Coverage Depth Distribution of {}", self.sample);
         Ok(())
@@ -711,7 +753,7 @@ impl Collector for WgsCollector {
             if self.current_ref_id.is_some() {
                 self.finalize_contig();
             }
-            self.begin_contig(ref_id)?;
+            self.begin_contig(ref_id);
         }
 
         // Probe-then-insert lets us build the overlap bitmap inline with
@@ -1094,33 +1136,43 @@ fn count_aligned_bases(record: &RikerRecord) -> u64 {
     count
 }
 
-// ─── Bitvec helper ────────────────────────────────────────────────────────────
+// ─── Non-N interval helper ────────────────────────────────────────────────────
 
-/// Build a `BitVec` from a reference sequence where each bit is `true` if the
-/// corresponding base is not N/n. This replaces storing the full sequence,
-/// reducing per-contig memory from ~250MB to ~31MB for the largest chromosomes
-/// and enabling hardware-accelerated `count_ones()` for eligible-position counts.
+/// Scan a reference sequence and return the maximal half-open `[start, end)`
+/// runs (0-based) of non-N bases. A base is non-N iff it is neither `N` nor
+/// `n`; adjacent non-N bases coalesce into one run and N bases break runs.
 ///
-/// Builds the bitvec one word at a time (64 bases → 1 `usize`) to avoid the
-/// overhead of per-bit indexing through bitvec's API.
-fn build_non_n_bitvec(seq: &[u8]) -> BitVec {
-    const W: usize = usize::BITS as usize;
-    let len = seq.len();
-    let mut words = Vec::with_capacity(len.div_ceil(W));
-
-    for chunk in seq.chunks(W) {
-        let mut word: usize = 0;
-        for (j, &b) in chunk.iter().enumerate() {
-            if b != b'N' && b != b'n' {
-                word |= 1 << j;
+/// This compact representation replaces a per-contig bitset: a bitset costs one
+/// bit per base (~31 MB for the largest human chromosome), whereas real
+/// references have only a few hundred to a few thousand N gaps, so a contig's
+/// runs total a handful of `(u32, u32)` pairs. The runs are consulted only when
+/// finalizing coverage (never per read), where a single forward pointer walks
+/// them in lockstep with the depth array.
+fn non_n_intervals(seq: &[u8]) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut run_start: Option<u32> = None;
+    for (i, &b) in seq.iter().enumerate() {
+        // Genomic positions fit in u32 for all supported references (the largest
+        // human chromosome is ~2.5e8 < u32::MAX); the depth path casts the same
+        // way, so runs stay consistent with it.
+        #[allow(clippy::cast_possible_truncation)]
+        let pos = i as u32;
+        let is_non_n = b != b'N' && b != b'n';
+        match (is_non_n, run_start) {
+            (true, None) => run_start = Some(pos),
+            (false, Some(start)) => {
+                runs.push((start, pos));
+                run_start = None;
             }
+            _ => {}
         }
-        words.push(word);
     }
-
-    let mut bv = BitVec::from_vec(words);
-    bv.truncate(len);
-    bv
+    if let Some(start) = run_start {
+        #[allow(clippy::cast_possible_truncation)]
+        let end = seq.len() as u32;
+        runs.push((start, end));
+    }
+    runs
 }
 
 // ─── Percentile helper ────────────────────────────────────────────────────────
@@ -1214,6 +1266,53 @@ mod tests {
         hist[5] = 5;
         hist[10] = 5;
         crate::assert_close!(percentile_from_hist(&hist, 0.5, 10), 5.0, f64::EPSILON);
+    }
+
+    // ── Non-N interval tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn non_n_intervals_empty_sequence_has_no_runs() {
+        assert!(non_n_intervals(b"").is_empty());
+    }
+
+    #[test]
+    fn non_n_intervals_all_bases_is_one_run() {
+        assert_eq!(non_n_intervals(b"ACGTACGT"), vec![(0, 8)]);
+    }
+
+    #[test]
+    fn non_n_intervals_all_n_has_no_runs() {
+        assert!(non_n_intervals(b"NNNNNN").is_empty());
+        // Lowercase n is treated as N too.
+        assert!(non_n_intervals(b"nnnn").is_empty());
+    }
+
+    #[test]
+    fn non_n_intervals_lowercase_n_breaks_runs() {
+        // Lowercase acgt are bases; a run of lowercase n is an N gap.
+        assert_eq!(non_n_intervals(b"acgtNNNNacgt"), vec![(0, 4), (8, 12)]);
+    }
+
+    #[test]
+    fn non_n_intervals_leading_and_trailing_n_are_trimmed() {
+        assert_eq!(non_n_intervals(b"NNACGTNN"), vec![(2, 6)]);
+    }
+
+    #[test]
+    fn non_n_intervals_interior_gaps_split_runs() {
+        // ACG [NN] TAC [N] GT → three runs.
+        assert_eq!(non_n_intervals(b"ACGNNTACNGT"), vec![(0, 3), (5, 8), (9, 11)]);
+    }
+
+    #[test]
+    fn non_n_intervals_trailing_run_reaches_end() {
+        // A run that extends to the final base is closed at seq.len().
+        assert_eq!(non_n_intervals(b"NNNACGT"), vec![(3, 7)]);
+    }
+
+    #[test]
+    fn non_n_intervals_single_base_runs() {
+        assert_eq!(non_n_intervals(b"NANANA"), vec![(1, 2), (3, 4), (5, 6)]);
     }
 
     // ── ContigDepth tests ────────────────────────────────────────────────────
