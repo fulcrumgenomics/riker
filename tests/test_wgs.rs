@@ -452,3 +452,77 @@ fn test_sd_coverage_uses_capped_depth() {
     let expected_sd = (125.0_f64 / 19.0).sqrt();
     assert_close!(m.sd_coverage, expected_sd, 0.01);
 }
+
+/// A second contig that receives no reads exercises the zero-coverage path in
+/// `finish_metrics`: its non-N bases still count toward genome territory (all at
+/// depth 0). Covers the `None` (no-intervals) branch of `count_eligible_positions`,
+/// which the single-contig tests never reach.
+#[test]
+fn zero_coverage_contig_counts_non_n_territory() {
+    // chr2: 10 bases then 10 Ns → 10 non-N positions, none covered.
+    let chr2_seq: Vec<u8> =
+        std::iter::repeat_n(b'A', 10).chain(std::iter::repeat_n(b'N', 10)).collect();
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", chr2_seq)
+        .to_temp_fasta()
+        .unwrap();
+
+    // One pair on chr1 (depth 1 across all 20 bp); chr2 gets no reads at all.
+    let mut bld = coord_builder(&[("chr1", 20), ("chr2", 20)]);
+    bld.add(pair("r0").at("chr1", 1, 11).len(10));
+    let bam = bld.to_temp_bam().unwrap();
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+
+    make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
+
+    let rows: Vec<WgsMetrics> =
+        read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
+    assert_eq!(rows.len(), 1);
+    // chr1: 20 non-N covered; chr2: 10 non-N uncovered → 30 total territory.
+    assert_eq!(rows[0].genome_territory, 30);
+
+    let cov: Vec<WgsCoverageEntry> =
+        read_metrics_tsv(&dir.path().join(format!("out{COVERAGE_SUFFIX}"))).unwrap();
+    // chr2's 10 non-N bases land in the depth-0 bin; chr1's 20 sit at depth 1.
+    assert_eq!(cov[0].bases, 10);
+    assert_eq!(cov[1].bases, 20);
+}
+
+/// A read-free contig that is both interval-restricted and contains N gaps
+/// exercises the `Some` branch of `count_eligible_positions`: only non-N
+/// positions that also fall inside the interval mask are counted (the rewritten
+/// run-vs-interval intersection).
+#[test]
+fn zero_coverage_contig_with_intervals_counts_masked_non_n() {
+    // chr2: 5 bases, 5 Ns, 5 bases → non-N runs [0,5) and [10,15).
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", b"AAAAANNNNNAAAAA".to_vec())
+        .to_temp_fasta()
+        .unwrap();
+
+    // Reads only on chr1; chr2 is the read-free, interval-restricted contig.
+    let mut bld = coord_builder(&[("chr1", 20), ("chr2", 15)]);
+    bld.add(pair("r0").at("chr1", 1, 11).len(10));
+    let bam = bld.to_temp_bam().unwrap();
+
+    // Interval on chr2 only, [3, 13). chr1 has no interval, so it contributes 0.
+    let dir = TempDir::new().unwrap();
+    let bed_path = dir.path().join("chr2.bed");
+    std::fs::write(&bed_path, "chr2\t3\t13\n").unwrap();
+
+    let prefix = dir.path().join("out");
+    make_cmd(bam.path(), refa.path(), &prefix, Some(bed_path), false, true, 20, 20, 250)
+        .execute(None)
+        .unwrap();
+
+    let rows: Vec<WgsMetrics> =
+        read_metrics_tsv(&dir.path().join(format!("out{METRICS_SUFFIX}"))).unwrap();
+    assert_eq!(rows.len(), 1);
+    // non-N ∩ [3,13): run [0,5)→{3,4}=2, run [10,15)→{10,11,12}=3 → 5 total.
+    assert_eq!(rows[0].genome_territory, 5);
+}
