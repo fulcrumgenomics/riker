@@ -1,9 +1,12 @@
 //! Reusable SIMD kernels for riker's hot byte-level loops, built on the [`wide`] crate.
 //!
 //! Each kernel processes a fixed-width chunk of its input in SIMD and handles the
-//! sub-chunk tail with a plain scalar loop. The kernels are intentionally general
+//! sub-chunk tail with a plain scalar loop. Most kernels are intentionally general
 //! — "count bases ≥ Q over a slice", "GC count of a slice" — rather than tailored
 //! to any one command, so a new call site can adopt them without growing the module.
+//! A few are command-specific where the SIMD shape is inseparable from the caller's
+//! per-position decision (e.g. [`pileup_depth_alone`], the `wgs` coverage kernel);
+//! these live here to keep all `wide`-based vectorization in one module.
 //!
 //! ## Conventions
 //!
@@ -64,6 +67,91 @@ pub fn count_bases_ge_q(qual: &[u8], threshold: u8) -> u64 {
 #[inline]
 pub fn count_bases_lt_q(qual: &[u8], threshold: u8) -> u64 {
     qual.len() as u64 - count_bases_ge_q(qual, threshold)
+}
+
+/// Apply BQ-filtered, cap-saturated depth increments over a contiguous run of
+/// pileup positions — the `AloneAction` fast path in `wgs::walk_depth`.
+///
+/// `qual` and `depth` are parallel slices of equal length. For each position `i`:
+///
+/// * `qual[i] < min_bq`         → a base-quality exclusion; `depth[i]` untouched.
+/// * else `depth[i] >= cap`     → a capped exclusion; `depth[i]` untouched.
+/// * else                       → `depth[i] += 1`.
+///
+/// Returns `(bases_excl_baseq, bases_excl_capped)`. The increment is applied only
+/// where `depth[i] < cap`, so `depth[i] + 1 <= cap <= u16::MAX` and no overflow
+/// is possible. Qualities are raw Phred values, not Phred+33.
+///
+/// This is the vectorized twin of the scalar per-position decision in
+/// `wgs::WgsCollector::walk_depth`'s overlapping-mate branch; the two must stay
+/// in lock-step (the byte-identical fixture run covers both).
+#[must_use]
+pub fn pileup_depth_alone(qual: &[u8], depth: &mut [u16], min_bq: u8, cap: u16) -> (u64, u64) {
+    debug_assert_eq!(qual.len(), depth.len(), "qual and depth slices must be parallel");
+    let n = qual.len().min(depth.len());
+
+    let min_bq_v = u16x8::splat(u16::from(min_bq));
+    let cap_v = u16x8::splat(cap);
+    let one = u16x8::splat(1);
+    let zero = u8x16::splat(0);
+
+    let mut excl_baseq = 0u64;
+    let mut excl_capped = 0u64;
+
+    // 16 positions per iteration: quals load as u8x16 and widen into two u16x8
+    // halves (interleave with a zero vector — little-endian puts the zero in the
+    // high byte); depth is two native u16x8 vectors.
+    let simd_len = n - (n % 16);
+    let mut i = 0;
+    while i < simd_len {
+        let q16 = u8x16::new(qual[i..i + 16].try_into().unwrap());
+        let q_lo: u16x8 = cast(u8x16::unpack_low(q16, zero));
+        let q_hi: u16x8 = cast(u8x16::unpack_high(q16, zero));
+        let d_lo = u16x8::new(depth[i..i + 8].try_into().unwrap());
+        let d_hi = u16x8::new(depth[i + 8..i + 16].try_into().unwrap());
+
+        let (d_lo2, bq_lo, cap_lo) = pileup_step(q_lo, d_lo, min_bq_v, cap_v, one);
+        let (d_hi2, bq_hi, cap_hi) = pileup_step(q_hi, d_hi, min_bq_v, cap_v, one);
+
+        let lo_arr: [u16; 8] = cast(d_lo2);
+        let hi_arr: [u16; 8] = cast(d_hi2);
+        depth[i..i + 8].copy_from_slice(&lo_arr);
+        depth[i + 8..i + 16].copy_from_slice(&hi_arr);
+
+        excl_baseq += bq_lo + bq_hi;
+        excl_capped += cap_lo + cap_hi;
+        i += 16;
+    }
+
+    // Scalar tail: the trailing 0..15 positions.
+    for j in simd_len..n {
+        let q = qual[j];
+        if q < min_bq {
+            excl_baseq += 1;
+        } else if depth[j] < cap {
+            depth[j] += 1;
+        } else {
+            excl_capped += 1;
+        }
+    }
+
+    (excl_baseq, excl_capped)
+}
+
+/// One 8-lane pileup step: given widened quals `q` and current depths `d`,
+/// return the updated depths plus the (BQ-fail, capped) lane counts.
+#[inline]
+fn pileup_step(q: u16x8, d: u16x8, min_bq_v: u16x8, cap_v: u16x8, one: u16x8) -> (u16x8, u64, u64) {
+    // `wide`'s u16x8 exposes only simd_gt/eq, so express `x < y` as `y > x`.
+    let bq_fail = min_bq_v.simd_gt(q); // min_bq > q ⟺ q < min_bq → BQ exclusion
+    let below_cap = cap_v.simd_gt(d); // cap > depth ⟺ depth < cap → can take a read
+    let pass = !bq_fail; // q >= min_bq
+    let incr = pass & below_cap; // BQ-passing and below the cap → increment
+    let capped = pass & !below_cap; // BQ-passing but already at the cap
+    let d2 = d + (incr & one);
+    let baseq = u64::from(bq_fail.to_bitmask().count_ones());
+    let cap_excl = u64::from(capped.to_bitmask().count_ones());
+    (d2, baseq, cap_excl)
 }
 
 /// Count G and C bases in `seq`, matching both upper- and lower-case.
@@ -275,6 +363,28 @@ mod tests {
         seq.iter().filter(|&&b| matches!(b, b'N' | b'n')).count() as u64
     }
 
+    /// Scalar reference for `pileup_depth_alone`: returns the mutated depths and
+    /// the (baseq-fail, capped) counts.
+    fn scalar_pileup_alone(
+        qual: &[u8],
+        depth: &[u16],
+        min_bq: u8,
+        cap: u16,
+    ) -> (Vec<u16>, u64, u64) {
+        let mut d = depth.to_vec();
+        let (mut bq, mut capped) = (0u64, 0u64);
+        for (i, &q) in qual.iter().enumerate() {
+            if q < min_bq {
+                bq += 1;
+            } else if d[i] < cap {
+                d[i] += 1;
+            } else {
+                capped += 1;
+            }
+        }
+        (d, bq, capped)
+    }
+
     // Tiny deterministic PRNG (xorshift64*) — avoids pulling in `rand` for tests.
     struct XorShift(u64);
     impl XorShift {
@@ -342,6 +452,52 @@ mod tests {
                     scalar_count_ge_q(&qual, t),
                     "len={len} t={t}",
                 );
+            }
+        }
+    }
+
+    // ── pileup_depth_alone ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pileup_depth_alone_empty_is_noop() {
+        let mut depth: [u16; 0] = [];
+        assert_eq!(pileup_depth_alone(&[], &mut depth, 20, 250), (0, 0));
+    }
+
+    #[test]
+    fn pileup_depth_alone_partitions_baseq_cap_and_increment() {
+        // q<20 → baseq; q>=20 with depth<cap → +1; q>=20 with depth==cap → capped.
+        let qual = [10u8, 30, 30, 40];
+        let mut depth = [5u16, 7, 250, 0];
+        let cap = 250;
+        let (bq, capped) = pileup_depth_alone(&qual, &mut depth, 20, cap);
+        assert_eq!(depth, [5, 8, 250, 1]); // pos0 baseq (untouched), pos2 at cap (untouched)
+        assert_eq!(bq, 1);
+        assert_eq!(capped, 1);
+    }
+
+    #[test]
+    fn pileup_depth_alone_matches_scalar_across_boundaries() {
+        let mut rng = XorShift::new(0xDA7A_5EED);
+        // Lengths straddling the 16-wide SIMD block; depths span below/at/above
+        // the cap so the cap and BQ mask lanes are all exercised.
+        for len in [0usize, 1, 8, 15, 16, 17, 31, 32, 33, 100, 151, 300] {
+            for _ in 0..16 {
+                let mut qual = vec![0u8; len];
+                rng.fill_byte(&mut qual, &(0u8..=60).collect::<Vec<u8>>());
+                let depth: Vec<u16> =
+                    (0..len).map(|_| u16::try_from(rng.next_u64() % 255).unwrap()).collect();
+                for &min_bq in &[0u8, 20, 60] {
+                    for &cap in &[1u16, 100, 250, 254] {
+                        let (exp_d, exp_bq, exp_cap) =
+                            scalar_pileup_alone(&qual, &depth, min_bq, cap);
+                        let mut got_d = depth.clone();
+                        let (got_bq, got_cap) = pileup_depth_alone(&qual, &mut got_d, min_bq, cap);
+                        assert_eq!(got_d, exp_d, "depth len={len} min_bq={min_bq} cap={cap}");
+                        assert_eq!(got_bq, exp_bq, "baseq len={len} min_bq={min_bq} cap={cap}");
+                        assert_eq!(got_cap, exp_cap, "capped len={len} min_bq={min_bq} cap={cap}");
+                    }
+                }
             }
         }
     }

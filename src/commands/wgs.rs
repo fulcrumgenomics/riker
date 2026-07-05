@@ -665,25 +665,39 @@ impl WgsCollector {
             let base_pos = block_ref_start as u32;
 
             // The block's `n` BQ-scored bases map to the contiguous depth range
-            // `[base_pos, base_pos + n)` (already clamped to the contig), so walk
-            // each depth slot and its qual in lockstep.
+            // `[base_pos, base_pos + n)` (already clamped to the contig).
             let depth_slice = self.depth.slice_mut(base_pos as usize, n);
-            for (i, (slot, &q)) in depth_slice.iter_mut().zip(available).enumerate() {
-                if q < min_bq {
-                    excl_baseq += 1;
-                    continue;
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let ref_pos = base_pos + i as u32;
-                if action.is_mate_covered(ref_pos) {
-                    excl_overlap += 1;
-                } else {
-                    if *slot < cap {
-                        *slot += 1;
-                    } else {
-                        excl_capped += 1;
+            if A::IS_ALONE {
+                // No mate bookkeeping: a pure BQ-filter + cap-saturated increment
+                // over contiguous memory, done SIMD-wide.
+                let (bq, capped) =
+                    crate::simd::pileup_depth_alone(available, depth_slice, min_bq, cap);
+                excl_baseq += bq;
+                excl_capped += capped;
+            } else {
+                // Overlapping-mate cases keep the per-base scalar walk so the
+                // mate-overlap hooks (`is_mate_covered` / `on_depth_counted`) run.
+                // The BQ-filter + cap-saturated increment below MUST stay in lock-
+                // step with `simd::pileup_depth_alone` (the SIMD path above); the
+                // byte-identical fixture run exercises both and would diverge if
+                // they drift.
+                for (i, (slot, &q)) in depth_slice.iter_mut().zip(available).enumerate() {
+                    if q < min_bq {
+                        excl_baseq += 1;
+                        continue;
                     }
-                    action.on_depth_counted(ref_pos);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ref_pos = base_pos + i as u32;
+                    if action.is_mate_covered(ref_pos) {
+                        excl_overlap += 1;
+                    } else {
+                        if *slot < cap {
+                            *slot += 1;
+                        } else {
+                            excl_capped += 1;
+                        }
+                        action.on_depth_counted(ref_pos);
+                    }
                 }
             }
             // If the qual array is shorter than the CIGAR claims the block spans
@@ -1066,6 +1080,13 @@ impl CachedMate {
 /// [`is_mate_covered`]: DepthAction::is_mate_covered
 /// [`on_depth_counted`]: DepthAction::on_depth_counted
 trait DepthAction {
+    /// `true` only for [`AloneAction`]. It gates the SIMD fast path in
+    /// `walk_depth`: with no per-base mate bookkeeping to do, an alone read's
+    /// block is a pure BQ-filter + cap-saturated increment over a contiguous
+    /// depth slice, which vectorizes. The const is monomorphised away, so the
+    /// dispatch `if A::IS_ALONE` is resolved at compile time per action.
+    const IS_ALONE: bool = false;
+
     /// Return `true` if the other read of this pair already counted
     /// `ref_pos`. The caller should not push depth again.
     #[inline]
@@ -1081,7 +1102,9 @@ trait DepthAction {
 
 /// No-overlap-awareness action for reads with no overlapping mate.
 struct AloneAction;
-impl DepthAction for AloneAction {}
+impl DepthAction for AloneAction {
+    const IS_ALONE: bool = true;
+}
 
 /// Action for reads that will be buffered: records each depth-push
 /// position into `bitmap` so the arriving mate can skip the double-count.
