@@ -1,0 +1,38 @@
+# Focused config: the fair three-way WGS comparison (riker wgs vs Picard
+# CollectWgsMetrics vs mosdepth) on a single sample, thread-swept 1-4 for
+# riker and mosdepth. Same profiles as the main run's wgs-t{1..4}, just
+# scoped to one 30x BAM for quick iteration / cross-architecture runs.
+#
+# All three tools are harmonized (MAPQ 20, orphans counted, dups +
+# secondary + supplementary excluded, mosdepth accurate — no -x/-a);
+# riker + Picard keep base-quality filtering (mosdepth can't).
+#
+# Scope: ONE sample (HG00188_30x — the 30x BAM where mosdepth had the
+# biggest advantage over riker in v1, picked deliberately to avoid biasing
+# toward riker). Three reps for min/max bars.
+#
+# Cross-architecture: run this same config on one x86_64 instance and one
+# Graviton (aarch64) instance in parallel. Each produces its own
+# results-mosdepth-compare/bench.tsv; combine them after the fact using the
+# host info recorded in results/host.json.
+
+samples_wgs_tsv:    config/samples.mosdepth-compare.tsv
+samples_hybcap_tsv: config/samples.hybcap.tsv
+references_yaml:    config/references.yaml
+kits_yaml:          config/kits.yaml
+
+stage_dir:          stage
+results_dir:        results-mosdepth-compare
+
+riker_bin:          ../target/dist/riker
+
+# Picard CollectWgsMetrics runs at wgs-t1; qualimap is not in these profiles.
+picard_xmx_gb:      16
+qualimap_xmx_gb:        16
+qualimap_xmx_gb_max:    24
+
+replicates:         3
+
+profiles_enabled:   [wgs-t1, wgs-t2, wgs-t3, wgs-t4]
+
+staging_threads:    8

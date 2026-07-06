@@ -7,6 +7,11 @@ samples_wgs_tsv:    config/samples.wgs.tsv
 samples_hybcap_tsv: config/samples.hybcap.tsv
 references_yaml:    config/references.yaml
 kits_yaml:          config/kits.yaml
+samples_rna_tsv:    config/samples.rna.tsv
+annotations_yaml:   config/annotations.yaml
+# RustQC scope-matched subset config (disables the RustQC modules riker
+# doesn't compute), passed to `rustqc rna -c`.
+rustqc_rna_config:  config/rustqc.rna.subset.yaml
 
 # Where staged BAMs, references, and per-run outputs live. Should be a
 # local NVMe path on the benchmark host (instance-store volume on EC2).
@@ -36,7 +41,7 @@ replicates:         1
 # Profiles to run. Trim this list to skip costly profiles during
 # iteration. Trimming a profile silently drops all rows for it from
 # bench.tsv — no warning. Re-add to recover.
-profiles_enabled: [wgs-only, wgs-bundle, hybcap-only, hybcap-bundle]
+profiles_enabled: [wgs-t1, wgs-t2, wgs-t3, wgs-t4, wgs-bundle, hybcap-only, hybcap-bundle, rna-t1, rna-t2, rna-t4]
 
 # samtools threads for staging (CRAM transcoding, downsample, indexing).
 # Not the riker thread count.

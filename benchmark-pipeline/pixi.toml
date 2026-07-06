@@ -23,6 +23,14 @@ picard = ">=3.3"
 mosdepth = ">=0.3"
 # All-in-one comparator. Heavy java; tune heap via --java-mem-size.
 qualimap = ">=2.3"
+# RustQC (Seqera) — single-pass RNA-seq QC comparator for the rna profiles.
+# Installed from Seqera's own bioconda distribution so the comparison is
+# "riker as shipped (its dist build) vs RustQC as shipped (its bioconda
+# build)". The `rustqc` binary lands on PATH like picard/mosdepth.
+rustqc = ">=0.2"
+# UCSC gtfToGenePred — converts the GENCODE GTF to Picard refFlat for
+# CollectRnaSeqMetrics (riker rna and rustqc read the GTF directly).
+ucsc-gtftogenepred = "*"
 # awscli is needed for `aws s3 cp --no-sign-request` from the public
 # 1000 Genomes bucket. curl handles HTTPS / FTP for everything else.
 awscli = "*"

@@ -37,24 +37,36 @@ done
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
 # ---- Build toolchain ------------------------------------------------------
-# Slim Linux AMIs (AL2023 minimal etc.) ship without a C/C++ toolchain or
-# cmake, which breaks rustc's build scripts and any Rust dep that drives a
-# C-library build (e.g. libz-ng-sys -> cmake). Install up front when
-# missing so the rust + cargo-multivers + riker chain works on a fresh box.
+# Slim Linux AMIs (AL2023 minimal etc.) ship without a C/C++ toolchain,
+# cmake, or libclang. We need:
+#   - gcc / g++ / cmake: rustc build scripts + Rust crates with C deps
+#     (e.g. libz-ng-sys -> cmake)
+#   - libclang: bindgen (used by hts-sys) dlopens libclang.so at build time
+# Install all up front when missing so the rust + cargo-multivers + riker
+# chain works on a fresh box.
 have_cc=true
 have_cxx=true
 have_cmake=true
+have_libclang=true
 command -v cc    >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || have_cc=false
 command -v c++   >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 || have_cxx=false
 command -v cmake >/dev/null 2>&1 || have_cmake=false
+# libclang has no canonical command — probe the dynamic linker cache and
+# common install paths.
+if ! ldconfig -p 2>/dev/null | grep -q '/libclang\.so'; then
+  if ! ls /usr/lib*/libclang*.so* /usr/lib/llvm*/lib/libclang*.so* 2>/dev/null | head -1 | grep -q .; then
+    have_libclang=false
+  fi
+fi
 
-if ! $have_cc || ! $have_cxx || ! $have_cmake; then
+if ! $have_cc || ! $have_cxx || ! $have_cmake || ! $have_libclang; then
   if [[ "$(uname -s)" == "Linux" ]]; then
     pkgs=()
     $have_cc    || pkgs+=(gcc)
     if command -v dnf >/dev/null 2>&1; then
-      $have_cxx   || pkgs+=(gcc-c++)
-      $have_cmake || pkgs+=(cmake)
+      $have_cxx     || pkgs+=(gcc-c++)
+      $have_cmake   || pkgs+=(cmake)
+      $have_libclang || pkgs+=(clang-devel)
       log "Installing build toolchain: ${pkgs[*]}"
       sudo dnf install -y -q "${pkgs[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
@@ -63,18 +75,19 @@ if ! $have_cc || ! $have_cxx || ! $have_cmake; then
       # apt-get complaining about a redundant package.
       $have_cxx || pkgs=("${pkgs[@]/gcc/}")
       $have_cxx || pkgs+=(build-essential)
-      $have_cmake || pkgs+=(cmake)
+      $have_cmake   || pkgs+=(cmake)
+      $have_libclang || pkgs+=(libclang-dev)
       log "Installing build toolchain: ${pkgs[*]}"
       sudo apt-get update -qq
       sudo apt-get install -y -qq "${pkgs[@]}"
     else
       echo "ERROR: missing build toolchain and unrecognized package manager." >&2
-      echo "Install gcc, g++, and cmake manually and re-run." >&2
+      echo "Install gcc, g++, cmake, and libclang manually and re-run." >&2
       exit 1
     fi
   else
     echo "ERROR: missing build toolchain on a non-Linux host." >&2
-    echo "On macOS: \`xcode-select --install && brew install cmake\`." >&2
+    echo "On macOS: \`xcode-select --install && brew install cmake llvm\`." >&2
     exit 1
   fi
 fi

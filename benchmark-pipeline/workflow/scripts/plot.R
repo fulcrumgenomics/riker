@@ -27,8 +27,8 @@ summary <- read_tsv(summary_path, show_col_types = FALSE)
 # Common style: small base size for dense panels, color palette mapping
 # tool_family rather than tool token (so multiple picard variants share
 # a hue but are distinguished by linetype/shape).
-TOOL_FAMILIES <- c("riker", "picard", "mosdepth", "qualimap")
-PALETTE <- setNames(c("#0072B2", "#E69F00", "#009E73", "#CC79A7"), TOOL_FAMILIES)
+TOOL_FAMILIES <- c("riker", "picard", "mosdepth", "qualimap", "rustqc")
+PALETTE <- setNames(c("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00"), TOOL_FAMILIES)
 
 theme_bench <- function() {
   theme_bw(base_size = 10) +

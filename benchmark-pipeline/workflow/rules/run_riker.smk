@@ -27,14 +27,19 @@ def _riker_argv(wildcards) -> list[str]:
     """Build the riker argv. Returned as a list so we can shlex.join it
     upstream of the shell block.
 
-    Standalone subcommands (wgs, hybcap, ...) are single-threaded and
-    take their kit BEDs as plain `--baits`/`--targets`. Only `riker
-    multi` has `--threads` and uses the `--hybcap::` prefix for kit
-    BEDs."""
+    Standalone wgs/hybcap are single-threaded and take their kit BEDs as
+    plain `--baits`/`--targets`. `riker multi` uses the `--hybcap::` prefix
+    for kit BEDs. Both `multi` and `rna` pass `--threads` — rna because the
+    rna-t{N} profiles sweep the thread count; rna additionally passes its
+    `--gene-model` / `--ribosomal-intervals` / `--strand`."""
     profile = PROFILES[wildcards.profile]
     sample = wildcards.sample
     rep = wildcards.rep
     is_multi = profile["riker_args"][0] == "multi"
+    is_rna = profile["riker_args"][0] == "rna"
+    # Thread-sweep profiles encode the budget in a trailing -t{N} (wgs-t*,
+    # rna-t*); they pass --threads like `multi` does.
+    is_sweep = bool(re.search(r"-t\d+$", wildcards.profile))
 
     bam = f"{STAGE_DIR}/{sample}/input.bam"
     out_prefix = f"{RESULTS_DIR}/run/{sample}/{wildcards.profile}/riker/rep{rep}/out"
@@ -42,11 +47,18 @@ def _riker_argv(wildcards) -> list[str]:
     argv = [str(RIKER_BIN), *profile["riker_args"]]
     argv += ["--input", bam]
     argv += ["--output", out_prefix]
-    if is_multi:
+    if is_multi or is_rna or is_sweep:
         argv += ["--threads", str(thread_count(wildcards.profile))]
 
     if _riker_needs_ref(profile):
         argv += ["--reference", ref_for_sample(sample)]
+
+    if is_rna:
+        argv += [
+            "--gene-model", gene_model_gtf_for_sample(sample),
+            "--ribosomal-intervals", ribosomal_intervals_for_sample(sample),
+            "--strand", strand_for_sample(sample),
+        ]
 
     if is_multi and "hybcap" in profile["riker_args"]:
         argv += [
@@ -76,6 +88,9 @@ def _riker_inputs(wildcards):
     if "hybcap" in profile["riker_args"]:
         inputs["baits"]   = bait_bed_for_sample(sample)
         inputs["targets"] = target_bed_for_sample(sample)
+    if profile["riker_args"][0] == "rna":
+        inputs["gene_model"] = gene_model_gtf_for_sample(sample)
+        inputs["ribosomal"]  = ribosomal_intervals_for_sample(sample)
     return inputs
 
 
@@ -101,6 +116,10 @@ rule run_riker:
         set -euo pipefail
         mkdir -p "$(dirname {output.time:q})"
         printf '%s\n' {params.argv_str:q} > {log.cmdline:q}
+        # Cold cache: drop the page cache so the tool reads its inputs cold
+        # from disk — deterministic + size-uniform across the coverage ladder
+        # (no BAM fits-in-RAM advantage). Fails loudly without sudo/root.
+        sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
         # `command time` bypasses the bash builtin so we get the conda-forge
         # GNU time binary (which supports -v / -o).
         command time -v -o {output.time:q} {params.argv_str} > {log.tool_log:q} 2>&1

@@ -1,26 +1,24 @@
-# mosdepth benchmark rule. Mosdepth is a single-purpose coverage tool; it
-# only makes sense as a comparator for the wgs-only and hybcap-only
-# profiles. Bundle profiles don't include mosdepth (no analog of riker
-# multi).
+# mosdepth benchmark rule. Comparator for the wgs-t{1..4} (fair, harmonized
+# three-way WGS) and hybcap-only profiles. Bundle profiles have no mosdepth
+# analog (no `riker multi` equivalent).
 #
-# Both branches use `--no-per-base` to skip the heavy per-base output
-# riker doesn't produce either. The wgs branch additionally passes
-# `-x` (mosdepth fast-mode: skip CIGAR walk, count entire fragment as
-# one contiguous block); we deliberately omit `-x` from the hybcap
-# branch because riker `hybcap` and Picard `CollectHsMetrics` both
-# walk CIGARs to apportion bases across capture-region boundaries, and
-# we want mosdepth's accuracy comparable to theirs on capture data.
-# Hybcap's `--by <target.bed>` then constrains coverage to the kit
-# regions.
+# WGS (wgs-t{N}): mosdepth runs in its ACCURATE mode (no -x fast-mode, no -a
+# fragment-mode), harmonized to riker/Picard's read selection so the three
+# tools count the same reads:
+#   -Q 20          MAPQ floor (matches riker --min-mapq default / Picard default)
+#   -F 3332        exclude unmapped+secondary+supplementary+dup — matches
+#                  riker's whole-read filters; orphan/unpaired reads are still
+#                  counted (as riker --include-unpaired-reads / Picard
+#                  COUNT_UNPAIRED=true do), and qcfail is counted (as riker does)
+#   --no-per-base  neither riker wgs nor Picard CollectWgsMetrics writes per-base
+# mosdepth cannot base-quality filter, so riker/Picard's BQ>=20 is the single
+# accepted asymmetry (an intentional riker/Picard feature).
 #
-# Threading: deliberately omit `-t` so mosdepth uses its default
-# (`-t 0` = no extra decompression threads, htslib runs single-threaded).
-# Riker's standalone wgs/hybcap subcommands are also single-threaded, so
-# the comparison is fair only without mosdepth's extra decompression
-# thread. We measured a 124-149% CPU footprint with `-t 1` because
-# htslib spins up an extra block-decompress thread on top of the main
-# thread; on 30x WGS that buys mosdepth ~30-40% wall-time over riker
-# even though riker uses ~10% LESS total CPU time.
+# Threads: a TOTAL-thread sweep. mosdepth's -t counts EXTRA BAM-decompression
+# threads on top of the main thread, so N total threads = `-t (N-1)`.
+#
+# hybcap-only: `--by <targets.bed>` constrains coverage to the capture
+# regions; single-threaded (matches riker hybcap), also accurate (no -x).
 
 def _mosdepth_inputs(wildcards):
     inputs = {
@@ -36,17 +34,19 @@ def _mosdepth_inputs(wildcards):
 rule run_mosdepth:
     input: unpack(_mosdepth_inputs)
     output:
-        time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/time.txt",
+        time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/{{tool}}/rep{{rep}}/time.txt",
     log:
-        cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/cmdline.txt",
-        tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/mosdepth/rep{{rep}}/tool.log",
+        cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/{{tool}}/rep{{rep}}/cmdline.txt",
+        tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/{{tool}}/rep{{rep}}/tool.log",
     wildcard_constraints:
-        # mosdepth doesn't run for bundle profiles.
-        profile = "wgs-only|hybcap-only",
-    threads: 1
+        profile = "wgs-t1|wgs-t2|wgs-t3|wgs-t4|hybcap-only",
+        tool    = "mosdepth",
+    threads: lambda w: thread_count(w.profile)
     resources: bench=100
     params:
         target_bed = lambda w: kit_bed_for_sample(w.sample) if w.profile == "hybcap-only" else "",
+        # mosdepth -t is EXTRA decompression threads, so total N => -t (N-1).
+        decomp_threads = lambda w: max(thread_count(w.profile) - 1, 0),
     shell:
         r"""
         set -euo pipefail
@@ -56,9 +56,14 @@ rule run_mosdepth:
             cmd=(mosdepth --by {params.target_bed:q} --no-per-base \
                           "$outdir/mosdepth" {input.bam})
         else
-            cmd=(mosdepth -x --no-per-base \
+            # wgs-t{{N}}: accurate + harmonized; total N threads = -t (N-1).
+            cmd=(mosdepth -t {params.decomp_threads} -Q 20 -F 3332 --no-per-base \
                           "$outdir/mosdepth" {input.bam})
         fi
         printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
+        # Cold cache: drop the page cache so the tool reads its inputs cold
+        # from disk — deterministic + size-uniform across the coverage ladder
+        # (no BAM fits-in-RAM advantage). Fails loudly without sudo/root.
+        sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
         command time -v -o {output.time:q} "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """
