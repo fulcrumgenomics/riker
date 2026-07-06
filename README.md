@@ -23,12 +23,6 @@ Fast Rust CLI toolkit for sequencing QC metrics -- ports key QC metrics tools fr
 <a href="mailto:contact@fulcrumgenomics.com?subject=[GitHub inquiry]"><img src="https://img.shields.io/badge/Email_us-%2338b44a.svg?&style=for-the-badge&logo=gmail&logoColor=white"/></a>
 <a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
 
-**Warning: ALPHA SOFTWARE - USE AT YOUR OWN RISK**
-
-This software is currently in **ALPHA**. While we have extensively tested these
-tools across a wide variety of data, **no guarantees are made** regarding
-correctness or stability.
-
 ## Overview
 
 Riker is the spiritual successor to [picard](https://github.com/broadinstitute/picard) for next-generation sequencing QC.  It aims to provide modern, fast implementations of NGS QC metrics that tell you both "how does your sample look?" and often "why does it look bad?".  It is **not** intended to be a drop-in replacement for Picard.  Notably:
@@ -45,79 +39,38 @@ See the [Available Tools](#available-tools) section for a list of current tools.
 
 The obvious question is: why not just fix up Picard?  Riker exists for a number of reasons:
 
-* **Speed**: Most tools in riker are 4-6x faster than their counterparts in Picard; some are _much_ faster. With a fresh start it was much easier to make _all_ tools runnable via a single `multi` command, reducing complexity and saving more compute time (e.g. in Picard the `wgs` `hybcap`, and `error` tools all require separate invocations).
+* **Speed**: Riker's tools run 12–38× faster than their Picard counterparts, measured across WGS, exome, and RNA-seq metrics (see [Performance](#performance)). Starting fresh also made it easy to compute _all_ the metrics in a single pass over the input via one `multi` command — cutting both complexity and compute, since in Picard `CollectWgsMetrics`, `CollectHsMetrics`, `CollectRnaSeqMetrics`, and `CollectMultipleMetrics` each require a separate invocation and a separate read of the data.
 * **Cleaner Output**: Picard's tools output an inconvenient mostly-TSV format with a variable number of `#`-commented header lines and sometimes multiple independent tables in the same file, making them harder than they should be to parse programmatically _and_ annoying to review manually.  Riker's outputs are simple TSVs with one table per output file that can easily be routed into `cat file | column -t` or python's `csv.DictReader` with no fuss.  In addition Riker standardizes on having the `sample` be the first column in every file - so you can easily concatenate files for many samples.
 * **Lightweight Distribution**: Picard carries a lot of baggage. It needs a JVM. It needs R and much of the tidyverse in order to produce plots.  The bioconda distribution requires a python interpreter to run it's wrapper script.  Running `pixi init && pixi add picard` results in a 1.2GB environment!  In contrast Riker is distributed as a single executable of < 10MB with no external dependencies.
 * **Maintenance**: Maintenance of Picard has been [minimal for some time](https://github.com/broadinstitute/picard/commits/master/), with what little activity there is coming mostly from the community.  Picard is owned by, but no longer actively led by, the Broad Institute, making its path forward unclear.  Picard also suffers from some now-unnecessary complexity and years of less-than-necessary maintenance.  All of this makes a fresh start more appealing.
 
 ## Performance
 
-Numbers below are from a [reproducible benchmark pipeline](benchmark-pipeline/) run on **2026-05-06** on a single AWS `r8id.xlarge` instance (4 vCPU, 32 GB RAM, local NVMe), against publicly-available 1000 Genomes 30× WGS BAMs (transcoded from CRAM) and the GIAB Ashkenazi exome trio.
+Numbers below are from a [reproducible benchmark pipeline](benchmark-pipeline/) run on **July 5th 2026** on a single AWS `m8a.2xlarge` instance (8 vCPU AMD EPYC 9R45, 32 GB RAM, gp3 EBS provisioned at 1000 MiB/s), against publicly-available 1000 Genomes WGS BAMs (transcoded from CRAM and downsampled to 4–30×), the GIAB Ashkenazi exome trio, and two ENCODE RNA-seq BAMs. The benchmark was performed using **riker 0.4.0** vs. the latest version of each tool available from `bioconda` as of the benchmark date.
 
-Tool versions:
+### Riker vs. Picard
 
-- **Riker**: 0.2.0 release candidate (built from source on the host)
-- **Picard**: 3.4.0 on OpenJDK 25.0.2 (bioconda)
-- **mosdepth**: 0.3.14 (bioconda)
-- **samtools**: 1.23.1 (bioconda; used for staging — CRAM→BAM transcoding, downsampling with `view --subsample`, indexing)
+Picard is the tool every one of Riker's tools was written to match, so we'll keep this part short: tool for tool, Riker computes the same metrics **12–38× faster**.
 
-### WGS — Riker wgs vs. Picard CollectWgsMetrics
+![Riker vs. Picard: single-tool speedup for WGS, exome, and RNA-seq metrics, from 12.5× to 38.3×](https://raw.githubusercontent.com/fulcrumgenomics/riker/main/docs/images/fig1_vs_picard.png)
 
-| Sample    | BAM    | Cov | Riker Wall | Picard Wall | Speedup   | Riker RSS | Picard RSS |
-|---        |---     |--- |---         |---          |---        |---        |---         |
-| HG02675   | 7.1 GB | 4×  | 0:56       | 12:24       | **13.2×** | 0.74 GB   | 1.56 GB    |
-| HG02675   | 21.7 GB| 15× | 2:56       | 32:20       | **11.0×** | 0.74 GB   | 5.97 GB    |
-| HG02675   | 28.1 GB| 20× | 3:47       | 40:24       | **10.7×** | 0.74 GB   | 5.58 GB    |
-| HG00188   | 37.5 GB| 30× | 5:13       | 1:02:30     | **12.0×** | 0.74 GB   | 5.24 GB    |
-| HG02675   | 41.1 GB| 30× | 5:32       | 1:01:20     | **11.1×** | 0.74 GB   | 5.20 GB    |
+Whether single-threaded tool vs. tool, or multi-threaded via `multi`, Riker is massively faster than the aging Picard.
 
-### WGS — Riker multi vs. Picard Collect*Metrics
+### WGS depth: Riker vs. mosdepth
 
-| Sample    | BAM    | Cov | Riker Wall | Picard Wall (CMM + CWM) | Speedup   | Riker RSS | Picard peak RSS |
-|---        |---     |--- |---         |---                      |---        |---        |---              |
-| HG02675   | 7.1 GB | 4×  | 1:25       | 21:16   (8:44 + 12:32)  | **15.1×** | 1.44 GB   | 1.60 GB         |
-| HG02675   | 21.7 GB| 15× | 4:34       | 58:38   (26:32 + 32:06) | **12.8×** | 1.47 GB   | 5.97 GB         |
-| HG02675   | 28.1 GB| 20× | 5:58       | 1:15:12 (34:21 + 40:51) | **12.6×** | 1.48 GB   | 5.58 GB         |
-| HG00188   | 37.5 GB| 30× | 8:14       | 1:46:16 (46:36 + 59:40) | **12.9×** | 1.48 GB   | 5.24 GB         |
-| HG02675   | 41.1 GB| 30× | 8:45       | 1:51:55 (51:13 + 60:42) | **12.8×** | 1.47 GB   | 5.20 GB         |
+[mosdepth](https://github.com/brentp/mosdepth) is well known for being the fastest WGS coverage tool... until now. With both tools configured as closely to each other as possible, Riker is faster at every coverage *and* every thread count we measured — by **1.2–1.5×**, with the biggest multipliers at low coverage.
 
-Riker was tested with a single invocation of `riker --threads 4 multi --tools wgs gcbias alignment basic isize`.
-Picard was run twice, once for `CollectWgsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
+![Riker vs. mosdepth wall time across 4×–30× coverage, single-threaded; Riker 1.2–1.4× faster at every depth](https://raw.githubusercontent.com/fulcrumgenomics/riker/main/docs/images/fig2a_mosdepth_coverage.png)
 
-"Picard peak RSS" is the larger of the two sequential JVM runs — typically dominated by `CollectWgsMetrics`, which scales with genome size + coverage.
+![Riker vs. mosdepth wall time on a 30× genome across 1–4 threads; Riker 1.2–1.3× faster at every thread count](https://raw.githubusercontent.com/fulcrumgenomics/riker/main/docs/images/fig2b_mosdepth_threads.png)
 
-### WGS — Riker wgs vs. mosdepth
+Riker wins while doing *more* per base: it applies base quality score filtering and quality-aware mate-overlap correction (matching Picard's WGS semantics), while mosdepth is not base quality aware. Base quality filtering is the one difference we couldn't harmonize away — mosdepth has no switch for it — so Riker is doing strictly more work and still finishes first.
 
-| Sample        | BAM    | Cov | Riker Wall | mosdepth Wall | Δ                    | Riker RSS | mosdepth RSS |
-|---            |---     |--- |---         |---            |---                   |---        |---           |
-| HG02675_4x    | 7.1 GB | 4×  | 0:56       | 1:13          | Riker 23 % faster    | 0.74 GB   | 3.07 GB      |
-| HG02675_15x   | 21.7 GB| 15× | 2:56       | 2:29          | mosdepth 15 % faster | 0.74 GB   | 2.42 GB      |
-| HG02675_20x   | 28.1 GB| 20× | 3:47       | 2:59          | mosdepth 21 % faster | 0.74 GB   | 2.48 GB      |
-| HG00188_30x   | 37.5 GB| 30× | 5:13       | 3:48          | mosdepth 27 % faster | 0.74 GB   | 2.52 GB      |
-| HG02675_30x   | 41.1 GB| 30× | 5:32       | 4:05          | mosdepth 26 % faster | 0.74 GB   | 2.59 GB      |
+### RNA-seq: Riker vs. Picard & RustQC
 
-Both tools running pure single-thread. `mosdepth` was run with its default `-t 0` for zero _extra_ decompression threads, and with `--no-per-base`.
+For RNA-seq the field also includes Picard `CollectRnaSeqMetrics` and **RustQC** (Seqera's Rust RNA-seq QC toolkit, which is advertised as ~60× faster than the tools it reimplements), scope-matched so all three compute a comparable set of metrics. Single-threaded, Riker runs **31–38× faster than Picard** and **18–21× faster than RustQC**. RustQC threads well, but even at four threads it is still **~10× behind** Riker.
 
-Surprisingly Riker outperforms mosdepth on the low-coverage (4×) sample, while mosdepth wins at higher depths.  The 15-27% delta is largely explainable by the fact that Riker is performing per-base quality score filtering, and quality-score aware mate-overlap computations whereas mosdepth does not examine quality scores.
-
-### Hybcap — Riker hybcap vs. Picard CollectHsMetrics
-
-Hybcap measurements are the mean of three GIAB Ashkenazi trio samples (HG002, HG003, HG004), each a ~9.8 GB exome BAM aligned to hs37d5 with the Agilent SureSelect Human All Exon V5 capture kit.
-
-| Sample          | BAM     | Kit         | Riker Wall | Picard Wall | Speedup   | Riker RSS | Picard RSS |
-|---              |---      |---          |---         |---          |---        |---        |---         |
-| AJ trio (mean)  | ~9.8 GB | Agilent v5  | 1:26       | 14:12       | **9.9×**  | 0.98 GB   | 2.45 GB    |
-
-### Hybcap — Riker multi vs. Picard Collect*Metrics
-
-| Sample          | BAM     | Kit         | Riker Wall | Picard Wall (CMM + CHsM) | Speedup   | Riker RSS | Picard peak RSS |
-|---              |---      |---          |---         |---                       |---        |---        |---              |
-| AJ trio (mean)  | ~9.8 GB | Agilent v5  | 1:45       | 22:07 (7:57 + 14:09)     | **12.6×** | 0.99 GB   | 3.23 GB         |
-
-Riker was tested with a single invocation of `riker --threads 4 multi --tools hybcap alignment basic isize`.
-Picard was run twice, once for `CollectHsMetrics` and once for `CollectMultipleMetrics` to generate a matching set of outputs.
-
-"Picard peak RSS" is the larger of the two sequential JVM runs — dominated by `CollectHsMetrics` on the hybcap trio.
+![Riker vs. Picard and RustQC on single- and paired-end RNA-seq; Riker 10–38× faster, with Picard shown as single-threaded only](https://raw.githubusercontent.com/fulcrumgenomics/riker/main/docs/images/fig3_rna.png)
 
 ## Installation
 
