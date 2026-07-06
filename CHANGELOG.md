@@ -9,66 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Toolkit-wide `--threads` option** for multithreaded input decoding — the
-  number of cores riker tries to saturate (it may spin a few more threads
-  internally to do so). It is a single, global budget (accepted before or after
-  the subcommand) that each command divides between decoding the input and its
-  own work. The single-pass tools (`wgs`, `alignment`, …) run their own work on
-  one thread and hand the rest to input decoding; `multi` lays the budget out
-  across decode threads, a dispatch thread, and parallel collector workers,
-  **tuned to the input format** (from benchmarking): BAM inflate is cheap so it
-  favors collector workers, while CRAM decode is expensive and parallelizes
-  well so it favors decode threads. BAM uses `noodles-bgzf`'s multithreaded BGZF
-  reader; CRAM sizes htslib's decode pool. Gains are sub-linear and flatten
-  past ~6 threads for BAM / ~8 for CRAM, but the sweet spot is platform- and
-  input-dependent. Left unset, the single-pass tools run single-threaded and
-  `multi` uses a small default pool.
-- **`rna`** command: RNA-seq QC metrics computed in a single pass — a port of
-  Picard `CollectRnaSeqMetrics` (base composition: coding / UTR / intronic /
-  intergenic / ribosomal; strand specificity; transcript 5'/3' coverage bias and
-  CV) together with fgbio `EstimateRnaSeqInsertSize` (insert size in transcript
-  space, introns collapsed), extended with read-level genomic origin (exonic /
-  intronic / intergenic / ambiguous / ribosomal reads), gene detection, splice-junction
-  annotation (known / partial-novel / novel, at observation and distinct-junction level),
-  transcript integrity (TIN: median / mean / stddev), and a per-biotype read-count file —
-  metrics informed by RSeQC, RNA-SeQC, and Qualimap. Accepts a gene model as UCSC refFlat, GTF, or GFF3
-  (GENCODE / Ensembl / RefSeq), auto-detected from file contents, with contig-name
-  reconciliation (`chr` add/strip, `MT`↔`chrM`, RefSeq accession → common name).
-  Strandedness is auto-detected by default (`--strand auto`); ribosomal territory
-  is the union of biotype-derived rRNA genes and an optional `--ribosomal-intervals`
-  file (BED or IntervalList). Writes `.rna-metrics.txt`, `.rna-biotype.txt` (+`.pdf`),
-  `.rna-gene-expression.pdf`, `.rna-coverage.pdf`, and `.rna-insert-size.txt` /
-  `-histogram.txt` (+`.pdf`).
-  Tunable via `--genes-detected-min-reads` (5), `--junction-min-intron` (50), and
-  `--tin-min-coverage` (10). Requires a
-  coordinate-sorted input; the `MC` (mate CIGAR) tag is required for the insert-size
-  metrics. Several Picard/fgbio behaviors are corrected and documented (top-1000
-  transcript selection, ribosomal-overlap union, non-overlapping coverage bins,
-  short-transcript bias exclusion, MC-derived fragment end, and an enclosure-based
-  insert-size acceptance rule) — see the "Differences in rna" section of the README.
+- **Toolkit-wide `--threads` option** to spread work across multiple cores. It
+  is a single global budget — accepted before or after the subcommand — that
+  each command splits between decoding the input and its own work. The
+  single-pass tools (`wgs`, `alignment`, …) do their own work on one thread and
+  hand the rest to input decoding; `multi` also spreads the budget across
+  parallel collector workers. Left unset, the single-pass tools stay
+  single-threaded and `multi` uses a small default pool. Gains are sub-linear
+  and taper off past a handful of threads, and the sweet spot depends on the
+  machine and whether the input is BAM or CRAM.
+  ([#44](https://github.com/fulcrumgenomics/riker/pull/44))
+- **`rna` command** — RNA-seq QC metrics in a single pass. It ports Picard
+  `CollectRnaSeqMetrics` (base composition, strand specificity, 5'/3' transcript
+  coverage bias) and fgbio `EstimateRnaSeqInsertSize` (insert size in transcript
+  space), and adds read-level genomic origin, gene detection, splice-junction
+  annotation, transcript integrity (TIN), and a per-biotype read-count file. The
+  gene model can be UCSC refFlat, GTF, or GFF3 (GENCODE / Ensembl / RefSeq),
+  auto-detected from the file, with contig-name reconciliation (`chr` add/strip,
+  `MT`↔`chrM`, RefSeq accessions). Strandedness auto-detects by default. Requires
+  a coordinate-sorted input. Several Picard/fgbio behaviours are corrected along
+  the way — see the "Differences in rna" section of the README and the new
+  [ERRATA.md](./ERRATA.md) file..
+  ([#40](https://github.com/fulcrumgenomics/riker/pull/40))
 
 ### Changed
 
-- **`multi --threads` is now the toolkit `--threads`.** It is reinterpreted as
-  the total thread budget (which `multi` divides between input decoding and
-  collector workers) rather than a bare worker count, and with no value given
-  `multi` now uses up to four threads (clamped to the core count) instead of a
-  fixed two. Existing `riker multi --threads N` invocations keep working.
-- **Faster `multi` at higher thread counts.** The reader→worker work queue now
-  uses the kanal channel instead of crossbeam-channel, ~4% lower wall-clock on a
-  12x WGS BAM at `--threads 6` (it avoids waking a worker that is about to pick
-  up its batch by spinning). Output is unchanged.
-- **Faster `hybcap` (~1.5x wall, -26% CPU at `--threads 3`).** Its per-read
-  coverage and bait/target overlap paths were rewritten to exploit coordinate
-  order and the merged, non-overlapping interval sets — contiguous depth-slice
-  fills plus a cursor sweep, instead of per-base target search and three
-  per-read interval-tree queries. Output is byte-identical. **`hybcap` now
-  requires a coordinate-sorted BAM** and aborts with an error on an out-of-order
-  record (it was previously order-agnostic).
-- **All commands validate output writability at startup** (fail-fast): the output
-  prefix's parent directory is checked for existence and writability before reading
-  any input, so a misspelled or unwritable output path fails immediately instead of
-  after a full pass over the data.
+- **`multi`'s `--threads` is now the total thread budget** — `multi` divides it
+  between input decoding and collector workers rather than treating it as a bare
+  worker count, and with no value given it now uses up to four threads (clamped
+  to the core count) instead of two. Existing `riker multi --threads N`
+  invocations keep working.
+  ([#44](https://github.com/fulcrumgenomics/riker/pull/44))
+- **`hybcap` now requires a coordinate-sorted BAM** and aborts on an
+  out-of-order record; it was previously order-agnostic. (This is what lets the
+  faster coordinate-order sweep below work.)
+  ([#45](https://github.com/fulcrumgenomics/riker/pull/45))
+- **All commands validate the output path at startup.** A misspelled or
+  unwritable output directory now fails immediately, before any input is read,
+  instead of after a full pass over the data.
+
+### Performance
+
+- **`wgs` is roughly 30% faster and uses about a third less peak memory.**
+  Several changes to the depth pipeline combine to do it: a SIMD pileup kernel
+  for the common no-overlapping-mate read, a slice-based depth buffer, and
+  precomputing the reference's non-N regions once up front instead of reloading
+  each contig. Measured on a 12× WGS BAM at four threads; output is
+  byte-identical.
+- **`hybcap` is ~1.5× faster** (about a quarter less CPU), from a
+  coordinate-order coverage and bait/target sweep in place of the old per-base
+  and interval-tree lookups. Output is byte-identical; note it now requires a
+  sorted BAM (see Changed).
+  ([#45](https://github.com/fulcrumgenomics/riker/pull/45))
+- **`multi` threads more efficiently**, splitting it's thread budget between
+  input decoding and worker threads with the split being optimized separately
+  for BAM vs. CRAM input.
+  ([#44](https://github.com/fulcrumgenomics/riker/pull/44),
+  [#49](https://github.com/fulcrumgenomics/riker/pull/49))
+- **Hash-heavy paths run faster** — frequency counters and the `error` model's
+  covariate lookups moved from SipHash to fxhash.
+  ([#48](https://github.com/fulcrumgenomics/riker/pull/48))
 
 ### Fixed
 
@@ -79,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`multi` output is now deterministic across thread counts.** Each collector
   is pinned to a single worker and receives batches in file order, so a
   parallel run is byte-identical to a single-threaded one; previously the
-  per-record output order of some collectors could vary with the thread count.
+  per-record output order of some collectors could, in rare circumstances,
+  vary with the thread count.
 
 ## [0.3.0] - 2026-06-24
 
