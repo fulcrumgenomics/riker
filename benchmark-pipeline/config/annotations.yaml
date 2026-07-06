@@ -1,0 +1,22 @@
+# Gene-model annotations for the RNA benchmark. Each entry is keyed by the
+# `annotation` column in samples.rna.tsv.
+#
+# The GTF is fetched once per annotation and shared by two of the three
+# RNA comparators directly:
+#   - riker rna  reads it via --gene-model  (auto-detects GTF)
+#   - rustqc rna reads it via --gtf
+# Picard CollectRnaSeqMetrics needs refFlat, which staging derives from the
+# same GTF via UCSC gtfToGenePred — so all three tools use one annotation
+# source. Ribosomal intervals for Picard are derived per-sample from the
+# GTF's rRNA/Mt_rRNA gene loci + the BAM's @SQ header (riker auto-derives
+# the equivalent from the GTF's rRNA biotypes).
+
+gencode_v50:
+  # GENCODE Release 50 (GRCh38.p14) — the current release as of 2026-07.
+  # Comprehensive annotation on the reference chromosomes (chr-named), which
+  # matches the ENCODE GRCh38 BAM contigs. Pinned to a specific release for
+  # reproducibility; bump the release number here to re-benchmark on a newer
+  # annotation. (The ENCODE BAMs were aligned against GENCODE v29, but this
+  # is a performance-only benchmark — the tools do equivalent work regardless
+  # of annotation vintage.)
+  gtf_url: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.annotation.gtf.gz"

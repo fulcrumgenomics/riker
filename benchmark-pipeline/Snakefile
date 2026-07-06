@@ -12,6 +12,7 @@
 # Adding a new comparator: add a rule under workflow/rules/, update
 # COMPARATORS in this file, and add it to the plot.R color palette.
 
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -39,10 +40,22 @@ STAGE_DIR          = _abs(config["stage_dir"])
 RESULTS_DIR        = _abs(config["results_dir"])
 RIKER_BIN          = _abs(config["riker_bin"])
 
+# RNA benchmarking is optional: a config without these keys (e.g. an older
+# wgs/hybcap-only config) simply loads no RNA samples or annotations. The
+# RustQC subset config falls back to the in-repo default so the rna rules
+# always have a valid path.
+SAMPLES_RNA_TSV    = _abs(config["samples_rna_tsv"]) if config.get("samples_rna_tsv") else None
+ANNOTATIONS_YAML   = _abs(config["annotations_yaml"]) if config.get("annotations_yaml") else None
+RUSTQC_RNA_CONFIG  = _abs(config.get("rustqc_rna_config") or "config/rustqc.rna.subset.yaml")
+
 with open(REFERENCES_YAML) as fh:
     REFERENCES = yaml.safe_load(fh)
 with open(KITS_YAML) as fh:
     KITS = yaml.safe_load(fh)
+ANNOTATIONS = {}
+if ANNOTATIONS_YAML and ANNOTATIONS_YAML.exists():
+    with open(ANNOTATIONS_YAML) as fh:
+        ANNOTATIONS = yaml.safe_load(fh) or {}
 
 
 # --- Sample sheets --------------------------------------------------------
@@ -67,9 +80,21 @@ def _load_samples():
                 if c not in hyb.columns:
                     hyb[c] = "-"
             frames.append(hyb)
+    if SAMPLES_RNA_TSV is not None and SAMPLES_RNA_TSV.exists():
+        rna = pd.read_csv(SAMPLES_RNA_TSV, sep="\t", dtype=str).fillna("-")
+        if len(rna) > 0:
+            rna["input_type"] = "rna"
+            frames.append(rna)
     if not frames:
-        raise SystemExit("No samples loaded — check samples_wgs_tsv / samples_hybcap_tsv")
+        raise SystemExit(
+            "No samples loaded — check samples_wgs_tsv / samples_hybcap_tsv / samples_rna_tsv"
+        )
     df = pd.concat(frames, ignore_index=True)
+    # Columns present in only some sheets (rna's annotation/strand, wgs's
+    # downsample_*) come out NaN for the other sheets' rows after the concat;
+    # normalise to "-" so the subset predicates below (which test for "-"/"")
+    # don't misclassify a row on a column its sheet never carried.
+    df = df.fillna("-")
     # Default benchmark=Y if column absent. Allows older sample sheets to
     # still work without a forced edit.
     if "benchmark" not in df.columns:
@@ -87,6 +112,11 @@ BENCHMARK_SAMPLES = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "benchmark"].uppe
 # Useful subsets for rule wildcards / DAG construction.
 WGS_SAMPLES    = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "input_type"] == "wgs"]
 HYBCAP_SAMPLES = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "input_type"] == "hybcap"]
+# RNA samples have .bam source_urls with no downsample, so they land in
+# BAM_SOURCE_SAMPLES below and are fetched as-is to input.bam (coordinate-
+# sorted already; no markdup — the RustQC subset drops dupRadar and riker
+# uses its non-MC path).
+RNA_SAMPLES    = [s for s in SAMPLE_NAMES if SAMPLES.loc[s, "input_type"] == "rna"]
 DOWNSAMPLE_SAMPLES = [
     s for s in SAMPLE_NAMES
     if SAMPLES.loc[s, "downsample_from"] not in ("-", "")
@@ -107,11 +137,17 @@ BAM_SOURCE_SAMPLES = [
 # Profile metadata. The riker_args field is exactly what gets passed to
 # the riker binary after `--threads N --input ... --output ...`.
 PROFILES = {
-    "wgs-only": {
-        "input_type": "wgs",
-        "riker_args": ["wgs"],
-        "needs_ref": True,
-    },
+    # Fair three-way WGS comparison, thread-swept 1-4 for riker and mosdepth
+    # (Picard CollectWgsMetrics can't thread → it appears in wgs-t1 only).
+    # All three are harmonized to the same read/base selection: MAPQ 20,
+    # orphan/unpaired reads counted, duplicates + secondary + supplementary
+    # excluded, mosdepth in accurate mode (no -x fast, no -a fragment). riker
+    # and Picard additionally keep base-quality filtering (their feature;
+    # mosdepth can't BQ-filter). The trailing -t{N} encodes the thread budget.
+    "wgs-t1": {"input_type": "wgs", "riker_args": ["wgs", "--include-unpaired-reads"], "needs_ref": True},
+    "wgs-t2": {"input_type": "wgs", "riker_args": ["wgs", "--include-unpaired-reads"], "needs_ref": True},
+    "wgs-t3": {"input_type": "wgs", "riker_args": ["wgs", "--include-unpaired-reads"], "needs_ref": True},
+    "wgs-t4": {"input_type": "wgs", "riker_args": ["wgs", "--include-unpaired-reads"], "needs_ref": True},
     "wgs-bundle": {
         "input_type": "wgs",
         "riker_args": ["multi", "--tools", "wgs", "alignment", "basic", "isize", "gcbias"],
@@ -127,6 +163,13 @@ PROFILES = {
         "riker_args": ["multi", "--tools", "hybcap", "alignment", "basic", "isize"],
         "needs_ref": False,
     },
+    # RNA thread-sweep: riker rna vs Picard CollectRnaSeqMetrics vs a
+    # scope-matched RustQC subset. The trailing -t{N} encodes the thread
+    # budget (see thread_count); riker + rustqc run at each of 1/2/4, while
+    # Picard (single-threaded) appears only in rna-t1.
+    "rna-t1": {"input_type": "rna", "riker_args": ["rna"], "needs_ref": False},
+    "rna-t2": {"input_type": "rna", "riker_args": ["rna"], "needs_ref": False},
+    "rna-t4": {"input_type": "rna", "riker_args": ["rna"], "needs_ref": False},
 }
 
 # Comparator coverage matrix — which tools run against which profile.
@@ -139,10 +182,23 @@ PROFILES = {
 # rule still exists in workflow/rules/run_qualimap.smk; re-add it to
 # COMPARATORS to bring it back when running on a beefier host.
 COMPARATORS = {
-    "wgs-only": [
-        ("riker",       "main"),
-        ("picard-cwm",  "main"),       # CollectWgsMetrics
-        ("mosdepth",    "main"),
+    # riker + mosdepth thread-swept 1-4; picard-cwm (single-thread) in t1 only.
+    "wgs-t1": [
+        ("riker",      "main"),
+        ("picard-cwm", "main"),        # CollectWgsMetrics (single-threaded → t1 only)
+        ("mosdepth",   "main"),        # accurate + harmonized (see run_mosdepth.smk)
+    ],
+    "wgs-t2": [
+        ("riker",    "main"),
+        ("mosdepth", "main"),
+    ],
+    "wgs-t3": [
+        ("riker",    "main"),
+        ("mosdepth", "main"),
+    ],
+    "wgs-t4": [
+        ("riker",    "main"),
+        ("mosdepth", "main"),
     ],
     "wgs-bundle": [
         ("riker",          "main"),
@@ -158,6 +214,19 @@ COMPARATORS = {
         ("riker",          "main"),
         ("picard-cmm",     "base"),    # CollectMultipleMetrics (default 5 programs)
         ("picard-chsm",    "supp"),
+    ],
+    "rna-t1": [
+        ("riker",       "main"),
+        ("picard-crsm", "main"),   # CollectRnaSeqMetrics (single-threaded → t1 only)
+        ("rustqc",      "main"),   # scope-matched RustQC subset
+    ],
+    "rna-t2": [
+        ("riker",  "main"),
+        ("rustqc", "main"),
+    ],
+    "rna-t4": [
+        ("riker",  "main"),
+        ("rustqc", "main"),
     ],
 }
 
@@ -199,9 +268,52 @@ def target_bed_for_sample(sample: str) -> str:
 
 
 def thread_count(profile: str) -> int:
-    """Single-tool profiles run all tools at 1 thread; bundle profiles
-    run riker (and qualimap) at 4."""
+    """Threads for a profile. Single-tool profiles run 1; bundle profiles
+    run 4; the RNA thread-sweep profiles encode their budget in a trailing
+    -t{N} suffix (rna-t1/-t2/-t4)."""
+    m = re.search(r"-t(\d+)$", profile)
+    if m:
+        return int(m.group(1))
     return 4 if profile.endswith("-bundle") else 1
+
+
+def annotation_for_sample(sample: str) -> str:
+    return SAMPLES.loc[sample, "annotation"]
+
+
+def gene_model_gtf_for_sample(sample: str) -> str:
+    """GENCODE GTF path — read directly by riker rna (--gene-model) and
+    rustqc (--gtf), and the source for the derived refFlat + ribosomal
+    interval_list."""
+    return f"{STAGE_DIR}/annotations/{annotation_for_sample(sample)}/genes.gtf.gz"
+
+
+def refflat_for_sample(sample: str) -> str:
+    """refFlat derived from the GTF, for Picard CollectRnaSeqMetrics REF_FLAT."""
+    return f"{STAGE_DIR}/annotations/{annotation_for_sample(sample)}/refFlat.txt"
+
+
+def ribosomal_intervals_for_sample(sample: str) -> str:
+    """Per-sample rRNA interval_list (BAM @SQ header + GTF rRNA loci) for
+    Picard CollectRnaSeqMetrics RIBOSOMAL_INTERVALS."""
+    return f"{STAGE_DIR}/{sample}/ribosomal.interval_list"
+
+
+def strand_for_sample(sample: str) -> str:
+    """riker --strand / rustqc token: forward | reverse | unstranded."""
+    return SAMPLES.loc[sample, "strand"]
+
+
+# Picard STRAND_SPECIFICITY tokens for CollectRnaSeqMetrics.
+_PICARD_STRAND = {
+    "forward":    "FIRST_READ_TRANSCRIPTION_STRAND",
+    "reverse":    "SECOND_READ_TRANSCRIPTION_STRAND",
+    "unstranded": "NONE",
+}
+
+
+def picard_strand_for_sample(sample: str) -> str:
+    return _PICARD_STRAND[strand_for_sample(sample)]
 
 
 # --- DAG fan-out ----------------------------------------------------------
@@ -243,7 +355,7 @@ rule all:
 # the same set of names so any rule can match by sample.
 _PROFILE_REGEX = "|".join(PROFILES.keys())
 _REP_REGEX = r"\d+"
-_TOOL_REGEX = "riker|picard-cmm|picard-cwm|picard-chsm|mosdepth|qualimap"
+_TOOL_REGEX = "riker|picard-cmm|picard-cwm|picard-chsm|picard-crsm|mosdepth|qualimap|rustqc"
 
 
 wildcard_constraints:
@@ -260,4 +372,5 @@ include: "workflow/rules/run_riker.smk"
 include: "workflow/rules/run_picard.smk"
 include: "workflow/rules/run_mosdepth.smk"
 include: "workflow/rules/run_qualimap.smk"
+include: "workflow/rules/run_rustqc.smk"
 include: "workflow/rules/aggregate.smk"

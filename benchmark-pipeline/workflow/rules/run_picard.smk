@@ -21,8 +21,9 @@
 # ---- CollectWgsMetrics ---------------------------------------------------
 
 rule run_picard_cwm:
-    """CollectWgsMetrics. Produces both the headline wgs-only datum AND
-    the supplementary 'add CWM on top of CMM' datum for wgs-bundle."""
+    """CollectWgsMetrics. The single-threaded WGS comparator in the fair
+    three-way (wgs-t1), plus the supplementary 'CWM on top of CMM' datum for
+    wgs-bundle."""
     input:
         bam = f"{STAGE_DIR}/{{sample}}/input.bam",
         bai = f"{STAGE_DIR}/{{sample}}/input.bam.bai",
@@ -36,9 +37,13 @@ rule run_picard_cwm:
         cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cwm/rep{{rep}}/cmdline.txt",
         tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-cwm/rep{{rep}}/tool.log",
     wildcard_constraints:
-        profile = "wgs-only|wgs-bundle",
+        profile = "wgs-t1|wgs-bundle",
     params:
         xmx = config["picard_xmx_gb"],
+        # Harmonize to riker/mosdepth in the fair three-way (wgs-t1): count
+        # orphan/unpaired reads. In wgs-bundle, CWM is a Picard-faithful
+        # supplement to riker multi (default wgs), so leave it off there.
+        count_unpaired = lambda w: "true" if w.profile == "wgs-t1" else "false",
     threads: 1
     resources: bench=100
     shell:
@@ -49,8 +54,13 @@ rule run_picard_cwm:
         cmd=(picard CollectWgsMetrics
              "I={input.bam}"
              "R={input.ref}"
+             "COUNT_UNPAIRED={params.count_unpaired}"
              "O=$outdir/picard.wgs_metrics.txt")
         printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
+        # Cold cache: drop the page cache so the tool reads its inputs cold
+        # from disk — deterministic + size-uniform across the coverage ladder
+        # (no BAM fits-in-RAM advantage). Fails loudly without sudo/root.
+        sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
         _JAVA_OPTIONS="-Xmx{params.xmx}g" command time -v -o {output.time:q} \
             "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """
@@ -91,6 +101,10 @@ rule run_picard_chsm:
              "TARGET_INTERVALS={input.intervals}"
              "O=$outdir/picard.hs_metrics.txt")
         printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
+        # Cold cache: drop the page cache so the tool reads its inputs cold
+        # from disk — deterministic + size-uniform across the coverage ladder
+        # (no BAM fits-in-RAM advantage). Fails loudly without sudo/root.
+        sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
         _JAVA_OPTIONS="-Xmx{params.xmx}g" command time -v -o {output.time:q} \
             "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """
@@ -154,10 +168,59 @@ rule run_picard_cmm:
         # Append PROGRAM= entries (already shell-quoted by params.programs).
         eval "cmd+=( {params.programs} )"
         printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
+        # Cold cache: drop the page cache so the tool reads its inputs cold
+        # from disk — deterministic + size-uniform across the coverage ladder
+        # (no BAM fits-in-RAM advantage). Fails loudly without sudo/root.
+        sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
         # Async-IO is a JVM system property in picard 3.x, not a CLI flag.
         # Enable it so picard's BAM read/write threads at least somewhat
         # match riker --threads 4 in the bundle profiles.
         _JAVA_OPTIONS="-Xmx{params.xmx}g -Dsamjdk.async_io_read_samtools=true -Dsamjdk.async_io_write_samtools=true" \
             command time -v -o {output.time:q} \
                 "${{cmd[@]}}" > {log.tool_log:q} 2>&1
+        """
+
+
+# ---- CollectRnaSeqMetrics (rna profiles) --------------------------------
+
+rule run_picard_crsm:
+    """CollectRnaSeqMetrics — the direct analog of riker rna's base-level
+    RNA metrics. Single-threaded, so it only appears in the rna-t1 profile.
+    REF_FLAT (derived from the same GTF riker/rustqc use), RIBOSOMAL_INTERVALS
+    (per-sample rRNA loci), and the sample's STRAND_SPECIFICITY."""
+    input:
+        bam       = f"{STAGE_DIR}/{{sample}}/input.bam",
+        bai       = f"{STAGE_DIR}/{{sample}}/input.bam.bai",
+        refflat   = lambda w: refflat_for_sample(w.sample),
+        ribosomal = lambda w: ribosomal_intervals_for_sample(w.sample),
+    output:
+        time     = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-crsm/rep{{rep}}/time.txt",
+    log:
+        cmdline  = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-crsm/rep{{rep}}/cmdline.txt",
+        tool_log = f"{RESULTS_DIR}/run/{{sample}}/{{profile}}/picard-crsm/rep{{rep}}/tool.log",
+    wildcard_constraints:
+        profile = "rna-t1",
+    params:
+        xmx    = config["picard_xmx_gb"],
+        strand = lambda w: picard_strand_for_sample(w.sample),
+    threads: 1
+    resources: bench=100
+    shell:
+        r"""
+        set -euo pipefail
+        outdir="$(dirname {output.time:q})"
+        mkdir -p "$outdir"
+        cmd=(picard CollectRnaSeqMetrics
+             "I={input.bam}"
+             "REF_FLAT={input.refflat}"
+             "RIBOSOMAL_INTERVALS={input.ribosomal}"
+             "STRAND_SPECIFICITY={params.strand}"
+             "O=$outdir/picard.rna_metrics.txt")
+        printf '%s ' "${{cmd[@]}}" > {log.cmdline:q}; echo >> {log.cmdline:q}
+        # Cold cache: drop the page cache so the tool reads its inputs cold
+        # from disk — deterministic + size-uniform across the coverage ladder
+        # (no BAM fits-in-RAM advantage). Fails loudly without sudo/root.
+        sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+        _JAVA_OPTIONS="-Xmx{params.xmx}g" command time -v -o {output.time:q} \
+            "${{cmd[@]}}" > {log.tool_log:q} 2>&1
         """

@@ -21,9 +21,11 @@ import pandas as pd
 from parse_gnu_time import parse as parse_time
 
 
-# results/run/{sample}/{profile}/{tool}/rep{rep}/time.txt
+# <results_dir>/run/{sample}/{profile}/{tool}/rep{rep}/time.txt
+# Anchor on /run/ so we work for any results_dir name (the default config
+# uses results/, focused configs may use results-<scenario>/).
 PATH_RE = re.compile(
-    r"results/run/"
+    r"/run/"
     r"(?P<sample>[^/]+)/"
     r"(?P<profile>[^/]+)/"
     r"(?P<tool>[^/]+)/"
@@ -47,8 +49,21 @@ def picard_bundle_role(profile: str, tool: str) -> str | None:
 
 def thread_count(profile: str, tool: str) -> int:
     """Snakefile sets threads via the rule's threads: directive; we mirror
-    that here so bench.tsv accurately reflects what was requested."""
-    if profile.endswith("-bundle") and tool in ("riker", "qualimap"):
+    that here so bench.tsv accurately reflects what was requested. Picard is
+    always single-threaded and mosdepth runs single-thread in these
+    profiles; riker / rustqc / qualimap take the profile's budget. The RNA
+    thread-sweep profiles encode their budget in a trailing -t{N}
+    (wgs-t1..t4, rna-t1/-t2/-t4); bundle profiles use 4."""
+    if tool.startswith("picard-"):
+        return 1
+    m = re.search(r"-t(\d+)$", profile)
+    if m:
+        # riker and mosdepth are both swept in the -t{N} profiles (the total
+        # thread budget; mosdepth's -t is set to N-1 in the rule).
+        return int(m.group(1))
+    if tool.startswith("mosdepth"):
+        return 1  # hybcap-only mosdepth is single-thread
+    if profile.endswith("-bundle"):
         return 4
     return 1
 
@@ -65,6 +80,7 @@ def effective_threads(tool: str, requested: int) -> int:
 def tool_family(tool: str) -> str:
     if tool == "riker": return "riker"
     if tool.startswith("picard-"): return "picard"
+    if tool.startswith("mosdepth"): return "mosdepth"
     return tool
 
 
@@ -124,6 +140,7 @@ def collect_versions(riker_bin: str) -> dict[str, str]:
         # "Java memory size is set to ..." which is useless; grab the
         # second non-empty line which actually carries the version.
         "qualimap": _qualimap_version(),
+        "rustqc":   safe_version(["rustqc", "--version"]),
     }
 
 
@@ -155,7 +172,8 @@ def bam_size_gb(stage_dir: Path, sample: str) -> float:
     return bam.stat().st_size / 1e9
 
 
-def load_samples(wgs_path: Path, hyb_path: Path) -> pd.DataFrame:
+def load_samples(wgs_path: Path, hyb_path: Path,
+                 rna_path: Path | None = None) -> pd.DataFrame:
     frames = []
     if wgs_path.exists():
         wgs = pd.read_csv(wgs_path, sep="\t", dtype=str).fillna("-")
@@ -167,6 +185,11 @@ def load_samples(wgs_path: Path, hyb_path: Path) -> pd.DataFrame:
         if len(hyb) > 0:
             hyb["input_type"] = "hybcap"
             frames.append(hyb)
+    if rna_path is not None and rna_path.exists():
+        rna = pd.read_csv(rna_path, sep="\t", dtype=str).fillna("-")
+        if len(rna) > 0:
+            rna["input_type"] = "rna"
+            frames.append(rna)
     if not frames:
         return pd.DataFrame(columns=["name", "input_type"])
     df = pd.concat(frames, ignore_index=True)
@@ -188,6 +211,8 @@ def main():
     p.add_argument("--root", required=True, help="results/run dir")
     p.add_argument("--samples-wgs", required=True)
     p.add_argument("--samples-hybcap", required=True)
+    p.add_argument("--samples-rna", default="",
+                   help="Optional RNA sample sheet; absent for wgs/hybcap-only runs")
     p.add_argument("--riker-bin", required=True)
     p.add_argument("--stage-dir", required=True,
                    help="Where stage/<sample>/input.bam lives — passed through "
@@ -199,7 +224,11 @@ def main():
     with open(args.host) as fh:
         host = json.load(fh)
 
-    samples = load_samples(Path(args.samples_wgs), Path(args.samples_hybcap))
+    samples = load_samples(
+        Path(args.samples_wgs),
+        Path(args.samples_hybcap),
+        Path(args.samples_rna) if args.samples_rna else None,
+    )
     versions = collect_versions(args.riker_bin)
 
     run_root = Path(args.root)

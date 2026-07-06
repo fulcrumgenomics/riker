@@ -1,0 +1,3 @@
+name	source_url	annotation	strand	layout	approx_bam_gb	benchmark	notes
+ENCFF028IUE	https://www.encodeproject.org/files/ENCFF028IUE/@@download/ENCFF028IUE.bam	gencode_v50	forward	SE	2.7	Y	ENCODE K562 polyA RNA-seq; single-end; forward-stranded (STAR / GRCh38 + ERCC/phiX spike-ins)
+ENCFF482AEE	https://www.encodeproject.org/files/ENCFF482AEE/@@download/ENCFF482AEE.bam	gencode_v50	unstranded	PE	4.2	Y	ENCODE immune-cell (ENCSR039JPA) polyA RNA-seq; paired-end; unstranded

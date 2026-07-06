@@ -1,0 +1,65 @@
+# RustQC `rna` subset for a fair, scope-matched comparison against
+# `riker rna`. riker computes RSeQC-style RNA QC — read distribution /
+# genomic origin, strand inference, splice-junction annotation, TIN,
+# transcript-space insert size, gene-body coverage bias, and gene
+# detection.
+#
+# Schema note (verified against RustQC 0.2.1 src/config.rs): each tool is a
+# key under `rna:`. Most tools have an `enabled: bool` we can flip to false
+# to skip them entirely. TWO do NOT — `dupradar` and `featurecounts` have
+# no enable/disable and ALWAYS run as part of the single pass; the config
+# only toggles their OUTPUT files. So RustQC unavoidably does dupRadar +
+# featureCounts work on top of the scope-matched modules — noted in the
+# README; it means RustQC does strictly >= riker's work here.
+#
+# Passed as `rustqc rna ... -c rustqc.rna.subset.yaml`.
+
+rna:
+  # dupRadar / featureCounts: can't disable (no `enabled` field). Suppress
+  # their output files so at least nothing riker doesn't emit is written;
+  # the compute still runs.
+  dupradar:
+    dup_matrix: false
+    intercept_slope: false
+    density_scatter_plot: false
+    boxplot: false
+    expression_histogram: false
+    multiqc_intercept: false
+    multiqc_curve: false
+  featurecounts:
+    counts_file: false
+    summary_file: false
+    biotype_summary_file: false
+    biotype_counts: false
+    biotype_counts_mqc: false
+    biotype_rrna_mqc: false
+
+  # Disabled — no riker analog (these all have `enabled`):
+  read_duplication:
+    enabled: false
+  preseq:
+    enabled: false
+  junction_saturation:
+    enabled: false
+  flagstat:
+    enabled: false
+  idxstats:
+    enabled: false
+  samtools_stats:
+    enabled: false
+
+  # Kept — riker computes an analog:
+  bam_stat:
+    enabled: true          # riker read accounting
+  read_distribution:
+    enabled: true          # riker genomic origin
+  infer_experiment:
+    enabled: true          # riker strand detection
+  junction_annotation:
+    enabled: true          # riker known/partial/novel junctions
+  inner_distance:
+    enabled: true          # riker transcript-space insert size
+  tin:
+    enabled: true          # riker TIN
+  qualimap:
+    enabled: true          # riker coverage bias / CV (gene-body coverage)

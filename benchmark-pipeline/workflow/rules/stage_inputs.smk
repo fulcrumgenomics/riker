@@ -64,11 +64,18 @@ rule fetch_reference:
         # skipped. To pin, edit references.yaml manually with the value of
         # `md5sum stage_dir/refs/<ref>.fa` after a successful first fetch;
         # subsequent runs will then fail loudly on any mismatch.
-        if [[ -n {params.md5:q} ]]; then
+        #
+        # Bind to a bash variable first: Snakemake's :q formatter renders
+        # an empty string as nothing at all (not as ''), so inlining
+        # {{params.md5:q}} into a [[ ... ]] test would yield a bash syntax
+        # error when md5 is unset. Assigning to a quoted variable avoids
+        # the trap and lets us test cleanly.
+        md5_expected={params.md5:q}
+        if [[ -n "$md5_expected" ]]; then
             actual=$(md5sum "$out_fa" | awk '{{print $1}}')
-            if [[ "$actual" != {params.md5:q} ]]; then
+            if [[ "$actual" != "$md5_expected" ]]; then
                 echo "ERROR: md5 mismatch on reference {wildcards.ref}" >&2
-                echo "  expected: {params.md5}" >&2
+                echo "  expected: $md5_expected" >&2
                 echo "  actual:   $actual" >&2
                 exit 1
             fi
@@ -112,12 +119,13 @@ rule fetch_kit_intervals:
             http*|ftp://*) curl -sSfL --retry 10 --retry-all-errors --retry-delay 10 "$url" -o "$raw" ;;
             *) echo "ERROR: unsupported intervals URL scheme: $url" >&2; exit 1 ;;
         esac
-        # Reject empty / @-only files: process substitution swallows
-        # grep's exit-1 ("no match") so a malformed upstream that has no
-        # data rows would otherwise produce a silent header-only
-        # intervals.list and downstream tools would benchmark zero
-        # capture regions.
-        if [[ ! -s "$raw" ]] || ! grep -v '^@' "$raw" | grep -q .; then
+        # Reject empty / @-only files so a malformed upstream doesn't produce
+        # a silent header-only intervals.list (downstream tools would then
+        # benchmark zero capture regions). Count data rows with `grep -vc`
+        # rather than `grep -v ... | grep -q .`: under `set -o pipefail`, the
+        # `grep -q` short-circuits and SIGPIPEs the upstream grep (exit 141)
+        # on a LARGE kit file, so the negated pipeline falsely fires the guard.
+        if [[ ! -s "$raw" ]] || [[ "$(grep -vc '^@' "$raw")" -eq 0 ]]; then
             echo "ERROR: kit intervals file empty or header-only: $raw" >&2
             exit 1
         fi
@@ -257,3 +265,106 @@ rule index_bam:
     resources: bench=1
     shell:
         "samtools index -@ {threads} {input.bam}"
+
+
+# ---- RNA gene-model (GTF) fetch + refFlat derivation --------------------
+# The RNA BAMs themselves reuse fetch_source_bam (their source_url ends in
+# .bam) and index_bam — the ENCODE STAR alignments are already coordinate-
+# sorted, which is all riker rna + rustqc require. No markdup/fixmate: the
+# RustQC subset drops dupRadar (its only marked-dup consumer) and riker uses
+# its non-MC insert-size fallback.
+
+rule fetch_gene_model_gtf:
+    """Download a gene-model GTF (gzip). Read directly by riker rna and
+    rustqc; also the source for the Picard refFlat + ribosomal interval_list
+    derived below."""
+    output:
+        gtf = f"{STAGE_DIR}/annotations/{{annotation}}/genes.gtf.gz",
+    wildcard_constraints:
+        annotation = "|".join(ANNOTATIONS.keys()) if ANNOTATIONS else "DOESNOTMATCH",
+    params:
+        url = lambda w: ANNOTATIONS[w.annotation]["gtf_url"],
+    resources: bench=1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.gtf:q})"
+        url={params.url:q}
+        case "$url" in
+            s3://*)        aws s3 cp --no-sign-request "$url" {output.gtf:q} ;;
+            http*|ftp://*) curl -sSfL --retry 10 --retry-all-errors --retry-delay 10 "$url" -o {output.gtf:q} ;;
+            *) echo "ERROR: unsupported annotation URL scheme: $url" >&2; exit 1 ;;
+        esac
+        # Sanity: must be a valid non-empty gzip (guards against a mirror
+        # serving an HTML error page with a 200).
+        gzip -t {output.gtf:q}
+        """
+
+
+rule gtf_to_refflat:
+    """Convert a GTF to Picard refFlat via UCSC gtfToGenePred. Picard
+    CollectRnaSeqMetrics needs refFlat; riker + rustqc read the GTF directly,
+    so all three share one annotation source."""
+    input:
+        gtf = f"{STAGE_DIR}/annotations/{{annotation}}/genes.gtf.gz",
+    output:
+        refflat = f"{STAGE_DIR}/annotations/{{annotation}}/refFlat.txt",
+    wildcard_constraints:
+        annotation = "|".join(ANNOTATIONS.keys()) if ANNOTATIONS else "DOESNOTMATCH",
+    resources: bench=1
+    shell:
+        r"""
+        set -euo pipefail
+        d="$(dirname {output.refflat:q})"
+        # gunzip -c (not zcat): zcat on macOS only handles .Z, so this keeps
+        # the recipe portable to a non-Linux dev box.
+        gunzip -c {input.gtf:q} > "$d/genes.gtf"
+        # genePredExt columns 1-10 are name,chrom,strand,txStart,txEnd,
+        # cdsStart,cdsEnd,exonCount,exonStarts,exonEnds; column 12 is name2
+        # (the gene name, via -geneNameAsName2). refFlat = gene name followed
+        # by those first 10 columns.
+        gtfToGenePred -genePredExt -geneNameAsName2 -ignoreGroupsWithoutExons \
+            "$d/genes.gtf" "$d/genes.genePred"
+        awk 'BEGIN{{OFS="\t"}} {{print $12,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}}' \
+            "$d/genes.genePred" > {output.refflat:q}
+        rm -f "$d/genes.gtf" "$d/genes.genePred"
+        """
+
+
+rule build_ribosomal_intervals:
+    """Build a Picard ribosomal interval_list for CollectRnaSeqMetrics from
+    the sample BAM's sequence dictionary (@HD/@SQ) plus the rRNA / Mt_rRNA
+    gene loci in the annotation GTF. Per-sample because the @SQ set comes
+    from the BAM header. riker rna auto-derives the same rRNA loci from the
+    GTF's biotypes, so this gives Picard the equivalent ribosomal input."""
+    input:
+        bam = f"{STAGE_DIR}/{{sample}}/input.bam",
+        gtf = lambda w: gene_model_gtf_for_sample(w.sample),
+    output:
+        intervals = f"{STAGE_DIR}/{{sample}}/ribosomal.interval_list",
+    wildcard_constraints:
+        sample = "|".join(RNA_SAMPLES) if RNA_SAMPLES else "DOESNOTMATCH",
+    resources: bench=1
+    shell:
+        r"""
+        set -euo pipefail
+        # The SAM sequence dictionary (@HD + @SQ) becomes the interval_list header.
+        samtools view -H {input.bam:q} | grep -E '^@HD|^@SQ' > {output.intervals:q}
+        # Append rRNA / Mt_rRNA gene loci as interval_list data rows:
+        #   chrom<TAB>start(1-based)<TAB>end(1-based)<TAB>strand<TAB>gene_id
+        # GTF is 1-based inclusive, matching Picard interval_list coordinates.
+        # gene_id is extracted portably (POSIX split, not gawk match(...,arr)).
+        # gunzip -c, never zcat (zcat is .Z-only on macOS / non-portable).
+        gunzip -c {input.gtf:q} | awk -F'\t' '
+            $3 == "gene" && $9 ~ /gene_type "(rRNA|Mt_rRNA)"/ {{
+                split($9, a, "gene_id \"");
+                split(a[2], b, "\"");
+                print $1"\t"$4"\t"$5"\t"$7"\t"b[1]
+            }}' >> {output.intervals:q}
+        # Fail loudly if the annotation yielded zero rRNA rows (Picard would
+        # otherwise silently report all-zero ribosomal).
+        if ! grep -qv '^@' {output.intervals:q}; then
+            echo "ERROR: no rRNA/Mt_rRNA gene loci found in {input.gtf}" >&2
+            exit 1
+        fi
+        """

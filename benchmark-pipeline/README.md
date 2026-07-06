@@ -9,20 +9,46 @@ access only — no laptop-local files required.
 
 ## Profiles benchmarked
 
-Four riker invocations, each with its corresponding fair comparators:
+The riker invocations below, each paired with its fair comparators —
+coverage/QC tools for WGS and capture, `riker rna` for RNA-seq:
 
-| Profile | Riker | Picard | mosdepth |
-|---|---|---|---|
-| `wgs-only` | `riker wgs` | `CollectWgsMetrics` | `mosdepth -x` |
-| `wgs-bundle` | `riker multi --tools wgs alignment basic isize gcbias` | `CollectMultipleMetrics+CollectGcBiasMetrics` + `CollectWgsMetrics` | — |
-| `hybcap-only` | `riker hybcap` | `CollectHsMetrics` | `mosdepth --by targets.bed` |
-| `hybcap-bundle` | `riker multi --tools hybcap alignment basic isize` | `CollectMultipleMetrics` + `CollectHsMetrics` | — |
+| Profile | Riker | Picard | mosdepth | RustQC |
+|---|---|---|---|---|
+| `wgs-only` | `riker wgs` | `CollectWgsMetrics` | `mosdepth -x` | — |
+| `wgs-bundle` | `riker multi --tools wgs alignment basic isize gcbias` | `CollectMultipleMetrics+CollectGcBiasMetrics` + `CollectWgsMetrics` | — | — |
+| `wgs-mosdepth` | `riker wgs` | — | `mosdepth -x` **and** `mosdepth` (no `-x`) | — |
+| `hybcap-only` | `riker hybcap` | `CollectHsMetrics` | `mosdepth --by targets.bed` | — |
+| `hybcap-bundle` | `riker multi --tools hybcap alignment basic isize` | `CollectMultipleMetrics` + `CollectHsMetrics` | — | — |
+| `rna-t{1,2,4}` | `riker rna` | `CollectRnaSeqMetrics` (t1 only) | — | `rustqc rna` (scope-matched subset) |
+
+`wgs-mosdepth` is the **fair** mosdepth comparison. The `wgs-only`
+profile runs mosdepth with `-x` (no CIGAR walk, no mate-overlap
+deduplication) — fast, but not accuracy-equivalent to riker. The
+`wgs-mosdepth` profile runs mosdepth both with and without `-x` so we
+can quote both numbers honestly. See
+[`config/mosdepth-compare.config.yaml`](config/mosdepth-compare.config.yaml)
+for the focused config that pins this to a single 30× sample over 3
+replicates.
+
+The **RNA** profiles compare `riker rna` against Picard
+`CollectRnaSeqMetrics` (the direct base-level analog) and a
+**scope-matched RustQC subset**. RustQC (Seqera) runs ~15 RNA-QC tools in
+one pass; [`config/rustqc.rna.subset.yaml`](config/rustqc.rna.subset.yaml)
+disables the modules riker has no analog for (dupRadar, preseq,
+read-duplication, junction saturation, the samtools passthroughs) so the
+two do comparable work. Both riker and RustQC are compared as their
+projects distribute them — riker's multivers `dist` build vs RustQC's
+bioconda build.
 
 Threading: single-tool profiles run **1 thread** for every tool. Bundle
 profiles run **riker `--threads 4`**; Picard `CollectMultipleMetrics`
 runs with `samjdk.async_io_*=true` JVM properties to be at least
 somewhat fair vs riker's multithreading. Supplementary Picard runs
-(`CollectWgsMetrics`, `CollectHsMetrics`) stay at 1 thread.
+(`CollectWgsMetrics`, `CollectHsMetrics`) stay at 1 thread. The RNA
+profiles instead run a **thread sweep** — riker and RustQC at 1, 2, and 4
+threads (`rna-t1/-t2/-t4`) — since both are multithreaded and we want
+their scaling curves; Picard `CollectRnaSeqMetrics` can't thread and runs
+only in `rna-t1`.
 
 **Qualimap** is implemented in `workflow/rules/run_qualimap.smk` but
 not enabled in the default `COMPARATORS` matrix (Snakefile). It OOMs
@@ -78,14 +104,56 @@ If the BAMs turn out to be hs37d5 instead, switch the `grch37_b37`
 entry's `fasta_url` in `config/references.yaml` to point at hs37d5 and
 re-run staging.
 
+**RNA** — two ENCODE polyA RNA-seq BAMs (GRCh38, STAR-aligned), one
+single-end and one paired-end, exercising both strand modes:
+
+| Sample | Source | Layout | Strand | Approx BAM |
+|---|---|---|---|---|
+| `ENCFF028IUE` | ENCODE (K562) | single-end | forward | 2.7 GB |
+| `ENCFF482AEE` | ENCODE (immune, ENCSR039JPA) | paired-end | unstranded | 4.2 GB |
+
+Fetched via `encodeproject.org/@@download` and used **as-is** — no
+markdup/fixmate: they're already coordinate-sorted (all three tools need
+that), the RustQC subset drops dupRadar (its only marked-dup consumer),
+and `riker rna` falls back to its non-MC insert-size path. No genome
+FASTA is staged either — `riker rna`, `CollectRnaSeqMetrics`, and
+`rustqc rna` on BAM input don't need one.
+
+The gene model is **GENCODE** (release pinned in
+[`config/annotations.yaml`](config/annotations.yaml), currently v50).
+`riker rna` and `rustqc` read the GTF directly; staging derives a Picard
+`refFlat` (via UCSC `gtfToGenePred`) and a per-sample rRNA
+`interval_list` (the GTF's rRNA/Mt_rRNA loci under the BAM's `@SQ`
+header) for `CollectRnaSeqMetrics` — one annotation source, three tools.
+(The ENCODE BAMs were aligned against GENCODE v29; since this is a
+performance-only benchmark, QC'ing against a newer annotation doesn't
+change the work each tool does.) Extend
+[`config/samples.rna.tsv`](config/samples.rna.tsv) to add samples.
+
 ## Setup
 
 ### Pre-`./install.sh` checklist (fresh EC2 / Linux box)
 
 These steps aren't done by `install.sh` itself:
 
-1. **Mount the local NVMe instance store** (c5d / i4i / m6id / r8id-class
-   instances ship with an unmounted ephemeral disk):
+1. **Provision fast scratch storage.** Stage BAMs on a volume with high
+   *sustained* throughput — riker is now fast enough that storage
+   bandwidth, not decode, can bound the WGS runs. Two options:
+
+   - **Provisioned gp3 EBS (recommended, and required for the `m8a`-class
+     hosts below).** `m8a` instances have no local instance store, so
+     attach a gp3 volume and dial its throughput to the **1000 MiB/s**
+     ceiling (with matching 16000 IOPS) so I/O isn't the limiter.
+     Warm-cache-only runs plus the `bench=100` serialization (one timed
+     job at a time) keep EBS random-read variance out of the numbers.
+     Instance-store NVMe throughput, by contrast, is provisioned per
+     instance *size*, so a small benching box can't buy bandwidth without
+     also buying vCPUs/RAM — a gp3 volume decouples the two.
+
+   - **Local NVMe instance store** (`c5d` / `i4i` / `m6id` / `r8id`-class)
+     is still fine if the instance size already gives enough throughput.
+
+   Either way, format + mount and point `stage_dir` at it:
 
    ```bash
    sudo mkfs.xfs /dev/nvme1n1                 # check `lsblk` for the device
@@ -157,24 +225,78 @@ After the smoke run:
 - `results/plots/0[1-6]*.pdf` — six diagnostic plots
 - `results/host.json` — host metadata (CPU, mem, EC2 instance type, etc.)
 
+## Fair mosdepth comparison (focused, ~2 hours per host)
+
+```bash
+./run.sh config/mosdepth-compare.config.yaml --cores $(nproc)
+```
+
+Runs the `wgs-mosdepth` profile against a single 30× sample
+(`HG00188_30x`, chosen because it had the largest mosdepth `-x`
+advantage in v1) over **3 replicates**, producing a three-way
+wall-time comparison:
+
+- `riker wgs`
+- `mosdepth -x` (the published "fast" setting; skips CIGAR + mate-overlap)
+- `mosdepth` (no `-x`; CIGAR walk + mate-overlap correction, matches
+  riker's accuracy)
+
+Outputs land in `results-mosdepth-compare/` (separate from the main
+`results/` so it doesn't collide with a full perf run).
+
+### Cross-architecture: x86_64 + Graviton in parallel
+
+Run the same config on two instances simultaneously. Without Picard or
+Qualimap in the comparator set we don't need the JVM headroom that
+forced the v1 run onto memory-optimized hardware — riker peaks under
+1 GB and mosdepth under 3 GB, so a **compute-optimized** pair is the
+right shape this time:
+
+| Host | Instance type |
+|---|---|
+| x86_64 | `c8id.xlarge` (4 vCPU, 16 GB, NVMe) — Intel Sierra Forest |
+| Graviton | `c8gd.xlarge` (4 vCPU, 8 GB, NVMe) — Graviton 4 |
+
+On each host:
+
+```bash
+git clone https://github.com/fulcrumgenomics/riker.git
+cd riker/benchmark-pipeline
+./install.sh
+./run.sh config/mosdepth-compare.config.yaml --cores $(nproc)
+```
+
+When both finish, copy each host's `results-mosdepth-compare/bench.tsv`
++ `host.json` off the instance. The `host.json` records arch / CPU /
+instance type, so concatenating the two `bench.tsv`s with a host-id
+column is enough to produce a side-by-side x86 vs aarch64 table.
+
 ## Full performance run
 
 ```bash
 ./run.sh config/performance.config.yaml --cores $(nproc)
 ```
 
-Storage budget: the staged BAMs total ~180 GB with the default
-five-WGS sample set (HG04131 disabled), or ~230 GB with all six. Use a
-c5d / i4i / m6id / r8id-class EC2 instance with local NVMe and
-configure `stage_dir:` (in `config/performance.config.yaml`) to point
-there. **Do not use EBS** for staged BAMs — random-read variance
-contaminates measurements. The pipeline was first validated on
-`r8id.xlarge` (4 vCPU / 32 GB / 220 GB NVMe) which fits the default
-sample set with ~45 GB headroom.
+Storage budget: the staged inputs total ~195 GB with the default
+five-WGS sample set (HG04131 disabled) — ~180 GB WGS/capture BAMs plus
+~14 GB of RNA (two ENCODE BAMs + the GENCODE GTF) — or ~245 GB with all
+six WGS samples. Point `stage_dir:` (in
+`config/performance.config.yaml`) at the scratch volume from the setup
+checklist.
 
-Replicates default to 1; bundle profiles run riker at 4 threads.
-With ~45 timed cells × ~2-50 minutes each, expect ~12-20 hours of
-wall-clock on a 4-vCPU host. Bump `replicates:` in the config to 3
+Recommended host: **`m8a.2xlarge`** (8 vCPU / 32 GB) with a **provisioned
+gp3 EBS** volume at 1000 MiB/s. That keeps the 32 GB RAM of the original
+`r8id.xlarge` validation host (enough for Picard's ~6 GB JVM) while adding
+vCPU headroom for the OS and for the RNA thread sweep (riker/RustQC at
+2 and 4 threads). Unlike the earlier "local NVMe, never EBS" guidance,
+a provisioned gp3 volume is the right call here: riker got fast enough
+that storage throughput matters, and gp3 lets you buy 1000 MiB/s without
+oversizing the instance. Warm-cache runs + `bench=100` serialization keep
+EBS variance out of the measurements.
+
+Replicates default to 1; bundle profiles run riker at 4 threads and the
+RNA profiles sweep 1/2/4. With ~60 timed cells × ~1-50 minutes each,
+expect ~14-22 hours of wall-clock. Bump `replicates:` in the config to 3
 once you have a multi-day window and want min/max variance bars.
 
 ### Resuming after a failure
@@ -276,9 +398,10 @@ timed rules and contaminate every measurement.
 ## Out of scope (v1)
 
 - Accuracy correlation between riker and Picard outputs. Not planned.
-- Thread-scaling sweep (one thread setting per profile per spec).
+- Thread-scaling sweep for the WGS/capture profiles (one thread setting
+  each). The RNA profiles do sweep 1/2/4 threads for riker + RustQC.
 - Multi-kit hybcap comparison.
 - samtools stats.
 - Multi-node / cluster execution.
-- riker `error` subcommand (not in any of the four profiles).
+- riker `error` subcommand (not in any benchmark profile).
 - Cold-cache vs warm-cache comparison (warm only).

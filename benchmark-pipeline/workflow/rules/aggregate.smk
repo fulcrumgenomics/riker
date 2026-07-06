@@ -21,17 +21,25 @@ rule aggregate_bench:
     params:
         samples_wgs    = str(SAMPLES_WGS_TSV),
         samples_hybcap = str(SAMPLES_HYBCAP_TSV),
+        samples_rna    = str(SAMPLES_RNA_TSV) if SAMPLES_RNA_TSV else "",
         run_root       = f"{RESULTS_DIR}/run",
         riker_bin      = str(RIKER_BIN),
         stage_dir      = str(STAGE_DIR),
     resources: bench=1
     shell:
         r"""
+        # --samples-rna is optional; bind to a shell var first because
+        # Snakemake's :q renders an empty string as nothing (not ''), which
+        # would let argparse swallow the next flag as its value.
+        samples_rna={params.samples_rna:q}
+        rna_arg=()
+        [[ -n "$samples_rna" ]] && rna_arg=(--samples-rna "$samples_rna")
         python {WORKDIR}/workflow/scripts/merge_results.py \
             --host {input.host:q} \
             --root {params.run_root:q} \
             --samples-wgs {params.samples_wgs:q} \
             --samples-hybcap {params.samples_hybcap:q} \
+            "${{rna_arg[@]}}" \
             --riker-bin {params.riker_bin:q} \
             --stage-dir {params.stage_dir:q} \
             --out {output:q}
