@@ -1149,9 +1149,9 @@ dependencies = [
 
 [[package]]
 name = "kuva"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e99d9ad687ca5c652ca192eee362606e91a494692fa0c383b810fc5eb5a7a9"
+checksum = "6667b60a6adcb413e8909641652da5fae201bb5aaff59d731d348588ec66d6f3"
 dependencies = [
  "chrono",
  "colorous",

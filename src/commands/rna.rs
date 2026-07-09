@@ -1295,7 +1295,10 @@ impl RnaCollector {
             .with_x_label("Normalized Position (5' → 3')")
             .with_y_label("Normalized Coverage")
             .with_x_axis_min(0.0)
-            .with_x_axis_max(100.0);
+            .with_x_axis_max(100.0)
+            // Anchor the filled area at 0 so its height reads as magnitude and the 5'/3' falloff
+            // isn't exaggerated by a floating auto-floored baseline.
+            .with_y_axis_min(0.0);
         write_plot_pdf(plots, layout, &self.coverage_plot_path)
     }
 

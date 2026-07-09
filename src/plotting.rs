@@ -144,17 +144,23 @@ pub fn write_insert_size_histogram_pdf(
         return Ok(());
     }
 
-    // Snap the x-axis max up to a clean multiple of kuva's tick step so the last major
-    // gridline lands on the axis edge (see the isize collector's original note).
+    // Give the axis ~10 major ticks so insert sizes are easy to read off the grid, and keep it
+    // tight to the data. Two independent explicit settings:
+    //   * tick step — kuva's auto step for this range is much coarser (it targets fewer ticks), so
+    //     we set our own; this only controls gridline density, not the axis range.
+    //   * max — left to auto, kuva nice-rounds the data max up (plus a small breathing-room pad),
+    //     which leaves a band of empty plot past these long-tailed distributions, so we pin it to
+    //     the data max. Unlike the pre-0.4.0 code we do NOT round it up to a whole tick (that was a
+    //     workaround for the old axis over-provisioning, fixed in 0.4.0) — a major tick simply
+    //     stops short of the edge, which is fine.
     let x_tick_step = compute_tick_step(0.0, data_x_max, 10);
-    let x_axis_max = (data_x_max / x_tick_step).ceil() * x_tick_step;
 
     let layout = standard_layout(&plots)
         .with_title(title)
         .with_x_label("Insert Size (bp)")
         .with_y_label("Read Pairs")
         .with_x_axis_min(0.0)
-        .with_x_axis_max(x_axis_max)
+        .with_x_axis_max(data_x_max)
         .with_x_tick_step(x_tick_step)
         .with_minor_ticks(5)
         .with_show_minor_grid(true)
