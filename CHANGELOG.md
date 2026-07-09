@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Upgraded the `kuva` plotting library to 0.4.0 and removed the plot-layout workarounds its fixes make unnecessary.** The insert-size charts (`isize` and the `rna` transcript-space insert size) no longer round the x-axis up to a whole tick — the axis now fits tight to the data while keeping the readable ~100 bp / ~50 bp gridlines — and the `gcbias` chart drops a manual y2-axis-label offset that was compensating for label mis-positioning in the old release. The upgrade additionally tightens categorical bar spacing, text measurement, and legend-box sizing across every chart with no code change on our side.
+
 ### Fixed
 
 - **`basic` base-distribution-by-cycle now reverse-complements reverse-strand reads.** Reverse-strand reads had their per-cycle index reversed but their bases left un-complemented, so each reverse read contributed the *complement* of the base that was sequenced. This flattened the per-cycle curves toward near-equal A≈T and C≈G (most visible on strand-asymmetric libraries such as EM-seq/bisulfite). The distribution is now computed in sequencing order, so an aligned BAM agrees with its Picard `RevertSam`-reverted counterpart. Mean-quality-by-cycle and quality-score-distribution were unaffected.
+- **The mean-quality-by-cycle (`basic`) and transcript-coverage (`rna`) charts now anchor their y-axis at 0.** Both are filled-area charts whose data sits well above zero, so the y-axis previously auto-floored just below the data and the fill "floated", visually exaggerating the falloff (e.g. transcript coverage looked like it crashed to zero at the 5'/3' ends when it was really ~0.4). Anchoring at 0 makes the fill height read as true magnitude.
 
 ## [0.4.0] - 2026-07-06
 

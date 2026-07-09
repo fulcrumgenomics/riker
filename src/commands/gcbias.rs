@@ -598,7 +598,6 @@ impl GcBiasCollector {
             .with_x_label("GC%")
             .with_y_label("Normalized Coverage")
             .with_y2_label("Base Quality")
-            .with_y2_label_offset(-15.0, 0.0)
             .with_reference_line(
                 ReferenceLine::horizontal(1.0).with_color(FG_GRAY).with_dasharray(""),
             )

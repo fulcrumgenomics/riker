@@ -471,7 +471,10 @@ impl BasicCollector {
             .with_title(format!("{} Mean Quality by Cycle", self.plot_title_prefix))
             .with_x_label("Cycle")
             .with_y_label("Mean Quality")
-            .with_x_axis_max(max_cycle + 1.0);
+            .with_x_axis_max(max_cycle + 1.0)
+            // Anchor at 0 so the filled area reads as magnitude: a 1-point drift over the read looks
+            // negligible (as it should) while a real 5-10 point drop stands out.
+            .with_y_axis_min(0.0);
 
         write_plot_pdf(plots, layout, &self.mean_qual_plot_path)
     }
