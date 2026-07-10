@@ -117,6 +117,16 @@ const IDX_T: usize = (b'T' & BASE_BITS) as usize;
 /// `& 0x1F`) and `qual_counts` (which previously checked literal `b'N'`).
 const ACGT_BITMASK: u32 = (1 << IDX_A) | (1 << IDX_C) | (1 << IDX_G) | (1 << IDX_T);
 
+/// Watson–Crick complement of every byte, indexed by the raw sequence byte.
+/// Reverse-strand reads are stored in the BAM reverse-complemented relative
+/// to sequencing order, so recovering the base that was sequenced at a given
+/// cycle requires complementing each stored base (the cycle *index* reversal
+/// is handled separately in `process_record`). A/C/G/T swap case-insensitively;
+/// every other byte (N, lowercase n, IUPAC ambiguity codes, `=`) maps to
+/// itself so it still folds into the residual "other / N" bucket after the
+/// `& 0x1F` slot mask. Built by `build_complement_lut`.
+const COMPLEMENT: [u8; 256] = build_complement_lut();
+
 /// Per-cycle accumulators. The hot loop touches exactly one `CycleStats`
 /// per base: one increment of `qual_sum` plus one increment of the slot in
 /// `base_counts` selected by `(base & 0x1F)`. Both the per-cycle total and
@@ -203,9 +213,13 @@ impl BasicCollector {
 
     /// Per-record inner loop, monomorphized on traversal direction so the
     /// `is_reverse` choice happens once at dispatch time rather than once per
-    /// base. With `REVERSE = false` the cycle index is `i` (forward); with
-    /// `REVERSE = true` it is `n - 1 - i` (reverse-complemented reads in the
-    /// BAM are stored in the opposite orientation from sequencing).
+    /// base. With `REVERSE = false` bases are counted as-is at cycle index `i`
+    /// (forward). With `REVERSE = true` the BAM stores the read
+    /// reverse-complemented relative to sequencing order, so recovering the
+    /// original per-cycle base requires *both* reversing the cycle index to
+    /// `n - 1 - i` *and* complementing each base via `COMPLEMENT`. Quality
+    /// scores are only reversed (not complemented), which the cycle-index
+    /// reversal already handles.
     ///
     /// The caller guarantees `seq.len() == quals.len()` (call site
     /// pre-slices both to `n = min(seq.len(), quals.len())`) and that
@@ -222,7 +236,11 @@ impl BasicCollector {
         let n = seq.len();
         let cycles = &mut cycles[..n];
         for i in 0..n {
-            let base = seq[i];
+            // On the reverse path, complement the stored base so the base
+            // counted at the reversed cycle index matches the base actually
+            // sequenced. `if REVERSE` is a compile-time const, so the forward
+            // monomorphization never touches `COMPLEMENT`.
+            let base = if REVERSE { COMPLEMENT[seq[i] as usize] } else { seq[i] };
             let q = quals[i];
             let cycle_idx = if REVERSE { n - 1 - i } else { i };
             // The mask proves `bi < 32`, so the indexed store skips bounds
@@ -652,6 +670,33 @@ pub struct QualityScoreDistributionMetric {
     pub frac_bases: f64,
 }
 
+// ─── Module-level functions ──────────────────────────────────────────────────
+
+/// Build the [`COMPLEMENT`] lookup table: identity for every byte except the
+/// canonical bases, which swap A↔T and C↔G (both cases). Leaving all other
+/// bytes as themselves keeps N and the IUPAC ambiguity codes in the residual
+/// bucket after the `& 0x1F` slot mask.
+const fn build_complement_lut() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i = 0u8;
+    loop {
+        table[i as usize] = i;
+        if i == u8::MAX {
+            break;
+        }
+        i += 1;
+    }
+    table[b'A' as usize] = b'T';
+    table[b'T' as usize] = b'A';
+    table[b'C' as usize] = b'G';
+    table[b'G' as usize] = b'C';
+    table[b'a' as usize] = b't';
+    table[b't' as usize] = b'a';
+    table[b'c' as usize] = b'g';
+    table[b'g' as usize] = b'c';
+    table
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -779,6 +824,30 @@ mod tests {
                 "non-ACGT byte 0x{b:02x} ({}) should not be in ACGT_BITMASK",
                 b as char
             );
+        }
+    }
+
+    /// `COMPLEMENT` drives the reverse-strand base counting: A/C/G/T must swap
+    /// case-insensitively, and every non-ACGT byte must map to a byte that
+    /// still folds into the residual (non-ACGT) bucket after `& 0x1F`.
+    #[test]
+    fn test_complement_table() {
+        for (base, comp) in [
+            (b'A', b'T'),
+            (b'T', b'A'),
+            (b'C', b'G'),
+            (b'G', b'C'),
+            (b'a', b't'),
+            (b't', b'a'),
+            (b'c', b'g'),
+            (b'g', b'c'),
+        ] {
+            assert_eq!(COMPLEMENT[base as usize], comp, "0x{base:02x}");
+        }
+        // Non-ACGT bytes stay out of the ACGT slots so they remain residual.
+        for &b in b"NnWSMKRYBDHV=" {
+            let bi = (COMPLEMENT[b as usize] & BASE_BITS) as usize;
+            assert_eq!((ACGT_BITMASK >> bi) & 1, 0, "0x{b:02x} ({}) leaked into ACGT", b as char);
         }
     }
 }
