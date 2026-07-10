@@ -61,12 +61,12 @@ fn test_paired_reads() {
     // Cycle 4: T=1.0
     assert_close!(r1[3].frac_t, 1.0, 1e-5);
 
-    // R2: reverse-complemented, so cycle numbering reversed: cycle 4,3,2,1
-    // but all bases are T, so each cycle should be 100% T
+    // R2: reverse strand, stored as TTTT. Reverse-complementing to sequencing
+    // order gives AAAA (complement of T is A), so each cycle should be 100% A.
     let r2: Vec<_> = base_dist.iter().filter(|m| m.read_end == 2).collect();
     assert_eq!(r2.len(), 4);
     for m in &r2 {
-        assert_close!(m.frac_t, 1.0, 1e-5);
+        assert_close!(m.frac_a, 1.0, 1e-5);
     }
 
     // Check mean quality by cycle
@@ -128,8 +128,10 @@ fn test_unpaired_forward_read() {
 #[test]
 fn test_unpaired_reverse_read() {
     let mut sam = SamBuilder::new();
-    // Reverse-complemented read: ACG, quals 10,20,30
-    // Cycle numbering reversed: stored seq position 0 -> cycle 3, pos 1 -> cycle 2, pos 2 -> cycle 1
+    // Reverse-strand read stored as ACG (quals 10,20,30). The BAM stores it
+    // reverse-complemented relative to sequencing order, so the read actually
+    // sequenced was revcomp(ACG) = CGT. Both the cycle index and the base
+    // must be reverse-complemented to recover it.
     sam.add(read_with("r1", b"ACG", &[10, 20, 30]).reverse());
 
     let (_dir, prefix) = run_basic(&sam);
@@ -139,17 +141,18 @@ fn test_unpaired_reverse_read() {
     let base_dist: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&bd_path).unwrap();
 
     assert_eq!(base_dist.len(), 3);
-    // Stored pos 0 (A) -> cycle_idx 2 (cycle 3)
-    // Stored pos 1 (C) -> cycle_idx 1 (cycle 2)
-    // Stored pos 2 (G) -> cycle_idx 0 (cycle 1)
+    // Stored pos 0 (A) -> complement T -> cycle_idx 2 (cycle 3)
+    // Stored pos 1 (C) -> complement G -> cycle_idx 1 (cycle 2)
+    // Stored pos 2 (G) -> complement C -> cycle_idx 0 (cycle 1)
     assert_eq!(base_dist[0].cycle, 1);
-    assert_close!(base_dist[0].frac_g, 1.0, 1e-5);
+    assert_close!(base_dist[0].frac_c, 1.0, 1e-5);
     assert_eq!(base_dist[1].cycle, 2);
-    assert_close!(base_dist[1].frac_c, 1.0, 1e-5);
+    assert_close!(base_dist[1].frac_g, 1.0, 1e-5);
     assert_eq!(base_dist[2].cycle, 3);
-    assert_close!(base_dist[2].frac_a, 1.0, 1e-5);
+    assert_close!(base_dist[2].frac_t, 1.0, 1e-5);
 
-    // Quality: pos 0 (q=10) -> cycle 3, pos 1 (q=20) -> cycle 2, pos 2 (q=30) -> cycle 1
+    // Quality is reversed but not complemented: pos 0 (q=10) -> cycle 3,
+    // pos 1 (q=20) -> cycle 2, pos 2 (q=30) -> cycle 1
     let mq_path =
         std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), MEAN_QUAL_SUFFIX));
     let mean_qual: Vec<MeanQualityByCycleMetric> = read_metrics_tsv(&mq_path).unwrap();
@@ -508,4 +511,52 @@ fn test_reverse_strand_with_heterogeneous_qualities() {
     assert_close!(mq[1].mean_quality, 30.0, 0.01);
     assert_close!(mq[2].mean_quality, 20.0, 0.01);
     assert_close!(mq[3].mean_quality, 10.0, 0.01);
+}
+
+#[test]
+fn test_reverse_strand_bases_are_complemented() {
+    // A reverse-strand read is stored in the BAM reverse-complemented relative
+    // to sequencing order, so the base distribution must complement each base
+    // in addition to reversing the cycle index. Stored ACTG on the reverse
+    // strand was sequenced as revcomp(ACTG) = CAGT, so cycle 1..4 = C,A,G,T.
+    // Four distinct bases make every complement mapping observable.
+    let mut sam = SamBuilder::new();
+    sam.add(read_with("rev", b"ACTG", &[30, 30, 30, 30]).reverse());
+    let (_dir, prefix) = run_basic(&sam);
+
+    let bd_path =
+        std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
+    let base_dist: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&bd_path).unwrap();
+
+    assert_eq!(base_dist.len(), 4);
+    assert_close!(base_dist[0].frac_c, 1.0, 1e-5); // cycle 1
+    assert_close!(base_dist[1].frac_a, 1.0, 1e-5); // cycle 2
+    assert_close!(base_dist[2].frac_g, 1.0, 1e-5); // cycle 3
+    assert_close!(base_dist[3].frac_t, 1.0, 1e-5); // cycle 4
+}
+
+#[test]
+fn test_forward_and_reverse_of_same_read_agree() {
+    // Regression for the strand bug: a molecule sequenced as AACG contributes
+    // the same per-cycle base distribution whether it aligned to the forward
+    // strand (stored AACG) or the reverse strand (stored revcomp(AACG) = CGTT).
+    // Before the complement fix the reverse read contributed its complement,
+    // smearing each cycle across two bases — the same artifact seen comparing
+    // a mapped EM-seq BAM to its RevertSam-reverted counterpart.
+    let mut sam = SamBuilder::new();
+    sam.add(read_with("fwd", b"AACG", &[30, 30, 30, 30]));
+    sam.add(read_with("rev", b"CGTT", &[30, 30, 30, 30]).reverse());
+    let (_dir, prefix) = run_basic(&sam);
+
+    let bd_path =
+        std::path::PathBuf::from(format!("{}{}", prefix.to_str().unwrap(), BASE_DIST_SUFFIX));
+    let base_dist: Vec<BaseDistributionByCycleMetric> = read_metrics_tsv(&bd_path).unwrap();
+
+    // Both reads land in the same read-end and cycles, each cycle 100% of the
+    // sequenced base: A, A, C, G.
+    assert_eq!(base_dist.len(), 4);
+    assert_close!(base_dist[0].frac_a, 1.0, 1e-5); // cycle 1
+    assert_close!(base_dist[1].frac_a, 1.0, 1e-5); // cycle 2
+    assert_close!(base_dist[2].frac_c, 1.0, 1e-5); // cycle 3
+    assert_close!(base_dist[3].frac_g, 1.0, 1e-5); // cycle 4
 }

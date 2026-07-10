@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`basic` base-distribution-by-cycle now reverse-complements reverse-strand reads.** Reverse-strand reads had their per-cycle index reversed but their bases left un-complemented, so each reverse read contributed the *complement* of the base that was sequenced. This flattened the per-cycle curves toward near-equal A≈T and C≈G (most visible on strand-asymmetric libraries such as EM-seq/bisulfite). The distribution is now computed in sequencing order, so an aligned BAM agrees with its Picard `RevertSam`-reverted counterpart. Mean-quality-by-cycle and quality-score-distribution were unaffected.
+
 ## [0.4.0] - 2026-07-06
 
 ### Added
