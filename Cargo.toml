@@ -3,7 +3,7 @@ members = [".", "riker_derive"]
 
 [package]
 name = "riker-ngs"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "Fast Rust CLI toolkit for sequencing QC metrics"
 repository = "https://github.com/fulcrumgenomics/riker"
@@ -73,7 +73,7 @@ num-traits = "0.2"
 # GFF3 attribute values percent-encode reserved chars (%3B ; %3D = %26 & %2C , etc.);
 # already in the tree transitively, promoted to a direct dep to decode them.
 percent-encoding = "2"
-riker_derive = { package = "riker-ngs-derive", version = "0.4.0", path = "riker_derive" }
+riker_derive = { package = "riker-ngs-derive", version = "0.4.1", path = "riker_derive" }
 rpmalloc = "0.2"
 rust-htslib = { version = "1", default-features = false, features = ["bzip2", "lzma", "libdeflate", "static"] }
 rust-lapper = "1"

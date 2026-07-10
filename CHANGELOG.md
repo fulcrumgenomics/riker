@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-10
+
 ### Changed
 
 - **Upgraded the `kuva` plotting library to 0.4.0 and removed the plot-layout workarounds its fixes make unnecessary.** The insert-size charts (`isize` and the `rna` transcript-space insert size) no longer round the x-axis up to a whole tick — the axis now fits tight to the data while keeping the readable ~100 bp / ~50 bp gridlines — and the `gcbias` chart drops a manual y2-axis-label offset that was compensating for label mis-positioning in the old release. The upgrade additionally tightens categorical bar spacing, text measurement, and legend-box sizing across every chart with no code change on our side.
