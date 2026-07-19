@@ -3,6 +3,7 @@
 [![Documentation at docs.rs](https://img.shields.io/docsrs/riker-ngs)](https://docs.rs/riker-ngs)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/riker.svg?label=bioconda)](https://bioconda.github.io/recipes/riker/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/riker/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445767.svg)](https://doi.org/10.5281/zenodo.21445767)
 
 # riker
 
