@@ -24,11 +24,10 @@
 //!   these slice sizes during benchmarking.
 //! * **Empty slices** return the neutral value (`0` for counts).
 
-// The `chunks_exact(N)` → `chunk.try_into::<[u8; N]>().unwrap()` pattern is
-// infallible by construction — `chunks_exact` guarantees every yielded chunk
-// has length `N`. Silence the pedantic `missing_panics_doc` lint at the
-// module level (including tests) rather than adding empty `# Panics`
-// sections to every kernel.
+// The remaining `slice[i..i + N].try_into::<[T; N]>().unwrap()` conversions are
+// infallible by construction: each slice is cut to exactly `N`. Silence the
+// pedantic `missing_panics_doc` lint at the module level (including tests)
+// rather than adding empty `# Panics` sections to every kernel.
 #![allow(clippy::missing_panics_doc)]
 
 use bytemuck::cast;
@@ -41,10 +40,9 @@ use wide::{u8x16, u16x8};
 pub fn count_bases_ge_q(qual: &[u8], threshold: u8) -> u64 {
     let cutoff = u8x16::splat(threshold);
     let mut count = 0u64;
-    let chunks = qual.chunks_exact(16);
-    let tail = chunks.remainder();
+    let (chunks, tail) = qual.as_chunks::<16>();
     for chunk in chunks {
-        let v = u8x16::new(chunk.try_into().unwrap());
+        let v = u8x16::new(*chunk);
         count += u64::from(v.simd_ge(cutoff).to_bitmask().count_ones());
     }
     for &q in tail {
@@ -165,10 +163,9 @@ pub fn count_gc_case_insensitive(seq: &[u8]) -> u64 {
     let g_lower = u8x16::splat(b'g');
     let c_lower = u8x16::splat(b'c');
     let mut count = 0u64;
-    let chunks = seq.chunks_exact(16);
-    let tail = chunks.remainder();
+    let (chunks, tail) = seq.as_chunks::<16>();
     for chunk in chunks {
-        let v = u8x16::new(chunk.try_into().unwrap()) | case;
+        let v = u8x16::new(*chunk) | case;
         // OR the two per-lane masks: no byte equals both `g` (0x67) and `c`
         // (0x63), so the masks are disjoint and a bitwise OR preserves the
         // total count without double-counting any lane.
@@ -195,10 +192,9 @@ pub fn count_n_case_insensitive(seq: &[u8]) -> u64 {
     let case = u8x16::splat(0x20);
     let n_lower = u8x16::splat(b'n');
     let mut count = 0u64;
-    let chunks = seq.chunks_exact(16);
-    let tail = chunks.remainder();
+    let (chunks, tail) = seq.as_chunks::<16>();
     for chunk in chunks {
-        let v = u8x16::new(chunk.try_into().unwrap()) | case;
+        let v = u8x16::new(*chunk) | case;
         count += u64::from(v.simd_eq(n_lower).to_bitmask().count_ones());
     }
     for &b in tail {
@@ -252,16 +248,14 @@ pub fn decode_packed_sequence_into(packed: &[u8], base_count: usize, dst: &mut V
     // For the high-nibble step, we shift as u16x8 then mask per byte.
     let mask_both_low_nibbles_u16 = u16x8::splat(0x0F0F);
 
-    let chunks = packed.chunks_exact(16);
-    let tail = chunks.remainder();
+    let (chunks, tail) = packed.as_chunks::<16>();
 
     // Track how many bases we've written so we can stop precisely at
     // `base_count` (odd-length sequences don't use the final low nibble).
     let mut written: usize = 0;
 
     for chunk in chunks {
-        // SAFETY of the unwrap: chunks_exact yields exactly 16 bytes.
-        let packed_v = u8x16::new(chunk.try_into().unwrap());
+        let packed_v = u8x16::new(*chunk);
 
         let low_nibbles = packed_v & mask_low_nibble;
 

@@ -249,12 +249,12 @@ impl RikerRecord {
     #[must_use]
     pub fn cigar_ops(&self) -> CigarOps<'_> {
         match self {
-            Self::Bam(r) => CigarOps::Bam(r.inner.cigar().as_bytes().chunks_exact(4)),
+            Self::Bam(r) => CigarOps::Bam(r.inner.cigar().as_bytes().as_chunks::<4>().0.iter()),
             Self::Fallback(r) => CigarOps::Fallback(r.inner.cigar().as_ref().iter()),
             // htslib stores CIGAR as native-endian `u32`s with the same
             // packing as BAM; on LE targets (enforced at file scope) the
             // bytes are identical and reuse `CigarOps::Bam`'s decoder.
-            Self::Htslib(r) => CigarOps::Bam(r.cigar_bytes().chunks_exact(4)),
+            Self::Htslib(r) => CigarOps::Bam(r.cigar_bytes().as_chunks::<4>().0.iter()),
         }
     }
 
@@ -984,7 +984,7 @@ fn htslib_aux_to_value(aux: &HtsAux<'_>) -> Option<AuxValue> {
 /// ops from the `RecordBuf`.
 pub enum CigarOps<'a> {
     /// Variant wrapping chunks of 4 bytes each for a BAM-packed CIGAR.
-    Bam(std::slice::ChunksExact<'a, u8>),
+    Bam(std::slice::Iter<'a, [u8; 4]>),
     /// Variant iterating pre-decoded ops from a `RecordBuf`.
     Fallback(std::slice::Iter<'a, Op>),
 }
@@ -998,7 +998,7 @@ impl Iterator for CigarOps<'_> {
             Self::Bam(chunks) => chunks.next().map(|c| {
                 // BAM-packed: bits [31..4] = length, bits [3..0] = op
                 // kind.
-                let word = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let word = u32::from_le_bytes(*c);
                 let kind = code_to_kind(word & 0xF);
                 #[allow(clippy::cast_possible_truncation)]
                 let len = (word >> 4) as usize;
