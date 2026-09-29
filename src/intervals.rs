@@ -278,7 +278,8 @@ fn read_file_contents(path: &Path) -> Result<String> {
 /// * **IntervalList**: 1-based fully-closed → converted to 0-based half-open.
 ///   The SAM header is parsed and validated as a prefix of `bam_dict`.
 /// * **BED**: already 0-based half-open.  Unknown contig names produce a warning
-///   and are skipped.
+///   and are skipped.  UCSC header lines (`#` comments and `track` or `browser`
+///   lines) are skipped.
 ///
 /// The returned vec is sorted by `(ref_id, start)`.
 ///
@@ -322,7 +323,7 @@ fn load_intervals(path: &Path, bam_dict: &SequenceDictionary) -> Result<Vec<Inte
     } else {
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
-            if line.is_empty() {
+            if line.is_empty() || is_bed_header_line(line) {
                 continue;
             }
 
@@ -507,6 +508,13 @@ fn parse_interval_list_line(
     let end = u32::try_from(end1)
         .with_context(|| format!("IntervalList line {line_num}: end exceeds u32 range"))?;
     Ok((contig, start0, end, name))
+}
+
+/// Whether a BED line is a UCSC header line rather than an interval: a `#` comment,
+/// or a `track` or `browser` line.
+fn is_bed_header_line(line: &str) -> bool {
+    line.starts_with('#')
+        || matches!(line.split_ascii_whitespace().next(), Some("track" | "browser"))
 }
 
 /// Parse one BED line (tab-separated: contig, start, end, name?, ...).
@@ -896,6 +904,27 @@ mod tests {
         let ivs = result.unwrap();
         assert_eq!(ivs.len(), 1);
         assert_eq!(ivs[0].start, 100); // stays 0-based confirms BED path
+    }
+
+    #[test]
+    fn test_bed_skips_ucsc_header_lines() {
+        let dict = make_dict(&[("chr1", 1000)]);
+        let content = "browser position chr1:100-200\n\
+                       track name=\"regions\" description=\"capture regions\"\n\
+                       # a comment\n\
+                       chr1\t100\t200\tname\n";
+        let ivs = load_from_string(content, &dict).unwrap();
+        assert_eq!(ivs.len(), 1);
+        assert_eq!((ivs[0].start, ivs[0].end), (100, 200));
+    }
+
+    #[test]
+    fn test_bed_contig_starting_with_track_is_not_a_header() {
+        let dict = make_dict(&[("track1", 1000)]);
+        let content = "track\n#comment\ntrack1\t100\t200\tname\n";
+        let ivs = load_from_string(content, &dict).unwrap();
+        assert_eq!(ivs.len(), 1);
+        assert_eq!(ivs[0].name(), "name");
     }
 
     #[test]

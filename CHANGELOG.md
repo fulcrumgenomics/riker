@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **BED interval files may now carry UCSC header lines.** Lines starting with `#`, and `track` or `browser` lines, are skipped instead of failing with `BED line 1: missing start`, so capture BEDs that open with these lines can be passed to `hybcap`, `error` and any other command that reads intervals as downloaded. A contig whose name merely begins with `track` or `browser` is still read as an interval.
+
 ## [0.4.1] - 2026-07-10
 
 ### Changed
