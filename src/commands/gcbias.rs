@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 use bitvec::vec::BitVec;
 use clap::Args;
 use kuva::plot::LinePlot;
@@ -26,8 +26,8 @@ use crate::plotting::{
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::derive_sample;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
+use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
 
 // ─── File suffixes ─────────────────────────────────────────────────────────────
@@ -165,6 +165,9 @@ impl Default for GcBiasOptions {
 /// distribution. Produces per-GC-bin detail metrics, a summary row, and
 /// a diagnostic chart. Outputs are written to <prefix>.gcbias-detail.txt,
 /// <prefix>.gcbias-summary.txt, and <prefix>.gcbias-chart.pdf.
+///
+/// The input BAM must be coordinate-sorted; a record on a contig that an earlier
+/// contig's records have already passed aborts the run with an error.
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -345,6 +348,15 @@ impl GcBiasCollector {
 
         if Some(ref_id) != self.current_contig_id {
             let name = self.dict.as_ref().unwrap().get_by_index(ref_id).map_or("", |m| m.name());
+            // Each contig's windows join the denominator once, on entry, so returning to a
+            // contig would count them again. This also catches a BAM whose header claims
+            // coordinate sort but isn't.
+            if self.visited_contigs.contains(&ref_id) {
+                bail!(
+                    "gcbias requires a coordinate-sorted BAM; encountered a record on {name} \
+                     after leaving it. Sort with `samtools sort`."
+                );
+            }
             let seq = self.reference.load_contig(name, false)?;
             let mask = self.contig_exclusion_mask(ref_id);
             let (gc_at_pos, window_counts) = scan_contig_gc(&seq, self.window_size, mask.as_ref());
@@ -612,6 +624,13 @@ impl GcBiasCollector {
 
 impl Collector for GcBiasCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
+        // The per-contig GC sweep requires coordinate-sorted input; the contig guard in
+        // process_record() is the backstop for a header that claims it falsely.
+        ensure!(
+            is_coordinate_sorted(header),
+            "gcbias requires a coordinate-sorted BAM/CRAM (@HD SO:coordinate); \
+             sort with `samtools sort`"
+        );
         self.reference.validate_bam_header(header)?;
 
         let dict = SequenceDictionary::from(header);
