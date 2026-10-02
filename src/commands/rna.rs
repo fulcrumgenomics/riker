@@ -2372,8 +2372,8 @@ mod tests {
     #[test]
     fn histogram_bins_is_empty_for_no_values() {
         let (edges, counts) = histogram_bins(&[], 4);
-        assert!(edges.is_empty());
-        assert!(counts.is_empty());
+        assert_eq!(edges, [] as [f64; 0]);
+        assert_eq!(counts, [] as [f64; 0]);
     }
 
     #[test]

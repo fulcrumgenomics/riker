@@ -83,7 +83,7 @@ mod tests {
 
         // Query empty contig
         let hits: Vec<&&str> = overlapper.get_overlaps(2, 0, 100).collect();
-        assert!(hits.is_empty());
+        assert_eq!(hits, [] as [&&str; 0]);
     }
 
     #[test]

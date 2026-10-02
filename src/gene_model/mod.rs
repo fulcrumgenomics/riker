@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn union_of_sorted_disjoint_handles_empty_and_single_sets() {
         let empty: [&[(u32, u32)]; 0] = [];
-        assert!(union_of_sorted_disjoint(empty.iter().copied()).is_empty());
+        assert_eq!(union_of_sorted_disjoint(empty.iter().copied()), [] as [(u32, u32); 0]);
 
         // Empty sets interspersed are skipped without affecting the result.
         let sets: [&[(u32, u32)]; 3] = [&[], &[(100, 200)], &[]];

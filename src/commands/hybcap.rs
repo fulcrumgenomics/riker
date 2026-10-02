@@ -1695,19 +1695,24 @@ fn sweep_run(ivs: &[(u32, u32, u32)], cursor: &mut usize, start: u32, end: u32) 
 
 // ─── Histogram helper functions ───────────────────────────────────────────────
 
-/// Compute the median from a depth histogram.
+/// Compute the median from a depth histogram, averaging the two middle depths for an even total.
 fn compute_median(histogram: &[u64], total_bases: u64) -> f64 {
     if total_bases == 0 {
         return 0.0;
     }
 
-    let mid = total_bases / 2;
+    let lower_pos = (total_bases - 1) / 2;
+    let upper_pos = total_bases / 2;
+    let mut lower_depth: Option<usize> = None;
     let mut cumulative: u64 = 0;
 
     for (depth, &count) in histogram.iter().enumerate() {
         cumulative += count;
-        if cumulative > mid {
-            return depth as f64;
+        if cumulative > lower_pos {
+            let lower_depth = *lower_depth.get_or_insert(depth);
+            if cumulative > upper_pos {
+                return f64::midpoint(lower_depth as f64, depth as f64);
+            }
         }
     }
 
@@ -1800,7 +1805,7 @@ mod tests {
         let buckets = bucket_by_contig(3, input.into_iter());
         assert_eq!(buckets.len(), 3);
         assert_eq!(buckets[0], vec![(10, 20, 1), (50, 60, 5)]);
-        assert!(buckets[1].is_empty());
+        assert_eq!(buckets[1], [] as [(u32, u32, u32); 0]);
         assert_eq!(buckets[2], vec![(100, 110, 9)]);
     }
 
@@ -1809,6 +1814,20 @@ mod tests {
         // 5 bases at depth 0, 10 bases at depth 1
         let hist = vec![5, 10];
         crate::assert_close!(compute_median(&hist, 15), 1.0, f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_median_even_total_averages_middle_depths() {
+        // 2 bases at depth 1 and 2 at depth 2: the middle depths are 1 and 2
+        let hist = vec![0, 2, 2];
+        crate::assert_close!(compute_median(&hist, 4), 1.5, f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_median_even_total_same_middle_depth() {
+        // 1 base at depth 0 and 3 at depth 1: both middle depths are 1
+        let hist = vec![1, 3];
+        crate::assert_close!(compute_median(&hist, 4), 1.0, f64::EPSILON);
     }
 
     #[test]

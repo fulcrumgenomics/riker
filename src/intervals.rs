@@ -689,8 +689,8 @@ mod tests {
         assert_eq!(contig_ivs.len(), 2);
         assert_eq!((contig_ivs[0].start, contig_ivs[0].end), (10, 20));
         assert_eq!((contig_ivs[1].start, contig_ivs[1].end), (30, 40));
-        assert!(ivs.get_contig(1).is_empty());
-        assert!(ivs.get_contig(99).is_empty());
+        assert_eq!(ivs.get_contig(1), []);
+        assert_eq!(ivs.get_contig(99), []);
     }
 
     #[test]
@@ -1014,7 +1014,7 @@ mod tests {
         let content = "@SQ\tSN:chr1\tLN:1000\n";
         let result = load_from_string(content, &dict);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert_eq!(result.unwrap(), [] as [Interval; 0]);
     }
 
     // ── Individual interval validation tests ────────────────────────────────
