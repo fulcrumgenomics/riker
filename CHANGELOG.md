@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **BED interval files may now carry UCSC header lines.** Lines starting with `#`, and `track` or `browser` lines, are skipped instead of failing with `BED line 1: missing start`, so capture BEDs that open with these lines can be passed to `hybcap`, `error` and any other command that reads intervals as downloaded. A contig whose name merely begins with `track` or `browser` is still read as an interval.
+- **`hybcap` now averages the two middle depths for `median_target_coverage`.** When the target territory has an even number of bases and its two middle depths differ, the median is their mean (e.g. `766.5`), as Picard `CollectHsMetrics` reports it. It previously took the upper of the two, so it was always a whole number.
 
 ## [0.4.1] - 2026-07-10
 
