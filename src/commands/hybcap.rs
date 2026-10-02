@@ -1805,7 +1805,7 @@ mod tests {
         let buckets = bucket_by_contig(3, input.into_iter());
         assert_eq!(buckets.len(), 3);
         assert_eq!(buckets[0], vec![(10, 20, 1), (50, 60, 5)]);
-        assert!(buckets[1].is_empty());
+        assert_eq!(buckets[1], [] as [(u32, u32, u32); 0]);
         assert_eq!(buckets[2], vec![(100, 110, 9)]);
     }
 

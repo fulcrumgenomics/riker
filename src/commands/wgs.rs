@@ -1340,7 +1340,7 @@ mod tests {
 
     #[test]
     fn non_n_intervals_empty_sequence_has_no_runs() {
-        assert!(non_n_intervals(b"").is_empty());
+        assert_eq!(non_n_intervals(b""), [] as [(u32, u32); 0]);
     }
 
     #[test]
@@ -1350,9 +1350,9 @@ mod tests {
 
     #[test]
     fn non_n_intervals_all_n_has_no_runs() {
-        assert!(non_n_intervals(b"NNNNNN").is_empty());
+        assert_eq!(non_n_intervals(b"NNNNNN"), [] as [(u32, u32); 0]);
         // Lowercase n is treated as N too.
-        assert!(non_n_intervals(b"nnnn").is_empty());
+        assert_eq!(non_n_intervals(b"nnnn"), [] as [(u32, u32); 0]);
     }
 
     #[test]
