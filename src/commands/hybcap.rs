@@ -1708,11 +1708,11 @@ fn compute_median(histogram: &[u64], total_bases: u64) -> f64 {
 
     for (depth, &count) in histogram.iter().enumerate() {
         cumulative += count;
-        if lower_depth.is_none() && cumulative > lower_pos {
-            lower_depth = Some(depth);
-        }
-        if cumulative > upper_pos {
-            return f64::midpoint(lower_depth.unwrap_or(depth) as f64, depth as f64);
+        if cumulative > lower_pos {
+            let lower_depth = *lower_depth.get_or_insert(depth);
+            if cumulative > upper_pos {
+                return f64::midpoint(lower_depth as f64, depth as f64);
+            }
         }
     }
 
