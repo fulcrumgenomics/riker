@@ -174,6 +174,8 @@ riker gcbias -i sample.bam -r ref.fa -o out_prefix
 riker gcbias -i sample.bam -r ref.fa -o out_prefix --exclude-intervals artifacts.bed
 ```
 
+The input BAM must be coordinate-sorted.
+
 Collect hybrid capture metrics:
 
 ```bash
