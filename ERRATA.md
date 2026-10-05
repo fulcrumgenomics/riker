@@ -90,7 +90,7 @@ So `total_reads ≥ aligned_reads ≥ (aligned_reads − filtered_reads)`, the l
 
 ### Coordinate-sorted input required
 
-**Picard** computes the reference's GC-window distribution for the whole reference up front, so it accepts records in any order (re-scanning a contig's GC each time the records switch contig).
+**Picard** computes the reference's GC-window distribution for the whole reference up front, so it accepts records in any order.
 
 **riker** sweeps the reference one contig at a time, adding each contig's windows to the denominator when its records begin, so it **requires a coordinate-sorted** SAM/BAM/CRAM (`@HD SO:coordinate`) and fails fast otherwise (sort with `samtools sort`). A record on a contig the run has already left also aborts it, which catches a header that claims coordinate order falsely. This is satisfied by essentially all aligned data in practice.
 
