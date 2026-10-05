@@ -7,7 +7,9 @@ use riker_lib::commands::common::{InputOptions, OutputOptions, ReferenceOptions}
 use riker_lib::commands::wgs::{
     COVERAGE_SUFFIX, METRICS_SUFFIX, Wgs, WgsCoverageEntry, WgsMetrics, WgsOptions,
 };
-use riker_lib::test_support::{FastaBuilder, ReadBuilder, coord_builder, pair, read};
+use riker_lib::test_support::{
+    FastaBuilder, ReadBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
+};
 use tempfile::TempDir;
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
@@ -525,4 +527,80 @@ fn zero_coverage_contig_with_intervals_counts_masked_non_n() {
     assert_eq!(rows.len(), 1);
     // non-N ∩ [3,13): run [0,5)→{3,4}=2, run [10,15)→{10,11,12}=3 → 5 total.
     assert_eq!(rows[0].genome_territory, 5);
+}
+
+// ─── Input requirements ───────────────────────────────────────────────────────
+
+/// A builder over two 20 bp contigs, `chr1` and `chr2`, in that header order.
+fn two_contig_builder() -> SamBuilder {
+    SamBuilder::with_contigs(&[("chr1".to_string(), 20), ("chr2".to_string(), 20)])
+}
+
+/// Run `wgs` on input that is not in coordinate order, check that it wrote no output,
+/// and return its error.
+fn expect_order_rejection(sam: &SamBuilder) -> anyhow::Error {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let bam = sam.to_temp_bam().unwrap();
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+
+    let err = make_cmd(bam.path(), refa.path(), &prefix, None, false, true, 0, 0, 250)
+        .execute(None)
+        .expect_err("wgs accepted out-of-order input");
+    let metrics_path = dir.path().join(format!("out{METRICS_SUFFIX}"));
+    assert!(!metrics_path.exists(), "rejected run wrote {}", metrics_path.display());
+    err
+}
+
+/// wgs sweeps the reference one contig at a time, so input whose header does not
+/// declare coordinate order is refused.
+#[test]
+fn test_unsorted_input_is_rejected() {
+    let mut sam = two_contig_builder().sort_order(SortOrder::Unsorted);
+    sam.add(read().name("r1").at("chr1", 1).len(10));
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("@HD SO:coordinate"), "unexpected error: {err}");
+}
+
+/// A header that declares `@HD SO:coordinate` over records that return to an earlier
+/// contig passes the header check, so the runtime guard must refuse it.
+#[test]
+fn test_mislabeled_contig_revisit_is_rejected() {
+    let mut sam = two_contig_builder().declare_coordinate_sorted();
+    sam.add(read().name("chr1_first").at("chr1", 1).len(10));
+    sam.add(read().name("chr2_between").at("chr2", 1).len(10));
+    sam.add(read().name("chr1_again").at("chr1", 1).len(10));
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("chr1:1 after chr2:1"), "unexpected error: {err}");
+}
+
+/// Mates of an overlapping pair written right-mate first under a header that declares
+/// `@HD SO:coordinate`: the runtime guard must refuse the position regression, which
+/// would otherwise double-count the overlap.
+#[test]
+fn test_mislabeled_out_of_order_positions_are_rejected() {
+    // `build()` resolves contigs against the default reference, whose `chr1` is also
+    // the first contig in this header.
+    let (r1, r2) = pair("p").at("chr1", 1, 6).len(10).build();
+    let mut sam = two_contig_builder().declare_coordinate_sorted();
+    sam.add(r2);
+    sam.add(r1);
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("chr1:1 after chr1:6"), "unexpected error: {err}");
+}
+
+/// A position regression on a record the filters drop (here a duplicate, excluded by
+/// default) must still be refused: the guard checks order before filtering.
+#[test]
+fn test_mislabeled_order_on_filtered_record_is_rejected() {
+    let mut sam = two_contig_builder().declare_coordinate_sorted();
+    sam.add(read().name("kept_first").at("chr1", 11).len(5));
+    sam.add(read().name("filtered_dup").at("chr1", 1).len(5).duplicate());
+    sam.add(read().name("kept_second").at("chr1", 15).len(5));
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("chr1:1 after chr1:11"), "unexpected error: {err}");
 }
