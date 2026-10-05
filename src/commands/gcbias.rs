@@ -166,8 +166,8 @@ impl Default for GcBiasOptions {
 /// a diagnostic chart. Outputs are written to <prefix>.gcbias-detail.txt,
 /// <prefix>.gcbias-summary.txt, and <prefix>.gcbias-chart.pdf.
 ///
-/// The input BAM must be coordinate-sorted; a record on a contig that an earlier
-/// contig's records have already passed aborts the run with an error.
+/// The input SAM/BAM/CRAM must be coordinate-sorted (@HD SO:coordinate); a record on a
+/// contig the run has already left aborts it with an error.
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -353,7 +353,7 @@ impl GcBiasCollector {
             // coordinate sort but isn't.
             if self.visited_contigs.contains(&ref_id) {
                 bail!(
-                    "gcbias requires a coordinate-sorted BAM; encountered a record on {name} \
+                    "gcbias requires coordinate-sorted input; encountered a record on {name} \
                      after leaving it. Sort with `samtools sort`."
                 );
             }

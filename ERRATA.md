@@ -88,6 +88,12 @@ So `total_reads ≥ aligned_reads ≥ (aligned_reads − filtered_reads)`, the l
 
 **Impact:** for files containing secondary or QC-fail reads, riker's `total_clusters` and `aligned_reads` are lower than Picard's by the count of those reads.
 
+### Coordinate-sorted input required
+
+**Picard** computes the reference's GC-window distribution for the whole reference up front, so it accepts records in any order (re-scanning a contig's GC each time the records switch contig).
+
+**riker** sweeps the reference one contig at a time, adding each contig's windows to the denominator when its records begin, so it **requires a coordinate-sorted** SAM/BAM/CRAM (`@HD SO:coordinate`) and fails fast otherwise (sort with `samtools sort`). A record on a contig the run has already left also aborts it, which catches a header that claims coordinate order falsely. This is satisfied by essentially all aligned data in practice.
+
 ### Read-to-window GC binning (forward-strand offset)
 
 Both tools precompute, for every reference position, the %GC of the window starting there, then assign each read to a single %GC bin using the window at one computed position: the alignment start for forward-strand reads, and `alignment_end − window_size` for reverse-strand reads.
@@ -107,7 +113,7 @@ riker supports a `--min-mapq` threshold and an `--exclude-intervals` mask (BED o
 
 Both `--min-mapq` and `--exclude-intervals` are applied **per read, not per template**: each mate is evaluated independently, mirroring gcbias's per-read-start accounting, so one mate of a pair may be filtered while the other is still counted. riker does not drop a pair as a unit when only one mate fails a filter; widen the intervals to cover both mates, or pre-filter the BAM, if you need pair-level semantics.
 
-**Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema, read-filtering, and forward-strand binning differences above).
+**Impact:** these are opt-in; with neither flag set, riker's behavior matches released Picard (modulo the schema, read-filtering, input-order, and forward-strand binning differences above).
 
 ---
 

@@ -634,9 +634,10 @@ fn interleaved_contigs(sam: SamBuilder) -> SamBuilder {
     sam
 }
 
-/// Run `gcbias` on input that is not in coordinate order and return its error. If the
-/// run is accepted instead, fail with the gc=0 window count it reported: `chr1` is 20 bp
-/// with a 10 bp window, so a correct denominator holds 11 windows.
+/// Run `gcbias` on input that is not in coordinate order, check that it wrote no output,
+/// and return its error. If the run is accepted instead, fail with the gc=0 window count
+/// it reported: `chr1` is 20 bp with a 10 bp window, so a correct denominator holds 11
+/// windows.
 fn expect_order_rejection(sam: &SamBuilder) -> anyhow::Error {
     let refa = FastaBuilder::new()
         .contig("chr1", vec![b'A'; 20])
@@ -647,15 +648,16 @@ fn expect_order_rejection(sam: &SamBuilder) -> anyhow::Error {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("out");
 
+    let detail_path = dir.path().join(format!("out{DETAIL_SUFFIX}"));
     let Err(err) = make_cmd(bam.path(), refa.path(), &prefix, opts()).execute(None) else {
-        let detail: Vec<GcBiasDetailMetric> =
-            read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+        let detail: Vec<GcBiasDetailMetric> = read_metrics_tsv(&detail_path).unwrap();
         panic!(
             "gcbias accepted out-of-order input and reported {} gc=0 windows for a 20 bp chr1 \
              with a 10 bp window (coordinate-sorted input gives 11)",
             detail[0].windows
         );
     };
+    assert!(!detail_path.exists(), "rejected run wrote {}", detail_path.display());
     err
 }
 
@@ -668,7 +670,7 @@ fn test_unsorted_input_is_rejected() {
             .sort_order(SortOrder::Unsorted),
     );
     let err = expect_order_rejection(&sam);
-    assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
+    assert!(err.to_string().contains("@HD SO:coordinate"), "unexpected error: {err}");
 }
 
 /// A header that declares `@HD SO:coordinate` over records that return to an earlier
@@ -680,5 +682,5 @@ fn test_mislabeled_out_of_order_input_is_rejected() {
             .declare_coordinate_sorted(),
     );
     let err = expect_order_rejection(&sam);
-    assert!(err.to_string().contains("coordinate-sorted"), "unexpected error: {err}");
+    assert!(err.to_string().contains("on chr1 after leaving it"), "unexpected error: {err}");
 }
