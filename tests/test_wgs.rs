@@ -592,3 +592,15 @@ fn test_mislabeled_out_of_order_positions_are_rejected() {
     let err = expect_order_rejection(&sam);
     assert!(err.to_string().contains("chr1:1 after chr1:6"), "unexpected error: {err}");
 }
+
+/// A position regression on a record the filters drop (here a duplicate, excluded by
+/// default) must still be refused: the guard checks order before filtering.
+#[test]
+fn test_mislabeled_order_on_filtered_record_is_rejected() {
+    let mut sam = two_contig_builder().declare_coordinate_sorted();
+    sam.add(read().name("kept_first").at("chr1", 11).len(5));
+    sam.add(read().name("filtered_dup").at("chr1", 1).len(5).duplicate());
+    sam.add(read().name("kept_second").at("chr1", 15).len(5));
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("chr1:1 after chr1:11"), "unexpected error: {err}");
+}

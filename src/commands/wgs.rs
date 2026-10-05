@@ -191,8 +191,9 @@ pub struct WgsCollector {
     // Per-contig working state
     current_ref_id: Option<usize>,
     processed_contigs: HashSet<usize>,
-    // Start of the last record to reach the depth walk; with `current_ref_id`, the
-    // position `check_coordinate_order` compares the next record against.
+    // Coordinates of the last mapped record, including ones the filters drop; what
+    // `check_coordinate_order` compares the next record against.
+    last_ref_id: Option<usize>,
     last_start: Position,
 
     // Per-contig non-N runs (half-open `[start, end)`, 0-based), indexed by BAM
@@ -256,6 +257,7 @@ impl WgsCollector {
             dict: None,
             current_ref_id: None,
             processed_contigs: HashSet::new(),
+            last_ref_id: None,
             last_start: Position::MIN,
             non_n_runs: Vec::new(),
             genome_territory: 0,
@@ -602,9 +604,9 @@ impl WgsCollector {
     /// records leave it, and the mate buffer expects a read's overlapping mate to arrive
     /// after it, so any regression in `(ref_id, start)` would silently drop coverage or
     /// miss overlaps. This also catches a BAM whose header claims coordinate sort but
-    /// isn't. Must run before the contig transition, which advances `current_ref_id`.
+    /// isn't.
     fn check_coordinate_order(&mut self, ref_id: usize, start: Position) -> Result<()> {
-        if let Some(last_ref_id) = self.current_ref_id
+        if let Some(last_ref_id) = self.last_ref_id
             && (ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start))
         {
             bail!(
@@ -615,6 +617,7 @@ impl WgsCollector {
                 self.last_start,
             );
         }
+        self.last_ref_id = Some(ref_id);
         self.last_start = start;
         Ok(())
     }
@@ -809,6 +812,14 @@ impl Collector for WgsCollector {
             return Ok(());
         }
 
+        // Check order before the filters below can drop the record, so a mislabeled
+        // header is caught wherever its disorder falls.
+        if let (Some(ref_id), Some(start)) =
+            (record.reference_sequence_id(), record.alignment_start())
+        {
+            self.check_coordinate_order(ref_id, start)?;
+        }
+
         // Mapping quality filter (checked first among the counted exclusions,
         // matching Picard's filter ordering so per-category fractions align).
         let mapq = record.mapping_quality().map_or(0, |m| m.get());
@@ -836,12 +847,6 @@ impl Collector for WgsCollector {
         let Some(ref_id) = record.reference_sequence_id() else {
             return Ok(());
         };
-        // A mapped record without a start adds no depth (walk_depth skips it) and has
-        // no position to order by.
-        let Some(start) = record.alignment_start() else {
-            return Ok(());
-        };
-        self.check_coordinate_order(ref_id, start)?;
 
         // Contig transition: finalize the previous contig and start a fresh
         // depth array sized to the new contig. Any buffered mates belonged to
