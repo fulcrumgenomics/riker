@@ -165,6 +165,8 @@ riker wgs -i sample.bam -r ref.fa -o out_prefix
 riker wgs -i sample.bam -r ref.fa -o out_prefix -L intervals.bed
 ```
 
+The input BAM must be coordinate-sorted.
+
 Collect GC bias metrics:
 
 ```bash

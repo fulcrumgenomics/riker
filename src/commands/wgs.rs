@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 use bitvec::prelude::*;
 use clap::Args;
 use kuva::plot::LinePlot;
 use kuva::plot::legend::LegendPosition;
 use kuva::render::plots::Plot;
+use noodles::core::Position;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
@@ -23,9 +24,9 @@ use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{FG_BLUE, FG_TEAL, standard_layout, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::derive_sample;
 use crate::sam::mate_buffer::{MateBuffer, Peek};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
+use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
 
 // ─── File suffixes ─────────────────────────────────────────────────────────────
@@ -108,6 +109,9 @@ impl Default for WgsOptions {
 /// the fraction of bases excluded by various filters. Outputs are
 /// written to <prefix>.wgs-metrics.txt, <prefix>.wgs-coverage.txt,
 /// and <prefix>.wgs-coverage.pdf.
+///
+/// The input SAM/BAM/CRAM must be coordinate-sorted (@HD SO:coordinate); a record
+/// that arrives out of order aborts the run with an error.
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -187,6 +191,9 @@ pub struct WgsCollector {
     // Per-contig working state
     current_ref_id: Option<usize>,
     processed_contigs: HashSet<usize>,
+    // Start of the last record to reach the depth walk; with `current_ref_id`, the
+    // position `check_coordinate_order` compares the next record against.
+    last_start: Position,
 
     // Per-contig non-N runs (half-open `[start, end)`, 0-based), indexed by BAM
     // ref_id. Precomputed once up front in `initialize`; consulted only at
@@ -249,6 +256,7 @@ impl WgsCollector {
             dict: None,
             current_ref_id: None,
             processed_contigs: HashSet::new(),
+            last_start: Position::MIN,
             non_n_runs: Vec::new(),
             genome_territory: 0,
             depth_histogram: vec![0u64; hist_len],
@@ -590,6 +598,32 @@ impl WgsCollector {
         }
     }
 
+    /// Enforce coordinate-sorted input. A contig's depth is tallied once, when the
+    /// records leave it, and the mate buffer expects a read's overlapping mate to arrive
+    /// after it, so any regression in `(ref_id, start)` would silently drop coverage or
+    /// miss overlaps. This also catches a BAM whose header claims coordinate sort but
+    /// isn't. Must run before the contig transition, which advances `current_ref_id`.
+    fn check_coordinate_order(&mut self, ref_id: usize, start: Position) -> Result<()> {
+        if let Some(last_ref_id) = self.current_ref_id
+            && (ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start))
+        {
+            bail!(
+                "wgs requires coordinate-sorted input (ordered by reference, then position); \
+                 encountered {}:{start} after {}:{}. Sort with `samtools sort`.",
+                self.contig_name(ref_id),
+                self.contig_name(last_ref_id),
+                self.last_start,
+            );
+        }
+        self.last_start = start;
+        Ok(())
+    }
+
+    /// Return the contig name for a `ref_id`, or `?` if unknown. Used only in errors.
+    fn contig_name(&self, ref_id: usize) -> &str {
+        self.dict.as_ref().and_then(|d| d.get_by_index(ref_id)).map_or("?", |m| m.name())
+    }
+
     /// Begin processing a new contig: resize the per-position depth array and
     /// reset the mate buffer (mates cannot straddle contigs). The non-N runs
     /// for every contig were precomputed in `initialize`, so no reference read
@@ -716,6 +750,12 @@ impl WgsCollector {
 
 impl Collector for WgsCollector {
     fn initialize(&mut self, header: &Header) -> Result<()> {
+        // The per-contig depth sweep requires coordinate-sorted input; the order guard
+        // in accept() is the backstop for a header that claims it falsely.
+        ensure!(
+            is_coordinate_sorted(header),
+            "wgs requires coordinate-sorted input (@HD SO:coordinate); sort with `samtools sort`"
+        );
         self.reference.validate_bam_header(header)?;
 
         let dict = SequenceDictionary::from(header);
@@ -796,6 +836,12 @@ impl Collector for WgsCollector {
         let Some(ref_id) = record.reference_sequence_id() else {
             return Ok(());
         };
+        // A mapped record without a start adds no depth (walk_depth skips it) and has
+        // no position to order by.
+        let Some(start) = record.alignment_start() else {
+            return Ok(());
+        };
+        self.check_coordinate_order(ref_id, start)?;
 
         // Contig transition: finalize the previous contig and start a fresh
         // depth array sized to the new contig. Any buffered mates belonged to

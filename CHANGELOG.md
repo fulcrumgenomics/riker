@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BED interval files may now carry UCSC header lines.** Lines starting with `#`, and `track` or `browser` lines, are skipped instead of failing with `BED line 1: missing start`, so capture BEDs that open with these lines can be passed to `hybcap`, `error` and any other command that reads intervals as downloaded. A contig whose name merely begins with `track` or `browser` is still read as an interval.
 - **`hybcap` now averages the two middle depths for `median_target_coverage`.** When the target territory has an even number of bases and its two middle depths differ, the median is their mean (e.g. `766.5`), as Picard `CollectHsMetrics` reports it. It previously took the upper of the two, so it was always a whole number.
+- **`wgs` now refuses input that is not coordinate-sorted.** It tallies each contig's depth once, when its records end, and finds a pair's overlap only when the leftmost mate arrives first, so input that returned to a contig silently dropped the later visit's coverage, and overlapping mates written out of position order had their overlap counted twice, with no error. A header without `@HD SO:coordinate` is rejected up front, and a record whose contig or position precedes the one before it aborts the run, which also catches a header that claims coordinate order falsely. Because `multi` shares one header across its tools, a `multi` run that includes `wgs` has the same requirement.
 
 ## [0.4.1] - 2026-07-10
 
