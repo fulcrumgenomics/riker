@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BED interval files may now carry UCSC header lines.** Lines starting with `#`, and `track` or `browser` lines, are skipped instead of failing with `BED line 1: missing start`, so capture BEDs that open with these lines can be passed to `hybcap`, `error` and any other command that reads intervals as downloaded. A contig whose name merely begins with `track` or `browser` is still read as an interval.
 - **`hybcap` now averages the two middle depths for `median_target_coverage`.** When the target territory has an even number of bases and its two middle depths differ, the median is their mean (e.g. `766.5`), as Picard `CollectHsMetrics` reports it. It previously took the upper of the two, so it was always a whole number.
+- **`gcbias` now refuses input that is not coordinate-sorted.** It sweeps the reference one contig at a time and adds a contig's GC windows to the denominator each time its records begin, so input that returned to a contig counted that contig's windows once per visit and skewed every normalized-coverage value, with no error. A header without `@HD SO:coordinate` is rejected up front, and a record on a contig the run has already left aborts it, which also catches a header that claims coordinate order falsely. Because `multi` shares one header across its tools, a `multi` run that includes `gcbias` has the same requirement.
 
 ## [0.4.1] - 2026-07-10
 

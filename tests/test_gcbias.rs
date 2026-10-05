@@ -8,7 +8,9 @@ use riker_lib::commands::gcbias::{
     DETAIL_SUFFIX, GcBias, GcBiasDetailMetric, GcBiasOptions, GcBiasSummaryMetric, PLOT_SUFFIX,
     SUMMARY_SUFFIX,
 };
-use riker_lib::test_support::{BedBuilder, FastaBuilder, coord_builder, pair, read};
+use riker_lib::test_support::{
+    BedBuilder, FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
+};
 use tempfile::TempDir;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -620,4 +622,65 @@ fn test_writes_chart_pdf() {
     let plot_path = dir.path().join(format!("out{PLOT_SUFFIX}"));
     assert!(plot_path.exists(), "GC-bias chart PDF should be created");
     assert!(plot_path.metadata().unwrap().len() > 0, "GC-bias chart PDF should be non-empty");
+}
+
+/// Build a two-contig BAM (all-A `chr1`, all-G `chr2`) whose reads leave `chr1`, visit
+/// `chr2`, and return to `chr1`, in that order.
+fn interleaved_contigs(sam: SamBuilder) -> SamBuilder {
+    let mut sam = sam;
+    sam.add(read().name("chr1_first").at("chr1", 1).len(10));
+    sam.add(read().name("chr2_between").at("chr2", 1).len(10));
+    sam.add(read().name("chr1_again").at("chr1", 1).len(10));
+    sam
+}
+
+/// Run `gcbias` on input that is not in coordinate order, check that it wrote no output,
+/// and return its error. If the run is accepted instead, fail with the gc=0 window count
+/// it reported: `chr1` is 20 bp with a 10 bp window, so a correct denominator holds 11
+/// windows.
+fn expect_order_rejection(sam: &SamBuilder) -> anyhow::Error {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'G'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let bam = sam.to_temp_bam().unwrap();
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("out");
+
+    let detail_path = dir.path().join(format!("out{DETAIL_SUFFIX}"));
+    let Err(err) = make_cmd(bam.path(), refa.path(), &prefix, opts()).execute(None) else {
+        let detail: Vec<GcBiasDetailMetric> = read_metrics_tsv(&detail_path).unwrap();
+        panic!(
+            "gcbias accepted out-of-order input and reported {} gc=0 windows for a 20 bp chr1 \
+             with a 10 bp window (coordinate-sorted input gives 11)",
+            detail[0].windows
+        );
+    };
+    assert!(!detail_path.exists(), "rejected run wrote {}", detail_path.display());
+    err
+}
+
+/// gcbias sweeps the reference one contig at a time, so input whose header does not
+/// declare coordinate order is refused.
+#[test]
+fn test_unsorted_input_is_rejected() {
+    let sam = interleaved_contigs(
+        SamBuilder::with_contigs(&[("chr1".to_string(), 20), ("chr2".to_string(), 20)])
+            .sort_order(SortOrder::Unsorted),
+    );
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("@HD SO:coordinate"), "unexpected error: {err}");
+}
+
+/// A header that declares `@HD SO:coordinate` over records that return to an earlier
+/// contig passes the header check, so the runtime guard must refuse it.
+#[test]
+fn test_mislabeled_out_of_order_input_is_rejected() {
+    let sam = interleaved_contigs(
+        SamBuilder::with_contigs(&[("chr1".to_string(), 20), ("chr2".to_string(), 20)])
+            .declare_coordinate_sorted(),
+    );
+    let err = expect_order_rejection(&sam);
+    assert!(err.to_string().contains("on chr1 after leaving it"), "unexpected error: {err}");
 }
