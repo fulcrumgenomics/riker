@@ -67,22 +67,24 @@ pub fn count_bases_lt_q(qual: &[u8], threshold: u8) -> u64 {
     qual.len() as u64 - count_bases_ge_q(qual, threshold)
 }
 
-/// Apply BQ-filtered, cap-saturated depth increments over a contiguous run of
-/// pileup positions — the `AloneAction` fast path in `wgs::walk_depth`.
+/// Apply BQ-filtered depth increments that saturate at `cap` over a contiguous
+/// run of pileup positions — the `AloneAction` fast path in `wgs::walk_depth`.
 ///
 /// `qual` and `depth` are parallel slices of equal length. For each position `i`:
 ///
 /// * `qual[i] < min_bq`         → a base-quality exclusion; `depth[i]` untouched.
-/// * else `depth[i] >= cap`     → a capped exclusion; `depth[i]` untouched.
+/// * else `depth[i] >= cap`     → a saturated base, dropped; `depth[i]` untouched.
 /// * else                       → `depth[i] += 1`.
 ///
-/// Returns `(bases_excl_baseq, bases_excl_capped)`. The increment is applied only
-/// where `depth[i] < cap`, so `depth[i] + 1 <= cap <= u16::MAX` and no overflow
-/// is possible. Qualities are raw Phred values, not Phred+33.
+/// Returns `(bases_excl_baseq, bases_saturated)`; the caller decides how to count
+/// the saturated bases. The increment is applied only where `depth[i] < cap`, so
+/// `depth[i] + 1 <= cap <= u16::MAX` and no overflow is possible. Qualities are
+/// raw Phred values, not Phred+33.
 ///
 /// This is the vectorized twin of the scalar per-position decision in
 /// `wgs::WgsCollector::walk_depth`'s overlapping-mate branch; the two must stay
-/// in lock-step (the byte-identical fixture run covers both).
+/// in lock-step. `pileup_depth_alone_matches_scalar_across_boundaries` pins this
+/// kernel against a scalar reference.
 #[must_use]
 pub fn pileup_depth_alone(qual: &[u8], depth: &mut [u16], min_bq: u8, cap: u16) -> (u64, u64) {
     debug_assert_eq!(qual.len(), depth.len(), "qual and depth slices must be parallel");

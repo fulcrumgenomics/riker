@@ -7,12 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`wgs --per-base-coverage` writes per-base depth as a bigWig** (`<prefix>.wgs-per-base.bw`), which IGV, UCSC, JBrowse 2, pyBigWig and the UCSC bigWig tools read directly. The depth is filtered exactly as for the metrics (mapping and base quality, duplicates, unpaired reads, overlapping mates) but is not capped by `--coverage-cap`; depth above 65,535 is reported as 65,535. Each contig with coverage is written as fixedStep data at every position, zeros included; contigs without coverage are listed in the file but have no data. With `--intervals`, only the interval positions are written. Writing uses one thread beyond `--threads`, and memory for one more contig's depth (about 0.5 GB for human chr1). In `multi` the option is `--wgs::per-base-coverage`.
+
 ### Fixed
 
 - **BED interval files may now carry UCSC header lines.** Lines starting with `#`, and `track` or `browser` lines, are skipped instead of failing with `BED line 1: missing start`, so capture BEDs that open with these lines can be passed to `hybcap`, `error` and any other command that reads intervals as downloaded. A contig whose name merely begins with `track` or `browser` is still read as an interval.
 - **`hybcap` now averages the two middle depths for `median_target_coverage`.** When the target territory has an even number of bases and its two middle depths differ, the median is their mean (e.g. `766.5`), as Picard `CollectHsMetrics` reports it. It previously took the upper of the two, so it was always a whole number.
 - **`gcbias` now refuses input that is not coordinate-sorted.** It sweeps the reference one contig at a time and adds a contig's GC windows to the denominator each time its records begin, so input that returned to a contig counted that contig's windows once per visit and skewed every normalized-coverage value, with no error. A header without `@HD SO:coordinate` is rejected up front, and a record on a contig the run has already left aborts it, which also catches a header that claims coordinate order falsely. Because `multi` shares one header across its tools, a `multi` run that includes `gcbias` has the same requirement.
 - **`wgs` now refuses input that is not coordinate-sorted.** It tallies each contig's depth once, when its records end, and finds a pair's overlap only when the leftmost mate arrives first, so input that returned to a contig silently dropped the later visit's coverage, and overlapping mates written out of position order had their overlap counted twice, with no error. A header without `@HD SO:coordinate` is rejected up front, and a record whose contig or position precedes the one before it aborts the run, which also catches a header that claims coordinate order falsely. Because `multi` shares one header across its tools, a `multi` run that includes `wgs` has the same requirement.
+- **`wgs --intervals` now restricts each contig by its own intervals when the BAM lists contigs in a different order from the FASTA.** Intervals were numbered by the FASTA's contig order but looked up by the BAM's, so territory and coverage were counted against another contig's intervals, with no error. They are now read against the BAM header, as in the other commands: intervals on contigs the BAM does not list are skipped with a warning, and an IntervalList's `@SQ` lines are checked against the BAM's.
 
 ## [0.4.1] - 2026-07-10
 

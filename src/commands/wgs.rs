@@ -1,9 +1,13 @@
 use std::collections::HashSet;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::JoinHandle;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use bigwig::{BigWigWriter, ChromIdOrder, ChromInfo, WriterOptions};
 use bitvec::prelude::*;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use kuva::plot::LinePlot;
 use kuva::plot::legend::LegendPosition;
 use kuva::render::plots::Plot;
@@ -40,6 +44,18 @@ pub const COVERAGE_SUFFIX: &str = ".wgs-coverage.txt";
 /// File suffix for the coverage depth histogram plot.
 pub const PLOT_SUFFIX: &str = ".wgs-coverage.pdf";
 
+/// File suffix for the per-base coverage bigWig output.
+pub const PER_BASE_BIGWIG_SUFFIX: &str = ".wgs-per-base.bw";
+
+/// Positions converted to `f32` per push to the per-base writer. The writer continues one run
+/// across pushes, so this sizes only the conversion buffer, not the file's sections.
+const PER_BASE_CHUNK_LEN: usize = 8_192;
+
+/// Largest depth stored per position, and so the largest per-base output reports. `--coverage-cap`
+/// is applied when a contig is tallied, not while piling up; bases arriving at a position that
+/// already holds this many are dropped (and counted as capped exclusions).
+const MAX_STORED_DEPTH: u16 = u16::MAX;
+
 // ─── Options ──────────────────────────────────────────────────────────────────
 
 /// Tool-specific tuning options for the WGS collector.
@@ -71,12 +87,29 @@ pub struct WgsOptions {
 
     /// Maximum depth reported in the metrics and histogram.
     ///
-    /// Per-position depths saturate at this value; bases arriving at a
-    /// position that has already hit the cap are counted as capped exclusions.
-    /// Bounded by u16 (max 65535) since the per-position depth array stores
-    /// each slot as a u16.
+    /// Positions deeper than the cap are tallied at the cap, and their bases
+    /// beyond it are counted as capped exclusions. Per-base output is not
+    /// capped by it. At most 65535, the largest depth stored per position.
     #[arg(long, default_value_t = WgsOptions::DEFAULT_COVERAGE_CAP)]
     pub coverage_cap: u16,
+
+    /// Write per-base depth to <prefix>.wgs-per-base.bw.
+    ///
+    /// `bigwig` (the only format) is the default when the flag has no value.
+    /// Each contig with coverage is written as fixedStep data at every
+    /// position, or only at its interval positions when intervals are given;
+    /// contigs without coverage there have no data. Depth is filtered as for
+    /// the metrics but not capped by the coverage cap, and depth above 65535
+    /// is reported as 65535. Writing uses one thread beyond --threads, and
+    /// memory for one more contig's depth (about 0.5 GB for human chr1).
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        num_args = 0..=1,
+        default_missing_value = "bigwig",
+    )]
+    pub per_base_coverage: Option<PerBaseCoverageFormat>,
 }
 
 impl WgsOptions {
@@ -95,6 +128,7 @@ impl Default for WgsOptions {
             min_mapq: Self::DEFAULT_MIN_MAPQ,
             min_bq: Self::DEFAULT_MIN_BQ,
             coverage_cap: Self::DEFAULT_COVERAGE_CAP,
+            per_base_coverage: None,
         }
     }
 }
@@ -108,7 +142,8 @@ impl Default for WgsOptions {
 /// including mean, median, standard deviation, and MAD. Also reports
 /// the fraction of bases excluded by various filters. Outputs are
 /// written to <prefix>.wgs-metrics.txt, <prefix>.wgs-coverage.txt,
-/// and <prefix>.wgs-coverage.pdf.
+/// and <prefix>.wgs-coverage.pdf, plus <prefix>.wgs-per-base.bw with
+/// --per-base-coverage.
 ///
 /// The input SAM/BAM/CRAM must be coordinate-sorted (@HD SO:coordinate); a record
 /// that arrives out of order aborts the run with an error.
@@ -119,7 +154,8 @@ impl Default for WgsOptions {
 Examples:
   riker wgs -i input.bam -o out_prefix -r ref.fa
   riker wgs -i input.bam -o out_prefix -r ref.fa -L intervals.bed
-  riker wgs -i input.bam -o out_prefix -r ref.fa --coverage-cap 500"
+  riker wgs -i input.bam -o out_prefix -r ref.fa --coverage-cap 500
+  riker wgs -i input.bam -o out_prefix -r ref.fa --per-base-coverage"
 )]
 pub struct Wgs {
     #[command(flatten)]
@@ -149,7 +185,7 @@ impl Command for Wgs {
         let reference = Fasta::from_path(&self.reference.reference)?;
 
         let mut collector =
-            WgsCollector::new(&self.input.input, &self.output.output, reference, &self.options)?;
+            WgsCollector::new(&self.input.input, &self.output.output, reference, &self.options);
 
         let mut progress = ProgressLogger::new("wgs", "reads", 5_000_000);
         drive_collector_single_threaded(&mut reader, &mut collector, &mut progress)
@@ -170,7 +206,12 @@ pub struct WgsCollector {
     // Input path (needed for sample name derivation in initialize)
     input_path: PathBuf,
 
-    // Per-contig depth array (one u16 per genomic position, reused across contigs).
+    // Per-base coverage output: the path when requested, and the writer thread, started in
+    // `initialize` once the BAM header gives the contig list.
+    per_base_path: Option<PathBuf>,
+    per_base_thread: Option<PerBaseThread>,
+
+    // Per-contig depth array (one u16 per genomic position, allocated for each contig).
     depth: ContigDepth,
 
     // Buffer of already-seen mate records whose overlapping mate hasn't arrived yet.
@@ -178,6 +219,8 @@ pub struct WgsCollector {
 
     // Config
     reference: Fasta,
+    intervals_path: Option<PathBuf>,
+    // Parsed in `initialize` against the BAM header, so it is indexed by BAM `tid`.
     intervals: Option<Intervals>,
     include_duplicates: bool,
     include_unpaired: bool,
@@ -217,38 +260,32 @@ pub struct WgsCollector {
 
 impl WgsCollector {
     /// Create a new collector. Output paths are derived from `prefix` by appending
-    /// suffixes. If `options.intervals` is set, the interval file is parsed using
-    /// the FASTA index's sequence dictionary. The sample name and contig names are
-    /// populated during [`Collector::initialize`] once the BAM header is available.
-    ///
-    /// # Errors
-    /// Returns an error if the interval file cannot be read or parsed.
-    pub fn new(
-        input: &Path,
-        prefix: &Path,
-        reference: Fasta,
-        options: &WgsOptions,
-    ) -> Result<Self> {
-        let intervals = options
-            .intervals
-            .as_ref()
-            .map(|path| Intervals::from_path(path, reference.dict().clone()))
-            .transpose()?;
-
+    /// suffixes. The interval file, the sample name and the contig names are read
+    /// in [`Collector::initialize`] once the BAM header is available.
+    #[must_use]
+    pub fn new(input: &Path, prefix: &Path, reference: Fasta, options: &WgsOptions) -> Self {
         let metrics_path = super::command::output_path(prefix, METRICS_SUFFIX);
         let coverage_path = super::command::output_path(prefix, COVERAGE_SUFFIX);
         let plot_path = super::command::output_path(prefix, PLOT_SUFFIX);
+        let per_base_path = options.per_base_coverage.map(|format| match format {
+            PerBaseCoverageFormat::Bigwig => {
+                super::command::output_path(prefix, PER_BASE_BIGWIG_SUFFIX)
+            }
+        });
         let hist_len = options.coverage_cap as usize + 1;
-        Ok(Self {
+        Self {
             metrics_path,
             coverage_path,
             plot_path,
             plot_title: String::new(),
             input_path: input.to_path_buf(),
+            per_base_path,
+            per_base_thread: None,
             depth: ContigDepth::new(),
             mate_buffer: MateBuffer::new(),
             reference,
-            intervals,
+            intervals_path: options.intervals.clone(),
+            intervals: None,
             include_duplicates: options.include_duplicates,
             include_unpaired: options.include_unpaired_reads,
             min_mapq: options.min_mapq,
@@ -269,7 +306,7 @@ impl WgsCollector {
             bases_excl_overlap: 0,
             bases_excl_capped: 0,
             sample: String::new(),
-        })
+        }
     }
 
     /// Finalize the last contig, process any un-pileup'd contigs, and write output.
@@ -280,8 +317,14 @@ impl WgsCollector {
     #[expect(clippy::too_many_lines, reason = "sequential finalization logic")]
     fn finish_metrics(&mut self) -> Result<()> {
         // Finalize whatever contig was being processed last.
-        self.finalize_contig();
+        self.finalize_contig()?;
         self.current_ref_id = None;
+
+        // Finish the per-base file before the metrics, including when the territory turns out to
+        // be empty below; an unfinished bigWig is unreadable.
+        if let Some(per_base_thread) = self.per_base_thread.take() {
+            per_base_thread.finish()?;
+        }
 
         // Process contigs that had zero reads (never appeared in pileup). Their
         // non-N runs were precomputed for every contig in `initialize`, so this
@@ -453,69 +496,78 @@ impl WgsCollector {
         Ok(())
     }
 
-    /// Walk the per-position depth array for the current contig and accumulate
-    /// per-position statistics into the global histograms. As it goes, it
-    /// zeroes each slot in the depth array (so the next contig starts clean
-    /// without a separate memset) and accumulates the `bases_excl_capped`
-    /// overflow counter from the per-contig buffer.
-    fn finalize_contig(&mut self) {
+    /// Walk the current contig's depth array and accumulate per-position
+    /// statistics into the global histograms, applying `--coverage-cap`:
+    /// positions are tallied at most at the cap, and every base above it, at any
+    /// position, is a capped exclusion. Then hand the depth array to the per-base
+    /// writer thread, if there is one, or free it.
+    ///
+    /// # Errors
+    /// Returns an error if the per-base output cannot be written.
+    fn finalize_contig(&mut self) -> Result<()> {
         let Some(ref_id) = self.current_ref_id else {
-            return;
+            return Ok(());
         };
 
-        // Global capped-exclusion counter absorbs the per-contig cap overflow.
-        self.bases_excl_capped += self.depth.take_excl_capped();
+        // Bases dropped at a position already holding `MAX_STORED_DEPTH` are capped exclusions.
+        self.bases_excl_capped += self.depth.take_excl_saturated();
 
         // Take the runs out to sidestep the borrow against `self.depth` below;
         // each contig is finalized exactly once, so we don't put them back.
         let runs = std::mem::take(&mut self.non_n_runs[ref_id]);
         let intervals_bv = self.intervals.as_ref().map(|intervals| intervals.contig_bitvec(ref_id));
 
-        let contig_len = self.depth.len();
+        let depth = self.depth.as_slice();
         let cap = self.coverage_cap;
 
         // Walk the non-N runs directly rather than every position: only run
         // positions can be eligible (finalize masks N gaps out), so histogram
-        // each run's contiguous depth slice and bulk-zero the N gaps between
-        // them. The whole array still ends up zeroed for the next contig, but
-        // the per-position run-pointer and interval branch fall out of the hot
-        // slice loop, and gap positions cost one vectorized fill instead of a
-        // read-modify-write each.
+        // each run's contiguous depth slice. The per-position run-pointer and
+        // interval branch fall out of the hot slice loop. Capped exclusions are
+        // counted at every position, N gaps included, because the bases were
+        // piled up there either way.
         let mut eligible: u64 = 0;
+        let mut excl_capped: u64 = 0;
         let mut cursor = 0usize;
         for &(start, end) in &runs {
             let (start, end) = (start as usize, end as usize);
-            self.depth.zero_range(cursor, start);
-            let slice = self.depth.slice_mut(start, end - start);
+            excl_capped += bases_above_cap(&depth[cursor..start], cap);
+            let run = &depth[start..end];
             match &intervals_bv {
                 None => {
                     // Every position in the run is eligible.
-                    for slot in slice.iter_mut() {
-                        let idx = (*slot).min(cap) as usize;
-                        self.depth_histogram[idx] += 1;
-                        *slot = 0;
+                    for &position_depth in run {
+                        self.depth_histogram[position_depth.min(cap) as usize] += 1;
+                        excl_capped += u64::from(position_depth.saturating_sub(cap));
                     }
-                    eligible += (end - start) as u64;
+                    eligible += run.len() as u64;
                 }
                 Some(bv) => {
-                    // Only positions inside the interval mask are eligible; all
-                    // positions are still zeroed for reuse.
-                    for (offset, slot) in slice.iter_mut().enumerate() {
+                    // Only positions inside the interval mask are eligible.
+                    for (offset, &position_depth) in run.iter().enumerate() {
                         let pos = start + offset;
                         if pos < bv.len() && bv[pos] {
-                            let idx = (*slot).min(cap) as usize;
-                            self.depth_histogram[idx] += 1;
+                            self.depth_histogram[position_depth.min(cap) as usize] += 1;
                             eligible += 1;
                         }
-                        *slot = 0;
+                        excl_capped += u64::from(position_depth.saturating_sub(cap));
                     }
                 }
             }
             cursor = end;
         }
-        // Zero the trailing N gap after the last run.
-        self.depth.zero_range(cursor, contig_len);
+        // The trailing N gap after the last run.
+        excl_capped += bases_above_cap(&depth[cursor..], cap);
+        self.bases_excl_capped += excl_capped;
         self.genome_territory += eligible;
+
+        // The finished array goes to the writer thread, or is freed; the next
+        // contig gets a new one.
+        let depth = self.depth.take();
+        if let Some(per_base_thread) = &mut self.per_base_thread {
+            per_base_thread.write_contig(ref_id, depth)?;
+        }
+        Ok(())
     }
 
     /// Write a PDF area-chart of the coverage depth distribution to [`Self::plot_path`].
@@ -667,13 +719,14 @@ impl WgsCollector {
         let quals: &[u8] = record.quality_scores();
         let contig_len_u64 = self.depth.len() as u64;
         let min_bq = self.min_bq;
-        let cap = self.coverage_cap;
+        // Depth piles up to `MAX_STORED_DEPTH`; `--coverage-cap` is applied in `finalize_contig`.
+        let max_depth = MAX_STORED_DEPTH;
         // Per-record exclusion tallies, folded into the collector's counters once
         // at the end so the hot per-base loop touches only locals and the depth
         // slice, never scattered `self` fields.
         let mut excl_baseq: u64 = 0;
         let mut excl_overlap: u64 = 0;
-        let mut excl_capped: u64 = 0;
+        let mut excl_saturated: u64 = 0;
 
         for (ref_off, read_off, len) in iter_aligned_blocks(record) {
             let block_ref_start = ref_start_u64 + u64::from(ref_off);
@@ -705,19 +758,19 @@ impl WgsCollector {
             // `[base_pos, base_pos + n)` (already clamped to the contig).
             let depth_slice = self.depth.slice_mut(base_pos as usize, n);
             if A::IS_ALONE {
-                // No mate bookkeeping: a pure BQ-filter + cap-saturated increment
+                // No mate bookkeeping: a pure BQ-filter + saturating increment
                 // over contiguous memory, done SIMD-wide.
-                let (bq, capped) =
-                    crate::simd::pileup_depth_alone(available, depth_slice, min_bq, cap);
+                let (bq, saturated) =
+                    crate::simd::pileup_depth_alone(available, depth_slice, min_bq, max_depth);
                 excl_baseq += bq;
-                excl_capped += capped;
+                excl_saturated += saturated;
             } else {
                 // Overlapping-mate cases keep the per-base scalar walk so the
                 // mate-overlap hooks (`is_mate_covered` / `on_depth_counted`) run.
-                // The BQ-filter + cap-saturated increment below MUST stay in lock-
-                // step with `simd::pileup_depth_alone` (the SIMD path above); the
-                // byte-identical fixture run exercises both and would diverge if
-                // they drift.
+                // The BQ-filter + saturating increment below MUST stay in lock-
+                // step with `simd::pileup_depth_alone` (the SIMD path above), whose
+                // per-position rule `pileup_depth_alone_matches_scalar_across_boundaries`
+                // pins against a scalar reference.
                 for (i, (slot, &q)) in depth_slice.iter_mut().zip(available).enumerate() {
                     if q < min_bq {
                         excl_baseq += 1;
@@ -728,10 +781,10 @@ impl WgsCollector {
                     if action.is_mate_covered(ref_pos) {
                         excl_overlap += 1;
                     } else {
-                        if *slot < cap {
+                        if *slot < max_depth {
                             *slot += 1;
                         } else {
-                            excl_capped += 1;
+                            excl_saturated += 1;
                         }
                         action.on_depth_counted(ref_pos);
                     }
@@ -745,7 +798,7 @@ impl WgsCollector {
 
         self.bases_excl_baseq += excl_baseq;
         self.bases_excl_overlap += excl_overlap;
-        self.depth.add_excl_capped(excl_capped);
+        self.depth.add_excl_saturated(excl_saturated);
     }
 }
 
@@ -762,6 +815,13 @@ impl Collector for WgsCollector {
         self.reference.validate_bam_header(header)?;
 
         let dict = SequenceDictionary::from(header);
+        // Every interval lookup is by BAM `tid`, so index the intervals by the BAM's
+        // contig order, which need not match the FASTA's.
+        self.intervals = self
+            .intervals_path
+            .as_ref()
+            .map(|path| Intervals::from_path(path, dict.clone()))
+            .transpose()?;
 
         // Precompute non-N runs for every relevant contig up front, reusing one
         // caller-owned sequence buffer across all loads. The runs are consulted
@@ -786,12 +846,21 @@ impl Collector for WgsCollector {
             // already guaranteed every contig is present in the reference index, so
             // this only fires on an unreadable/truncated reference — a broken input
             // where failing loud beats silently under-counting genome_territory.
-            // (The pre-refactor code warn+skipped this only for zero-read contigs.)
             self.reference.load_contig_into(name, false, &mut seq_buf)?;
             runs[ref_id] = non_n_intervals(&seq_buf);
         }
         drop(seq_buf);
         self.non_n_runs = runs;
+
+        if let Some(path) = &self.per_base_path {
+            // A bigWig must list at least one contig, and there would be no data anyway.
+            if dict.is_empty() {
+                log::warn!("wgs: the BAM header lists no contigs; writing no per-base coverage");
+            } else {
+                let writer = PerBaseWriter::create(path, &dict, self.intervals.as_ref())?;
+                self.per_base_thread = Some(PerBaseThread::spawn(writer)?);
+            }
+        }
 
         self.dict = Some(dict);
         self.sample = derive_sample(&self.input_path, header);
@@ -854,7 +923,7 @@ impl Collector for WgsCollector {
         // pushed when they arrived, so we just drop the buffer.
         if Some(ref_id) != self.current_ref_id {
             if self.current_ref_id.is_some() {
-                self.finalize_contig();
+                self.finalize_contig()?;
             }
             self.begin_contig(ref_id);
         }
@@ -1008,24 +1077,274 @@ pub struct WgsCoverageEntry {
     pub frac_bases_at_or_above: f64,
 }
 
+// ─── Per-base coverage output ────────────────────────────────────────────────
+
+/// File format for `--per-base-coverage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PerBaseCoverageFormat {
+    /// bigWig with fixedStep data (suffix `.wgs-per-base.bw`).
+    Bigwig,
+}
+
+/// Runs a [`PerBaseWriter`] on its own thread, so that converting, compressing and
+/// writing one contig's depth overlaps with piling up the next.
+///
+/// The channel holds no messages, so at most two depth arrays are alive: the one
+/// being written and the one being filled. The file is finished only by
+/// [`Self::finish`]. If the collector is dropped first, or writing fails, the
+/// thread removes the file, so a failed run leaves no partial output.
+struct PerBaseThread {
+    /// `None` once dropped, which closes the channel.
+    sender: Option<SyncSender<PerBaseMessage>>,
+    /// `None` once the thread has been joined.
+    handle: Option<JoinHandle<Result<()>>>,
+}
+
+impl PerBaseThread {
+    /// Start the thread, which takes ownership of `writer`.
+    ///
+    /// # Errors
+    /// Returns an error if the thread cannot be started.
+    fn spawn(writer: PerBaseWriter) -> Result<Self> {
+        let path = writer.path.clone();
+        let (sender, receiver) = sync_channel(0);
+        let spawned = std::thread::Builder::new()
+            .name("wgs-per-base".to_string())
+            .spawn(move || Self::run(writer, &receiver));
+        match spawned {
+            Ok(handle) => Ok(Self { sender: Some(sender), handle: Some(handle) }),
+            Err(error) => {
+                // The writer was dropped with the thread's closure, unfinished.
+                Self::remove_unfinished(&path);
+                Err(error).context("cannot start the per-base coverage writer thread")
+            }
+        }
+    }
+
+    /// Hand contig `ref_id`'s depth array to the thread, waiting until it has
+    /// written the previous contig.
+    ///
+    /// # Errors
+    /// Returns the thread's error if it has stopped writing.
+    fn write_contig(&mut self, ref_id: usize, depth: Vec<u16>) -> Result<()> {
+        self.send(PerBaseMessage::Contig { ref_id, depth })
+    }
+
+    /// Finish the file and wait for the thread to exit.
+    ///
+    /// # Errors
+    /// Returns an error if any contig or the file's completion could not be written.
+    fn finish(mut self) -> Result<()> {
+        self.send(PerBaseMessage::Finish)?;
+        self.join()
+    }
+
+    /// Send `message` to the thread. A send fails only once the thread has exited,
+    /// which it does early only on an error, so return that error.
+    fn send(&mut self, message: PerBaseMessage) -> Result<()> {
+        if self.sender.as_ref().is_some_and(|sender| sender.send(message).is_ok()) {
+            return Ok(());
+        }
+        self.join()?;
+        bail!("the per-base coverage writer thread stopped unexpectedly")
+    }
+
+    /// Wait for the thread to exit and return its result.
+    fn join(&mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => bail!("the per-base coverage writer thread panicked"),
+        }
+    }
+
+    /// The thread's body: write the file, then remove it unless it was finished.
+    fn run(writer: PerBaseWriter, receiver: &Receiver<PerBaseMessage>) -> Result<()> {
+        let path = writer.path.clone();
+        let result = Self::write_all(writer, receiver);
+        if !matches!(result, Ok(true)) {
+            Self::remove_unfinished(&path);
+        }
+        result.map(|_finished| ())
+    }
+
+    /// Write each contig as it arrives and finish the file on
+    /// [`PerBaseMessage::Finish`]. Returns whether the file was finished, which it
+    /// is not if the collector is dropped first.
+    fn write_all(mut writer: PerBaseWriter, receiver: &Receiver<PerBaseMessage>) -> Result<bool> {
+        for message in receiver {
+            match message {
+                PerBaseMessage::Contig { ref_id, depth } => writer.write_contig(ref_id, &depth)?,
+                PerBaseMessage::Finish => return writer.finish().map(|()| true),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove the unfinished file at `path`. The run has already failed, so a file
+    /// that cannot be removed is only logged.
+    fn remove_unfinished(path: &Path) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                log::info!("wgs: removed unfinished per-base coverage file {}", path.display());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "wgs: cannot remove unfinished per-base coverage file {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl Drop for PerBaseThread {
+    /// Close the channel and wait for the thread, so it never outlives the
+    /// collector. Unless [`PerBaseThread::finish`] ran, the thread removes the
+    /// file; its error, if any, is moot because the run has already failed.
+    fn drop(&mut self) {
+        self.sender = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A message to the [`PerBaseThread`].
+enum PerBaseMessage {
+    /// The depth array of the BAM contig `ref_id`, which is complete.
+    Contig { ref_id: usize, depth: Vec<u16> },
+    /// Every contig has been sent; finish the file.
+    Finish,
+}
+
+/// Writes each contig's per-base depth to a bigWig file as the contig is finalized.
+///
+/// Every BAM contig is in the file's chromosome list, with `chromId` equal to its
+/// BAM `tid`, but only contigs with coverage get data. A contig's data is one
+/// fixedStep run over the whole contig, zeros included, or one run per merged
+/// interval when `-L` is given.
+struct PerBaseWriter {
+    path: PathBuf,
+    writer: BigWigWriter<File>,
+    /// Contig names and lengths from the BAM header, indexed by `tid`.
+    contigs: Vec<ChromInfo>,
+    /// The `-L` intervals, merged because the writer rejects overlapping items.
+    intervals: Option<Intervals>,
+    /// Reused buffer for converting depth to `f32` one chunk at a time.
+    values: Vec<f32>,
+}
+
+impl PerBaseWriter {
+    /// Create the file at `path` with every contig in `dict`, in BAM header order.
+    ///
+    /// # Errors
+    /// Returns an error if a contig is longer than bigWig allows (`u32::MAX`
+    /// bases) or the file cannot be created.
+    fn create(
+        path: &Path,
+        dict: &SequenceDictionary,
+        intervals: Option<&Intervals>,
+    ) -> Result<Self> {
+        let contigs = dict
+            .iter()
+            .map(|contig| {
+                let length = u32::try_from(contig.length()).with_context(|| {
+                    format!(
+                        "contig {} is {} bp, longer than a bigWig file allows",
+                        contig.name(),
+                        contig.length()
+                    )
+                })?;
+                Ok(ChromInfo::new(contig.name(), length))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let writer = WriterOptions::new()
+            .chrom_id_order(ChromIdOrder::Listed)
+            .create(path, &contigs)
+            .with_context(|| format!("cannot create per-base coverage file {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer,
+            contigs,
+            intervals: intervals.map(Intervals::merged),
+            values: Vec::with_capacity(PER_BASE_CHUNK_LEN),
+        })
+    }
+
+    /// Write the depth of contig `ref_id`: every position, or the positions in its
+    /// intervals when `-L` was given. Writes nothing if all those positions have
+    /// zero depth.
+    ///
+    /// # Errors
+    /// Returns an error if the data cannot be written.
+    fn write_contig(&mut self, ref_id: usize, depth: &[u16]) -> Result<()> {
+        // The depth array is sized from the reference; never write past the BAM
+        // header's length for the contig, which the file declares.
+        let contig = &self.contigs[ref_id];
+        let len = depth.len().min(contig.length as usize);
+        let ranges: Vec<(usize, usize)> = match &self.intervals {
+            None => vec![(0, len)],
+            Some(intervals) => intervals
+                .get_contig(ref_id)
+                .iter()
+                .map(|interval| {
+                    ((interval.start as usize).min(len), (interval.end as usize).min(len))
+                })
+                .filter(|&(start, end)| start < end)
+                .collect(),
+        };
+        if !ranges.iter().any(|&(start, end)| depth[start..end].iter().any(|&d| d != 0)) {
+            return Ok(());
+        }
+
+        for (start, end) in ranges {
+            for (chunk_index, chunk) in depth[start..end].chunks(PER_BASE_CHUNK_LEN).enumerate() {
+                self.values.clear();
+                self.values.extend(chunk.iter().map(|&d| f32::from(d)));
+                // Positions are below `contig.length`, a `u32`.
+                #[allow(clippy::cast_possible_truncation)]
+                let chunk_start = (start + chunk_index * PER_BASE_CHUNK_LEN) as u32;
+                self.writer
+                    .push_fixed_step(&contig.name, chunk_start, 1, 1, &self.values)
+                    .with_context(|| {
+                        format!("cannot write per-base coverage to {}", self.path.display())
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the indexes, zoom levels and header that complete the file.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be finished.
+    fn finish(self) -> Result<()> {
+        self.writer.finish().with_context(|| {
+            format!("cannot finish per-base coverage file {}", self.path.display())
+        })?;
+        log::info!("wgs: per-base coverage written to {}", self.path.display());
+        Ok(())
+    }
+}
+
 // ─── ContigDepth ─────────────────────────────────────────────────────────────
 
-/// Per-position depth array for a single contig. Allocated once and reused
-/// across contigs: `reset_for_contig(n)` clears and resizes to `n` u16 slots,
-/// zeroing all entries. The caller drains the array by `take(pos)` on each
-/// position during `finalize_contig`, which returns the current depth and
-/// zeros the slot — after the finalize pass the array is already in the
-/// "fresh" state for the next contig (no separate memset needed).
+/// Per-position depth array for a single contig, allocated for each contig by
+/// `reset_for_contig(n)` and given up by `take` once the contig is finalized.
+/// Depth is stored up to [`MAX_STORED_DEPTH`].
 struct ContigDepth {
     depth: Vec<u16>,
-    /// Running count of bases that arrived at a position already at the cap.
-    /// Finalize drains this into the collector-level accumulator.
-    excl_capped: u64,
+    /// Running count of bases that arrived at a position already holding
+    /// [`MAX_STORED_DEPTH`]. Finalize drains this into the capped exclusions.
+    excl_saturated: u64,
 }
 
 impl ContigDepth {
+    /// An empty array; `reset_for_contig` sizes it for each contig.
     fn new() -> Self {
-        Self { depth: Vec::new(), excl_capped: 0 }
+        Self { depth: Vec::new(), excl_saturated: 0 }
     }
 
     /// Length of the currently-active contig's depth array.
@@ -1033,20 +1352,27 @@ impl ContigDepth {
         self.depth.len()
     }
 
-    /// Resize for a new contig. `Vec::resize(n, 0)` reuses the existing backing
-    /// allocation up to current capacity, truncates down or zero-fills new
-    /// slots as needed; the caller is expected to have drained the previous
-    /// contig via `take(pos)` so the existing slots are already zero.
+    /// The whole depth array of the current contig.
+    fn as_slice(&self) -> &[u16] {
+        &self.depth
+    }
+
+    /// Allocate `contig_len` zeroed slots for a new contig.
     fn reset_for_contig(&mut self, contig_len: usize) {
-        self.depth.resize(contig_len, 0);
+        self.depth = vec![0; contig_len];
+    }
+
+    /// Take the depth array, leaving an empty one.
+    fn take(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.depth)
     }
 
     /// Mutable view of the depth slots for the half-open range `[start, start+len)`.
     /// The caller (`walk_depth`) has already clamped the range to the contig, so
-    /// iterating this slice elides the per-base bounds check and lets the cap /
+    /// iterating this slice elides the per-base bounds check and lets the
     /// increment loop run over contiguous memory. The saturating increment and
-    /// capped-exclusion accounting live at the call site (interleaved with the
-    /// per-base BQ filter and mate-overlap hooks), so this is a plain slice.
+    /// exclusion accounting live at the call site (interleaved with the per-base
+    /// BQ filter and mate-overlap hooks), so this is a plain slice.
     ///
     /// Panics if `[start, start+len)` is out of range; `walk_depth` guarantees it
     /// is in bounds (each CIGAR block is clamped to the contig length before the
@@ -1057,24 +1383,16 @@ impl ContigDepth {
         &mut self.depth[start..start + len]
     }
 
-    /// Zero the depth slots in `[start, end)` in bulk (a vectorized fill). Used by
-    /// `finalize_contig` to reset the N-gap positions between non-N runs — those
-    /// carry no eligible coverage but may have accrued depth from deletion-
-    /// spanning reads, so they still must be cleared before the next contig.
-    fn zero_range(&mut self, start: usize, end: usize) {
-        self.depth[start..end].fill(0);
+    /// Add to the running saturation counter (bases that arrived at a position
+    /// already holding [`MAX_STORED_DEPTH`]). `walk_depth` accumulates these per
+    /// record and folds them in once.
+    fn add_excl_saturated(&mut self, n: u64) {
+        self.excl_saturated += n;
     }
 
-    /// Add to the running capped-exclusion counter (bases that arrived at a
-    /// position already at the cap). `walk_depth` accumulates these per record
-    /// and folds them in once.
-    fn add_excl_capped(&mut self, n: u64) {
-        self.excl_capped += n;
-    }
-
-    /// Drain and return the running capped-exclusion counter.
-    fn take_excl_capped(&mut self) -> u64 {
-        std::mem::take(&mut self.excl_capped)
+    /// Drain and return the running saturation counter.
+    fn take_excl_saturated(&mut self) -> u64 {
+        std::mem::take(&mut self.excl_saturated)
     }
 }
 
@@ -1133,7 +1451,7 @@ impl CachedMate {
 trait DepthAction {
     /// `true` only for [`AloneAction`]. It gates the SIMD fast path in
     /// `walk_depth`: with no per-base mate bookkeeping to do, an alone read's
-    /// block is a pure BQ-filter + cap-saturated increment over a contiguous
+    /// block is a pure BQ-filter + saturating increment over a contiguous
     /// depth slice, which vectorizes. The const is monomorphised away, so the
     /// dispatch `if A::IS_ALONE` is resolved at compile time per action.
     const IS_ALONE: bool = false;
@@ -1253,6 +1571,14 @@ fn count_aligned_bases(record: &RikerRecord) -> u64 {
         }
     }
     count
+}
+
+// ─── Coverage cap helper ──────────────────────────────────────────────────────
+
+/// The number of bases in `depths` above `cap`: the capped exclusions at those
+/// positions.
+fn bases_above_cap(depths: &[u16], cap: u16) -> u64 {
+    depths.iter().map(|&depth| u64::from(depth.saturating_sub(cap))).sum()
 }
 
 // ─── Non-N interval helper ────────────────────────────────────────────────────
@@ -1437,7 +1763,7 @@ mod tests {
     // ── ContigDepth tests ────────────────────────────────────────────────────
 
     #[test]
-    fn contig_depth_slice_increments_then_zero_range_resets() {
+    fn contig_depth_slice_increments_then_reset_zeroes() {
         let mut d = ContigDepth::new();
         d.reset_for_contig(10);
         // Increment through the mutable slice (walk_depth's path).
@@ -1448,34 +1774,66 @@ mod tests {
         assert_eq!(d.slice_mut(3, 1)[0], 2);
         assert_eq!(d.slice_mut(7, 1)[0], 1);
         assert_eq!(d.slice_mut(0, 1)[0], 0);
-        // `zero_range` clears a span in bulk (finalize's gap reset).
-        d.zero_range(3, 8);
-        assert_eq!(d.slice_mut(3, 1)[0], 0);
-        assert_eq!(d.slice_mut(7, 1)[0], 0);
+        // The next contig starts from zero, however long it is.
+        d.reset_for_contig(8);
+        assert_eq!(d.as_slice(), &[0; 8]);
     }
 
     #[test]
-    fn contig_depth_excl_capped_accumulates_then_drains() {
+    fn bases_above_cap_sums_the_excess_at_each_position() {
+        // Bases above a cap of 3: 2 at depth 5, 6 at depth 9, 1 at depth 4.
+        assert_eq!(bases_above_cap(&[0, 2, 5, 3, 9, 4], 3), 9);
+        assert_eq!(bases_above_cap(&[], 3), 0);
+    }
+
+    #[test]
+    fn contig_depth_excl_saturated_accumulates_then_drains() {
         let mut d = ContigDepth::new();
-        d.add_excl_capped(3);
-        d.add_excl_capped(4);
-        assert_eq!(d.take_excl_capped(), 7);
+        d.add_excl_saturated(3);
+        d.add_excl_saturated(4);
+        assert_eq!(d.take_excl_saturated(), 7);
         // `take` drains the counter.
-        assert_eq!(d.take_excl_capped(), 0);
+        assert_eq!(d.take_excl_saturated(), 0);
     }
 
     #[test]
-    fn contig_depth_resize_grows_and_reuses_backing() {
+    fn contig_depth_take_returns_the_array_and_reset_starts_a_zeroed_one() {
         let mut d = ContigDepth::new();
         d.reset_for_contig(10);
         d.slice_mut(5, 1)[0] += 1;
-        d.zero_range(5, 6);
-        // Switch to a larger contig; the backing store grows via resize, with
-        // the new slots zero-filled.
+        let taken = d.take();
+        assert_eq!(taken.len(), 10);
+        assert_eq!(taken[5], 1);
+        assert_eq!(d.len(), 0);
+        // The next contig, larger, starts from zero.
         d.reset_for_contig(100);
         assert_eq!(d.len(), 100);
+        assert_eq!(d.slice_mut(5, 1)[0], 0);
         d.slice_mut(99, 1)[0] += 1;
         assert_eq!(d.slice_mut(99, 1)[0], 1);
+    }
+
+    // ── PerBaseThread tests ──────────────────────────────────────────────────
+
+    /// A write that fails on the writer thread comes back from `finish` as the
+    /// writer's error, and the unfinished file is removed.
+    #[test]
+    fn per_base_thread_finish_returns_the_writer_error_and_removes_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("out.bw");
+        let sam = crate::test_support::coord_builder(&[("chr1", 10)]);
+        let dict = SequenceDictionary::from(sam.header());
+        let writer = PerBaseWriter::create(&path, &dict, None).unwrap();
+        let mut thread = PerBaseThread::spawn(writer).unwrap();
+
+        thread.write_contig(0, vec![1; 10]).unwrap();
+        // Writing chr1 again overlaps its first run, which the writer rejects.
+        thread.write_contig(0, vec![1; 10]).unwrap();
+        let error = thread.finish().unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot write per-base coverage"), "unexpected error: {message}");
+        assert!(!path.exists());
     }
 
     // ── CachedMate tests ─────────────────────────────────────────────────────
