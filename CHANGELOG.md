@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`wgs --per-base-coverage` writes per-base depth as a bigWig** (`<prefix>.wgs-per-base.bw`), which IGV, UCSC, JBrowse 2, pyBigWig and the UCSC bigWig tools read directly. The depth is filtered exactly as for the metrics (mapping and base quality, duplicates, unpaired reads, overlapping mates) but is not capped by `--coverage-cap`; depth above 65,535 is reported as 65,535. Each contig with coverage is written as fixedStep data at every position, zeros included; contigs without coverage are listed in the file but have no data. With `--intervals`, only the interval positions are written. Writing uses one thread beyond `--threads`, and memory for one more contig's depth (about 0.5 GB for human chr1). In `multi` the option is `--wgs::per-base-coverage`.
+- **`wgs --per-base-coverage` writes per-base depth as a bigWig** (`<prefix>.wgs-per-base.bw`), which IGV, UCSC, JBrowse 2, pyBigWig and the UCSC bigWig tools read directly. The depth is filtered exactly as for the metrics (mapping and base quality, duplicates, unpaired reads, overlapping mates) but is not capped by `--coverage-cap`; depth above 65,535 is reported as 65,535. Every position of every contig in the BAM header gets a value, zeros included, or with `--intervals` every interval position, even where no read reaches; a contig or interval with no coverage is stored as one zero-valued item, and everything else as fixedStep data. Zoom levels run from 1 kb to 100 Mb in ×10 steps. Writing uses one thread beyond `--threads`, and memory for one more contig's depth (about 0.5 GB for human chr1). In `multi` the option is `--wgs::per-base-coverage`.
 
 ### Fixed
 

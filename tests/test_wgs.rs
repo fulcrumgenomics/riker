@@ -603,6 +603,19 @@ fn all_missing(values: &[f32]) -> bool {
     values.iter().all(|value| value.is_nan())
 }
 
+/// The items stored for `chrom` as `(start, end, value)`: one per position of fixedStep data, one
+/// per zero-valued bedGraph item.
+fn items(reader: &mut BigWigReader<BufReader<File>>, chrom: &str) -> Vec<(u32, u32, f32)> {
+    reader
+        .chrom_items(chrom)
+        .unwrap()
+        .map(|item| {
+            let item = item.unwrap();
+            (item.start, item.end, item.value)
+        })
+        .collect()
+}
+
 /// A covered contig gets a value at every position, including zero where no read lands.
 #[test]
 fn per_base_coverage_writes_the_depth_at_every_position_of_a_covered_contig() {
@@ -687,9 +700,30 @@ fn per_base_coverage_reports_depth_above_65535_as_65535() {
     assert_eq!(reader.values("chr1", 0, 20).unwrap(), expected);
 }
 
-/// A contig no read reaches is in the file's chromosome list but has no data.
+/// A contig that no read reaches, between two that reads do, has zero depth at every position.
 #[test]
-fn per_base_coverage_omits_contigs_without_reads() {
+fn per_base_coverage_writes_zeros_on_a_contig_without_reads_between_covered_contigs() {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'A'; 20])
+        .contig("chr3", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let mut sam = coord_builder(&[("chr1", 20), ("chr2", 20), ("chr3", 20)]);
+    sam.add(pair("r0").at("chr1", 1, 11).len(10));
+    sam.add(pair("r1").at("chr3", 1, 11).len(10));
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base(&sam, refa.path(), None, 250, &dir);
+
+    assert_eq!(reader.values("chr1", 0, 20).unwrap(), repeat(1.0, 20));
+    assert_eq!(reader.values("chr2", 0, 20).unwrap(), repeat(0.0, 20));
+    assert_eq!(reader.values("chr3", 0, 20).unwrap(), repeat(1.0, 20));
+}
+
+/// Contigs after the last one that reads reach have zero depth at every position.
+#[test]
+fn per_base_coverage_writes_zeros_on_contigs_after_the_last_covered_contig() {
     let refa = FastaBuilder::new()
         .contig("chr1", vec![b'A'; 20])
         .contig("chr2", vec![b'A'; 20])
@@ -701,14 +735,13 @@ fn per_base_coverage_omits_contigs_without_reads() {
 
     let mut reader = run_per_base(&sam, refa.path(), None, 250, &dir);
 
-    assert!(reader.chrom("chr2").is_some());
-    assert!(all_missing(&reader.values("chr2", 0, 20).unwrap()));
     assert_eq!(reader.values("chr1", 0, 20).unwrap(), repeat(1.0, 20));
+    assert_eq!(reader.values("chr2", 0, 20).unwrap(), repeat(0.0, 20));
 }
 
-/// A contig whose reads all fail the filters has no coverage, so it has no data either.
+/// A contig whose reads all fail the filters has zero depth at every position.
 #[test]
-fn per_base_coverage_omits_contigs_whose_reads_are_all_filtered() {
+fn per_base_coverage_writes_zeros_on_a_contig_whose_reads_are_all_filtered() {
     let refa = FastaBuilder::new()
         .contig("chr1", vec![b'A'; 20])
         .contig("chr2", vec![b'A'; 20])
@@ -721,7 +754,45 @@ fn per_base_coverage_omits_contigs_whose_reads_are_all_filtered() {
 
     let mut reader = run_per_base(&sam, refa.path(), None, 250, &dir);
 
-    assert!(all_missing(&reader.values("chr2", 0, 20).unwrap()));
+    assert_eq!(reader.values("chr2", 0, 20).unwrap(), repeat(0.0, 20));
+}
+
+/// A BAM with no reads still gets zero depth at every position of every contig.
+#[test]
+fn per_base_coverage_writes_zeros_on_every_contig_of_a_bam_without_reads() {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let sam = coord_builder(&[("chr1", 20), ("chr2", 20)]);
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base(&sam, refa.path(), None, 250, &dir);
+
+    assert_eq!(reader.values("chr1", 0, 20).unwrap(), repeat(0.0, 20));
+    assert_eq!(reader.values("chr2", 0, 20).unwrap(), repeat(0.0, 20));
+}
+
+/// A contig without coverage is stored as one zero-valued item, whether no read reached it or its
+/// reads were all filtered.
+#[test]
+fn per_base_coverage_stores_a_contig_without_coverage_as_one_zero_item() {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'A'; 20])
+        .contig("chr3", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let mut sam = coord_builder(&[("chr1", 20), ("chr2", 20), ("chr3", 20)]);
+    sam.add(pair("r0").at("chr1", 1, 11).len(10));
+    sam.add(pair("low_bq").at("chr3", 1, 11).len(10).quals(vec![5; 10]));
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base(&sam, refa.path(), None, 250, &dir);
+
+    assert_eq!(items(&mut reader, "chr2"), [(0, 20, 0.0)]);
+    assert_eq!(items(&mut reader, "chr3"), [(0, 20, 0.0)]);
 }
 
 /// With `--intervals`, only interval positions get data; overlapping intervals are merged.
@@ -740,6 +811,117 @@ fn per_base_coverage_with_intervals_writes_only_the_interval_positions() {
     assert!(all_missing(&values[..5]));
     assert_eq!(values[5..15], repeat(1.0, 10));
     assert!(all_missing(&values[15..]));
+}
+
+/// The two contig and interval layouts of the tests of intervals without coverage: a 40 bp chr1 whose
+/// one pair covers positions 0–19, with intervals at 5–15 and 25–35, and a 20 bp chr2 no read
+/// reaches, with an interval at 5–15.
+fn intervals_without_coverage_inputs(
+    dir: &TempDir,
+) -> (tempfile::NamedTempFile, SamBuilder, PathBuf) {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 40])
+        .contig("chr2", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let mut sam = coord_builder(&[("chr1", 40), ("chr2", 20)]);
+    sam.add(pair("r0").at("chr1", 1, 11).len(10));
+    let bed_path = dir.path().join("targets.bed");
+    BedBuilder::new()
+        .interval("chr1", 5, 15)
+        .interval("chr1", 25, 35)
+        .interval("chr2", 5, 15)
+        .write_bed(&bed_path)
+        .unwrap();
+    (refa, sam, bed_path)
+}
+
+/// With `--intervals`, an interval no read covers has zero depth at every position, on a contig
+/// that reads reach elsewhere.
+#[test]
+fn per_base_coverage_with_intervals_writes_zeros_on_an_interval_without_coverage() {
+    let dir = TempDir::new().unwrap();
+    let (refa, sam, bed_path) = intervals_without_coverage_inputs(&dir);
+
+    let mut reader = run_per_base(&sam, refa.path(), Some(bed_path), 250, &dir);
+
+    let values = reader.values("chr1", 0, 40).unwrap();
+    assert!(all_missing(&values[..5]));
+    assert_eq!(values[5..15], repeat(1.0, 10));
+    assert!(all_missing(&values[15..25]));
+    assert_eq!(values[25..35], repeat(0.0, 10));
+    assert!(all_missing(&values[35..]));
+}
+
+/// With `--intervals`, the intervals of a contig no read reaches have zero depth at every position.
+#[test]
+fn per_base_coverage_with_intervals_writes_zeros_on_a_contig_without_reads() {
+    let dir = TempDir::new().unwrap();
+    let (refa, sam, bed_path) = intervals_without_coverage_inputs(&dir);
+
+    let mut reader = run_per_base(&sam, refa.path(), Some(bed_path), 250, &dir);
+
+    let values = reader.values("chr2", 0, 20).unwrap();
+    assert!(all_missing(&values[..5]));
+    assert_eq!(values[5..15], repeat(0.0, 10));
+    assert!(all_missing(&values[15..]));
+}
+
+/// With `--intervals`, a BAM with no reads still gets zero depth at every interval position.
+#[test]
+fn per_base_coverage_with_intervals_writes_zeros_on_every_interval_of_a_bam_without_reads() {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 20])
+        .contig("chr2", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let sam = coord_builder(&[("chr1", 20), ("chr2", 20)]);
+    let dir = TempDir::new().unwrap();
+    let bed_path = dir.path().join("targets.bed");
+    BedBuilder::new().interval("chr1", 5, 15).interval("chr2", 0, 10).write_bed(&bed_path).unwrap();
+
+    let mut reader = run_per_base(&sam, refa.path(), Some(bed_path), 250, &dir);
+
+    let chr1 = reader.values("chr1", 0, 20).unwrap();
+    assert!(all_missing(&chr1[..5]));
+    assert_eq!(chr1[5..15], repeat(0.0, 10));
+    assert!(all_missing(&chr1[15..]));
+    let chr2 = reader.values("chr2", 0, 20).unwrap();
+    assert_eq!(chr2[..10], repeat(0.0, 10));
+    assert!(all_missing(&chr2[10..]));
+}
+
+/// With `--intervals`, an interval without coverage is stored as one zero-valued item, and an
+/// interval with coverage as per-position data.
+#[test]
+fn per_base_coverage_with_intervals_stores_an_interval_without_coverage_as_one_zero_item() {
+    let dir = TempDir::new().unwrap();
+    let (refa, sam, bed_path) = intervals_without_coverage_inputs(&dir);
+
+    let mut reader = run_per_base(&sam, refa.path(), Some(bed_path), 250, &dir);
+
+    let expected: Vec<(u32, u32, f32)> =
+        (5..15).map(|pos| (pos, pos + 1, 1.0)).chain([(25, 35, 0.0)]).collect();
+    assert_eq!(items(&mut reader, "chr1"), expected);
+    assert_eq!(items(&mut reader, "chr2"), [(5, 15, 0.0)]);
+}
+
+/// The first zoom level is 1 kb even when a long contig without reads, stored as one item, comes
+/// before the covered ones.
+#[test]
+fn per_base_coverage_zoom_levels_start_at_1_kb_when_leading_contigs_have_no_reads() {
+    let refa = FastaBuilder::new()
+        .contig("chr1", vec![b'A'; 1_000_000])
+        .contig("chr2", vec![b'A'; 20])
+        .to_temp_fasta()
+        .unwrap();
+    let mut sam = coord_builder(&[("chr1", 1_000_000), ("chr2", 20)]);
+    sam.add(pair("r0").at("chr2", 1, 11).len(10));
+    let dir = TempDir::new().unwrap();
+
+    let reader = run_per_base(&sam, refa.path(), None, 250, &dir);
+
+    assert_eq!(reader.zoom_levels()[0].reduction(), 1_000);
 }
 
 /// Contigs keep their BAM header order, with `chromId` equal to the BAM `tid`, even when that

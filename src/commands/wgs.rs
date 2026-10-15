@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail, ensure};
-use bigwig::{BigWigWriter, ChromIdOrder, ChromInfo, WriterOptions};
+use bigwig::{BigWigWriter, ChromIdOrder, ChromInfo, WriterOptions, ZoomPolicy};
 use bitvec::prelude::*;
 use clap::{Args, ValueEnum};
 use kuva::plot::LinePlot;
@@ -50,6 +50,13 @@ pub const PER_BASE_BIGWIG_SUFFIX: &str = ".wgs-per-base.bw";
 /// Positions converted to `f32` per push to the per-base writer. The writer continues one run
 /// across pushes, so this sizes only the conversion buffer, not the file's sections.
 const PER_BASE_CHUNK_LEN: usize = 8_192;
+
+/// Zoom levels of the per-base file, in bases per record: 1 kb, then ×10 up to 100 Mb. Views finer
+/// than 1 kb read the raw data, and starting there rather than at a few hundred bases keeps the
+/// zoom data small. Set explicitly because the writer's default policy derives the levels from the
+/// first items written, which a long contig written as one zero-depth item makes far coarser.
+const PER_BASE_ZOOM_REDUCTIONS: [u32; 6] =
+    [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
 
 /// Largest depth stored per position, and so the largest per-base output reports. `--coverage-cap`
 /// is applied when a contig is tallied, not while piling up; bases arriving at a position that
@@ -96,12 +103,12 @@ pub struct WgsOptions {
     /// Write per-base depth to <prefix>.wgs-per-base.bw.
     ///
     /// `bigwig` (the only format) is the default when the flag has no value.
-    /// Each contig with coverage is written as fixedStep data at every
-    /// position, or only at its interval positions when intervals are given;
-    /// contigs without coverage there have no data. Depth is filtered as for
-    /// the metrics but not capped by the coverage cap, and depth above 65535
-    /// is reported as 65535. Writing uses one thread beyond --threads, and
-    /// memory for one more contig's depth (about 0.5 GB for human chr1).
+    /// Every position of every contig in the BAM header gets a value, zeros
+    /// included, or every interval position when intervals are given. Depth is
+    /// filtered as for the metrics but not capped by the coverage cap, and
+    /// depth above 65535 is reported as 65535. Writing uses one thread beyond
+    /// --threads, and memory for one more contig's depth (about 0.5 GB for
+    /// human chr1).
     #[arg(
         long,
         value_enum,
@@ -1222,9 +1229,12 @@ enum PerBaseMessage {
 /// Writes each contig's per-base depth to a bigWig file as the contig is finalized.
 ///
 /// Every BAM contig is in the file's chromosome list, with `chromId` equal to its
-/// BAM `tid`, but only contigs with coverage get data. A contig's data is one
-/// fixedStep run over the whole contig, zeros included, or one run per merged
-/// interval when `-L` is given.
+/// BAM `tid`, and gets a value at every position, or at every interval position
+/// when `-L` is given. A contig or interval with zero depth throughout is one
+/// zero-valued bedGraph item; everything else is fixedStep data, zeros included.
+/// Contigs that no read reached are never finalized, so the writer fills them
+/// with zeros as it passes them: before the next contig it is given, and at
+/// [`PerBaseWriter::finish`].
 struct PerBaseWriter {
     path: PathBuf,
     writer: BigWigWriter<File>,
@@ -1232,6 +1242,8 @@ struct PerBaseWriter {
     contigs: Vec<ChromInfo>,
     /// The `-L` intervals, merged because the writer rejects overlapping items.
     intervals: Option<Intervals>,
+    /// The first contig not yet written; the file takes contigs in `tid` order.
+    next_ref_id: usize,
     /// Reused buffer for converting depth to `f32` one chunk at a time.
     values: Vec<f32>,
 }
@@ -1262,6 +1274,7 @@ impl PerBaseWriter {
             .collect::<Result<Vec<_>>>()?;
         let writer = WriterOptions::new()
             .chrom_id_order(ChromIdOrder::Listed)
+            .zoom(ZoomPolicy::Explicit(PER_BASE_ZOOM_REDUCTIONS.to_vec()))
             .create(path, &contigs)
             .with_context(|| format!("cannot create per-base coverage file {}", path.display()))?;
         Ok(Self {
@@ -1269,22 +1282,67 @@ impl PerBaseWriter {
             writer,
             contigs,
             intervals: intervals.map(Intervals::merged),
+            next_ref_id: 0,
             values: Vec::with_capacity(PER_BASE_CHUNK_LEN),
         })
     }
 
-    /// Write the depth of contig `ref_id`: every position, or the positions in its
-    /// intervals when `-L` was given. Writes nothing if all those positions have
-    /// zero depth.
+    /// Write zeros for the contigs before `ref_id` not yet written, then the depth
+    /// of contig `ref_id`: every position, or the positions in its intervals when
+    /// `-L` was given. Contigs must be given in increasing `ref_id` order.
     ///
     /// # Errors
     /// Returns an error if the data cannot be written.
     fn write_contig(&mut self, ref_id: usize, depth: &[u16]) -> Result<()> {
+        self.write_zeros_until(ref_id)?;
         // The depth array is sized from the reference; never write past the BAM
         // header's length for the contig, which the file declares.
-        let contig = &self.contigs[ref_id];
-        let len = depth.len().min(contig.length as usize);
-        let ranges: Vec<(usize, usize)> = match &self.intervals {
+        let len = depth.len().min(self.contigs[ref_id].length as usize);
+        for (start, end) in self.ranges(ref_id, len) {
+            if depth[start..end].iter().all(|&d| d == 0) {
+                self.push_zeros(ref_id, start, end)?;
+            } else {
+                self.push_depth(ref_id, start, &depth[start..end])?;
+            }
+        }
+        self.next_ref_id = ref_id + 1;
+        Ok(())
+    }
+
+    /// Write zeros for the contigs not yet written, then the indexes, zoom levels
+    /// and header that complete the file.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be finished.
+    fn finish(mut self) -> Result<()> {
+        self.write_zeros_until(self.contigs.len())?;
+        self.writer.finish().with_context(|| {
+            format!("cannot finish per-base coverage file {}", self.path.display())
+        })?;
+        log::info!("wgs: per-base coverage written to {}", self.path.display());
+        Ok(())
+    }
+
+    /// Write zero depth over every position, or every interval position, of the
+    /// contigs from `next_ref_id` up to but not including `end_ref_id`.
+    ///
+    /// # Errors
+    /// Returns an error if the data cannot be written.
+    fn write_zeros_until(&mut self, end_ref_id: usize) -> Result<()> {
+        while self.next_ref_id < end_ref_id {
+            let ref_id = self.next_ref_id;
+            for (start, end) in self.ranges(ref_id, self.contigs[ref_id].length as usize) {
+                self.push_zeros(ref_id, start, end)?;
+            }
+            self.next_ref_id += 1;
+        }
+        Ok(())
+    }
+
+    /// The ranges of contig `ref_id` to write, clamped to its first `len`
+    /// positions: the whole contig, or its merged `-L` intervals.
+    fn ranges(&self, ref_id: usize, len: usize) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = match &self.intervals {
             None => vec![(0, len)],
             Some(intervals) => intervals
                 .get_contig(ref_id)
@@ -1292,40 +1350,43 @@ impl PerBaseWriter {
                 .map(|interval| {
                     ((interval.start as usize).min(len), (interval.end as usize).min(len))
                 })
-                .filter(|&(start, end)| start < end)
                 .collect(),
         };
-        if !ranges.iter().any(|&(start, end)| depth[start..end].iter().any(|&d| d != 0)) {
-            return Ok(());
-        }
+        // Clamping can leave a range empty, which the writer would reject.
+        ranges.retain(|&(start, end)| start < end);
+        ranges
+    }
 
-        for (start, end) in ranges {
-            for (chunk_index, chunk) in depth[start..end].chunks(PER_BASE_CHUNK_LEN).enumerate() {
-                self.values.clear();
-                self.values.extend(chunk.iter().map(|&d| f32::from(d)));
-                // Positions are below `contig.length`, a `u32`.
-                #[allow(clippy::cast_possible_truncation)]
-                let chunk_start = (start + chunk_index * PER_BASE_CHUNK_LEN) as u32;
-                self.writer
-                    .push_fixed_step(&contig.name, chunk_start, 1, 1, &self.values)
-                    .with_context(|| {
-                        format!("cannot write per-base coverage to {}", self.path.display())
-                    })?;
-            }
+    /// Push `depth` as fixedStep data starting at `start` on contig `ref_id`.
+    ///
+    /// # Errors
+    /// Returns an error if the data cannot be written.
+    fn push_depth(&mut self, ref_id: usize, start: usize, depth: &[u16]) -> Result<()> {
+        let name = &self.contigs[ref_id].name;
+        for (chunk_index, chunk) in depth.chunks(PER_BASE_CHUNK_LEN).enumerate() {
+            self.values.clear();
+            self.values.extend(chunk.iter().map(|&d| f32::from(d)));
+            // Positions are below the contig's length, a `u32`.
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk_start = (start + chunk_index * PER_BASE_CHUNK_LEN) as u32;
+            self.writer.push_fixed_step(name, chunk_start, 1, 1, &self.values).with_context(
+                || format!("cannot write per-base coverage to {}", self.path.display()),
+            )?;
         }
         Ok(())
     }
 
-    /// Write the indexes, zoom levels and header that complete the file.
+    /// Push zero depth over `[start, end)` of contig `ref_id` as one bedGraph item.
     ///
     /// # Errors
-    /// Returns an error if the file cannot be finished.
-    fn finish(self) -> Result<()> {
-        self.writer.finish().with_context(|| {
-            format!("cannot finish per-base coverage file {}", self.path.display())
-        })?;
-        log::info!("wgs: per-base coverage written to {}", self.path.display());
-        Ok(())
+    /// Returns an error if the data cannot be written.
+    fn push_zeros(&mut self, ref_id: usize, start: usize, end: usize) -> Result<()> {
+        // Positions are at most the contig's length, a `u32`.
+        #[allow(clippy::cast_possible_truncation)]
+        let (start, end) = (start as u32, end as u32);
+        self.writer
+            .push_interval(&self.contigs[ref_id].name, start, end, 0.0)
+            .with_context(|| format!("cannot write per-base coverage to {}", self.path.display()))
     }
 }
 
