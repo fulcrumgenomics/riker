@@ -290,7 +290,7 @@ impl Multi {
                         &self.output.output,
                         reference,
                         &opts,
-                    )?));
+                    )));
                 }
             }
         }

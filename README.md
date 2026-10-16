@@ -163,9 +163,10 @@ Collect whole-genome coverage metrics:
 ```bash
 riker wgs -i sample.bam -r ref.fa -o out_prefix
 riker wgs -i sample.bam -r ref.fa -o out_prefix -L intervals.bed
+riker wgs -i sample.bam -r ref.fa -o out_prefix --per-base-coverage
 ```
 
-The input BAM must be coordinate-sorted.
+The input BAM must be coordinate-sorted. `--per-base-coverage` also writes the per-base depth as a bigWig (`out_prefix.wgs-per-base.bw`) that genome browsers and bigWig tools can read.
 
 Collect GC bias metrics:
 

@@ -24,8 +24,9 @@ use riker_lib::commands::isize::{
 use riker_lib::commands::multi::{CollectorKind, Multi};
 use riker_lib::commands::rna::{METRICS_SUFFIX as RNA_METRICS_SUFFIX, RnaOptions, RnaSeqMetric};
 use riker_lib::commands::wgs::{
-    COVERAGE_SUFFIX as WGS_COVERAGE_SUFFIX, METRICS_SUFFIX as WGS_SUFFIX, MultiWgsOptions, Wgs,
-    WgsMetrics, WgsOptions,
+    COVERAGE_SUFFIX as WGS_COVERAGE_SUFFIX, METRICS_SUFFIX as WGS_SUFFIX, MultiWgsOptions,
+    PER_BASE_BIGWIG_SUFFIX as WGS_PER_BASE_SUFFIX, PerBaseCoverageFormat, Wgs, WgsMetrics,
+    WgsOptions,
 };
 use riker_lib::test_support::{FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read};
 use std::path::{Path, PathBuf};
@@ -317,6 +318,28 @@ fn test_wgs_collector() -> Result<()> {
     let wgs_metrics: Vec<WgsMetrics> = read_metrics_tsv(&wgs_path)?;
     assert_eq!(wgs_metrics.len(), 1);
     assert_eq!(wgs_metrics[0].genome_territory, 20);
+
+    Ok(())
+}
+
+/// `--wgs::per-base-coverage` reaches the wgs collector, which writes the per-base bigWig.
+#[test]
+fn test_wgs_collector_writes_per_base_coverage() -> Result<()> {
+    let refa = FastaBuilder::new().contig("chr1", vec![b'A'; 20]).to_temp_fasta()?;
+    let bam = build_wgs_test_bam(20)?;
+    let dir = TempDir::new()?;
+    let prefix = dir.path().join("out");
+
+    let mut multi = make_multi_with_ref(bam.path(), &prefix, refa.path(), vec![CollectorKind::Wgs]);
+    multi.wgs_opts = WgsOptions {
+        per_base_coverage: Some(PerBaseCoverageFormat::Bigwig),
+        ..WgsOptions::default()
+    }
+    .into();
+    multi.execute(None)?;
+
+    let mut reader = bigwig::BigWigReader::open(out_path(&prefix, WGS_PER_BASE_SUFFIX))?;
+    assert_eq!(reader.values("chr1", 0, 20)?, vec![5.0; 20]);
 
     Ok(())
 }
