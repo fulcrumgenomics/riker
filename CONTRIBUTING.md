@@ -444,10 +444,9 @@ After the push, create the GitHub release object pointing at the new tag.
 Use the freshly stamped `## [0.3.0]` section of `CHANGELOG.md` as the
 release body (e.g. `gh release create v0.3.0 --notes-file <(...)`, or paste
 it in the web UI); `--generate-notes` remains a fallback if the changelog
-section is thin. Then update any downstream consumer recipes — at minimum
-the
-[bioconda riker-ngs recipe](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/riker-ngs)
-needs the new version + the new tarball SHA256:
+section is thin.
+
+Within about an hour of the GitHub release, BiocondaBot opens an "Update riker to X.Y.Z" PR against the [bioconda riker recipe](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/riker) (branch `bump/riker`) with the new version and tarball SHA256. Approve it and enable auto-merge; it merges once CI passes on all four platforms. If CI fails, push fixes to `bump/riker` rather than opening a separate PR. If the bot hasn't opened a PR, bump `version` and `sha256` in the recipe yourself:
 
 ```bash
 curl -sL https://github.com/fulcrumgenomics/riker/archive/refs/tags/v0.3.0.tar.gz \
