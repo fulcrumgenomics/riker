@@ -545,8 +545,7 @@ fn test_parallel_matches_single_threaded_isize_alignment() -> Result<()> {
 
 /// multi output must be byte-identical across thread counts when the budget is
 /// set via the top-level `--threads` (the non-deprecated path). Compares every
-/// `.txt` output file against the single-threaded run; PDF plots embed
-/// non-deterministic bytes and are skipped.
+/// output file, PDF plots included, against the single-threaded run.
 #[test]
 fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
     let bam = build_test_bam()?;
@@ -559,12 +558,13 @@ fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
     let mut baseline: Vec<(std::ffi::OsString, Vec<u8>)> = Vec::new();
     for entry in std::fs::read_dir(base_dir.path())? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "txt") {
-            let name = path.file_name().expect("output file has a name").to_owned();
-            baseline.push((name, std::fs::read(&path)?));
-        }
+        let name = path.file_name().expect("output file has a name").to_owned();
+        baseline.push((name, std::fs::read(&path)?));
     }
-    assert!(!baseline.is_empty(), "expected at least one .txt output file");
+    assert!(
+        baseline.iter().any(|(name, _)| Path::new(name).extension().is_some_and(|e| e == "pdf")),
+        "expected at least one PDF output file"
+    );
 
     for threads in [2u8, 3, 4] {
         let dir = TempDir::new()?;
@@ -573,6 +573,76 @@ fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
         for (name, bytes) in &baseline {
             let got = std::fs::read(dir.path().join(name))?;
             assert_eq!(&got, bytes, "output {name:?} differs at --threads {threads}");
+        }
+    }
+    Ok(())
+}
+
+/// Every PDF plot must be byte-identical across runs in separate processes, whose std
+/// `HashMap`s are seeded differently.
+#[test]
+fn test_pdfs_byte_identical_across_processes() -> Result<()> {
+    let fasta = FastaBuilder::hg38_mini();
+    let reference = fasta.to_temp_fasta()?;
+    let mut sam = SamBuilder::with_contigs(&fasta.dict()).sort_order(SortOrder::Coordinate);
+    for i in 0..60 {
+        let start = 1 + i * 150;
+        sam.add(pair(sam.next_id()).fr("chr1", start..start + 150 + (i % 7) * 40));
+    }
+    let bam = sam.to_temp_bam()?;
+
+    let gene = |id: &str, kind: &str| {
+        format!(
+            "gene_id \"{id}\"; transcript_id \"{id}.1\"; gene_name \"{id}\"; gene_type \"{kind}\";"
+        )
+    };
+    let (g1, g2, g3) =
+        (gene("G1", "protein_coding"), gene("G2", "lncRNA"), gene("G3", "protein_coding"));
+    let gene_model = tempfile::NamedTempFile::new()?;
+    std::fs::write(
+        gene_model.path(),
+        format!(
+            "chr1\tx\texon\t1000\t2000\t.\t+\t.\t{g1}\n\
+             chr1\tx\tCDS\t1500\t2000\t.\t+\t0\t{g1}\n\
+             chr1\tx\texon\t3000\t4000\t.\t+\t.\t{g1}\n\
+             chr1\tx\tCDS\t3000\t3500\t.\t+\t0\t{g1}\n\
+             chr1\tx\texon\t5000\t6000\t.\t-\t.\t{g2}\n\
+             chr1\tx\texon\t7000\t8500\t.\t+\t.\t{g3}\n\
+             chr1\tx\tCDS\t7200\t8200\t.\t+\t0\t{g3}\n"
+        ),
+    )?;
+
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let dir = TempDir::new()?;
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_riker"))
+            .arg("multi")
+            .arg("--input")
+            .arg(bam.path())
+            .arg("--output")
+            .arg(dir.path().join("out"))
+            .arg("--reference")
+            .arg(reference.path())
+            .arg("--rna::gene-model")
+            .arg(gene_model.path())
+            .args(["--tools", "basic", "isize", "gcbias", "wgs", "rna"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        runs.push(dir);
+    }
+
+    let mut pdfs: Vec<PathBuf> = std::fs::read_dir(runs[0].path())?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    pdfs.retain(|path| path.extension().is_some_and(|e| e == "pdf"));
+    assert_eq!(pdfs.len(), 10, "expected one PDF per plot, got {pdfs:?}");
+
+    for path in &pdfs {
+        let name = path.file_name().expect("output file has a name");
+        let expected = std::fs::read(path)?;
+        for run in &runs[1..] {
+            let got = std::fs::read(run.path().join(name))?;
+            assert!(got == expected, "{name:?} differs between runs");
         }
     }
     Ok(())

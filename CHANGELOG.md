@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`hybcap --per-base-coverage bigwig` writes the depth at every target position as a bigWig** (`<prefix>.hybcap-per-base.bw`), so pipelines that also run `wgs --per-base-coverage` handle one file type. It has the same depth as the TSV at every target position; a target with no coverage is stored as one zero-valued item, and positions outside targets have no data rather than zero depth, because hybcap does not measure them. Zoom levels run from 10 kb to 100 Mb in ×10 steps, keeping only levels that reduce the record count, so a small panel may have fewer. On real exome data it was about 2.5× smaller than the gzipped TSV and about 4× faster to write. `--per-base-coverage` with no value still writes the uncompressed TSV. In `multi` the option is `--hybcap::per-base-coverage bigwig`.
 
+### Fixed
+
+- **PDF plots are now byte-identical from run to run.** The `kuva` plotting library is upgraded to 0.6.0, whose PDF backend (krilla) writes resources in a fixed order. The old backend, `svg2pdf`, listed a page's graphics states and fonts in std `HashMap` order, so a chart with more than one of either, such as the semi-transparent fills in the `basic` charts and the `rna` gene-expression chart, could differ byte for byte between runs on the same input. The charts look the same as before.
+
 ## [0.5.0] - 2026-10-16
 
 ### Added
