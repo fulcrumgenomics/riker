@@ -572,7 +572,7 @@ fn test_output_byte_identical_across_global_thread_counts() -> Result<()> {
             .execute(Some(threads))?;
         for (name, bytes) in &baseline {
             let got = std::fs::read(dir.path().join(name))?;
-            assert_eq!(&got, bytes, "output {name:?} differs at --threads {threads}");
+            assert!(&got == bytes, "output {name:?} differs at --threads {threads}");
         }
     }
     Ok(())
