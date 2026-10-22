@@ -76,7 +76,7 @@ pub fn write_twin_y_plot_pdf(
 ) -> Result<()> {
     let scene = render_twin_y(primary, secondary, layout);
     let pdf_bytes =
-        kuva::backend::pdf::PdfBackend.render_scene(&scene).map_err(|e| anyhow!("{e}"))?;
+        kuva::backend::pdf::PdfBackend::new().render_scene(&scene).map_err(|e| anyhow!("{e}"))?;
     std::fs::write(path, pdf_bytes)?;
     Ok(())
 }
