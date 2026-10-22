@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
+use bigwig::{ChromIdOrder, ChromInfo, WriterOptions, ZoomPolicy};
 use clap::{Args, ValueEnum};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::cigar::Op;
@@ -43,6 +44,14 @@ pub const PER_BASE_SUFFIX: &str = ".hybcap-per-base.txt";
 /// File suffix for the gzip-compressed per-base coverage output.
 pub const PER_BASE_GZ_SUFFIX: &str = ".hybcap-per-base.txt.gz";
 
+/// File suffix for the bigWig per-base coverage output.
+pub const PER_BASE_BIGWIG_SUFFIX: &str = ".hybcap-per-base.bw";
+
+/// Zoom levels of the per-base bigWig, in bases per record: 10 kb, then ×10 up to 100 Mb. They
+/// start coarser than wgs's because targets are sparse: a browser reads raw depth cheaply for views
+/// up to a few Mb, and finer levels would mostly summarize single targets.
+const PER_BASE_ZOOM_REDUCTIONS: [u32; 5] = [10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
 /// Output format for the per-base coverage file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PerBaseCoverageFormat {
@@ -50,6 +59,8 @@ pub enum PerBaseCoverageFormat {
     Uncompressed,
     /// Gzip-compressed TSV (suffix `.gz`).
     Compressed,
+    /// bigWig with depth at target positions only (suffix `.bw`).
+    Bigwig,
 }
 
 // ─── CLI struct ───────────────────────────────────────────────────────────────
@@ -102,8 +113,10 @@ pub struct HybCapOptions {
     pub per_target_coverage: bool,
 
     /// Output per-base coverage values. Pass `compressed` for a gzipped
-    /// `.hybcap-per-base.txt.gz` file or `uncompressed` (the default when the
-    /// flag is given without a value) for a plain `.hybcap-per-base.txt`.
+    /// `.hybcap-per-base.txt.gz` file, `bigwig` for a `.hybcap-per-base.bw`
+    /// bigWig, or `uncompressed` (the default when the flag is given without a
+    /// value) for a plain `.hybcap-per-base.txt`. The bigWig has depth at
+    /// target positions only; other positions have no data, not zero depth.
     #[arg(
         long,
         value_enum,
@@ -152,9 +165,9 @@ impl Default for HybCapOptions {
 /// all computations.
 ///
 /// Outputs are written to <prefix>.hybcap-metrics.txt, and optionally
-/// <prefix>.hybcap-per-target.txt and either <prefix>.hybcap-per-base.txt
-/// or <prefix>.hybcap-per-base.txt.gz (depending on
-/// `--per-base-coverage`).
+/// <prefix>.hybcap-per-target.txt and one of <prefix>.hybcap-per-base.txt,
+/// <prefix>.hybcap-per-base.txt.gz or <prefix>.hybcap-per-base.bw (depending
+/// on `--per-base-coverage`).
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about,
@@ -163,7 +176,7 @@ Examples:
   riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed
   riker hybcap -i input.bam -o out_prefix --baits baits.interval_list --targets targets.interval_list -r ref.fa
   riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-target-coverage
-  riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-base-coverage compressed"
+  riker hybcap -i input.bam -o out_prefix --baits baits.bed --targets targets.bed --per-base-coverage bigwig"
 )]
 pub struct HybCap {
     #[command(flatten)]
@@ -299,6 +312,7 @@ impl HybCapCollector {
         });
         let per_base_suffix = match options.per_base_coverage {
             Some(PerBaseCoverageFormat::Compressed) => PER_BASE_GZ_SUFFIX,
+            Some(PerBaseCoverageFormat::Bigwig) => PER_BASE_BIGWIG_SUFFIX,
             // Path is unused when per-base output is disabled, but matching the
             // historical default keeps the field's debug output friendly.
             Some(PerBaseCoverageFormat::Uncompressed) | None => PER_BASE_SUFFIX,
@@ -926,6 +940,60 @@ impl HybCapCollector {
 
         (at_dropout, gc_dropout)
     }
+
+    /// Write the target depths to the per-base bigWig, with every contig in `dict` in its
+    /// chromosome list. Each target is fixedStep data, or one zero-valued item if none of its
+    /// bases is covered. Positions outside targets get no data rather than zero, because hybcap
+    /// does not measure their depth.
+    ///
+    /// # Errors
+    /// Returns an error if a contig is longer than bigWig allows (`u32::MAX` bases) or the file
+    /// cannot be written.
+    fn write_per_base_bigwig(&self, dict: &SequenceDictionary) -> Result<()> {
+        let path = &self.per_base_path;
+        let contigs = dict
+            .iter()
+            .map(|contig| {
+                let length = u32::try_from(contig.length()).with_context(|| {
+                    format!(
+                        "contig {} is {} bp, longer than a bigWig file allows",
+                        contig.name(),
+                        contig.length()
+                    )
+                })?;
+                Ok(ChromInfo::new(contig.name(), length))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut writer = WriterOptions::new()
+            .chrom_id_order(ChromIdOrder::Listed)
+            .zoom(ZoomPolicy::Explicit(PER_BASE_ZOOM_REDUCTIONS.to_vec()))
+            .create(path, &contigs)
+            .with_context(|| format!("cannot create per-base coverage file {}", path.display()))?;
+
+        // Targets are merged and in (ref_id, start) order, as the writer requires.
+        let mut values: Vec<f32> = Vec::new();
+        for (iv, cov) in &self.target_coverages {
+            // A zero-length target has no positions, and the writer rejects empty items.
+            if cov.hq_depths.is_empty() {
+                continue;
+            }
+            let name = &contigs[iv.ref_id].name;
+            let pushed = if cov.hq_depths.iter().all(|&depth| depth == 0) {
+                writer.push_interval(name, iv.start, iv.end, 0.0)
+            } else {
+                // f32 holds every depth up to 2^24 exactly.
+                values.clear();
+                values.extend(cov.hq_depths.iter().map(|&depth| depth as f32));
+                writer.push_fixed_step(name, iv.start, 1, 1, &values)
+            };
+            pushed
+                .with_context(|| format!("cannot write per-base coverage to {}", path.display()))?;
+        }
+        writer
+            .finish()
+            .with_context(|| format!("cannot finish per-base coverage file {}", path.display()))?;
+        Ok(())
+    }
 }
 
 impl Collector for HybCapCollector {
@@ -1348,11 +1416,14 @@ impl Collector for HybCapCollector {
         }
 
         // ── Per-base coverage ──
-        // Stream rows row-by-row — at production target sizes this file can
-        // contain tens of millions of entries. Path-driven `.gz` dispatch
-        // (when `--per-base-coverage compressed`) is handled inside
-        // [`tsv_writer`].
-        if self.per_base_format.is_some() {
+        if self.per_base_format == Some(PerBaseCoverageFormat::Bigwig) {
+            log::info!("Writing per-base coverage to {}", self.per_base_path.display());
+            self.write_per_base_bigwig(dict)?;
+        } else if self.per_base_format.is_some() {
+            // Stream rows row-by-row — at production target sizes this file can
+            // contain tens of millions of entries. Path-driven `.gz` dispatch
+            // (when `--per-base-coverage compressed`) is handled inside
+            // [`tsv_writer`].
             log::info!("Writing per-base coverage to {}", self.per_base_path.display());
             let mut writer = tsv_writer::<PerBaseCoverage>(&self.per_base_path)?;
             for (iv, cov) in &self.target_coverages {

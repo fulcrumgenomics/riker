@@ -1,17 +1,21 @@
 mod helpers;
 
+use bigwig::BigWigReader;
 use helpers::read_metrics_tsv;
 use noodles::sam::alignment::record::Flags;
 use riker_lib::assert_close;
 use riker_lib::commands::command::Command;
 use riker_lib::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
 use riker_lib::commands::hybcap::{
-    HybCap, HybCapMetric, HybCapOptions, METRICS_SUFFIX, PER_BASE_GZ_SUFFIX, PER_BASE_SUFFIX,
-    PER_TARGET_SUFFIX, PerBaseCoverage, PerBaseCoverageFormat, PerTargetCoverage,
+    HybCap, HybCapMetric, HybCapOptions, METRICS_SUFFIX, PER_BASE_BIGWIG_SUFFIX,
+    PER_BASE_GZ_SUFFIX, PER_BASE_SUFFIX, PER_TARGET_SUFFIX, PerBaseCoverage, PerBaseCoverageFormat,
+    PerTargetCoverage,
 };
 use riker_lib::test_support::{
     BedBuilder, FastaBuilder, ReadBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
 };
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -741,6 +745,198 @@ fn test_per_base_coverage_output_compressed() {
     assert_eq!(rows[0].coverage, 1);
     assert_eq!(rows[4].pos, 5);
     assert_eq!(rows[4].coverage, 0);
+}
+
+// ─── Per-base bigWig output ───────────────────────────────────────────────────
+
+/// Run hybcap with `--per-base-coverage bigwig`, `baits` and `targets`, and no quality filters,
+/// writing into `dir`, and open the bigWig it wrote.
+fn run_per_base_bigwig(
+    sam: &SamBuilder,
+    baits: &Path,
+    targets: &Path,
+    dir: &TempDir,
+) -> BigWigReader<BufReader<File>> {
+    let bam = sam.to_temp_bam().unwrap();
+    let mut options = opts(0, 0);
+    options.per_base_coverage = Some(PerBaseCoverageFormat::Bigwig);
+    let prefix = dir.path().join("out");
+    make_cmd(bam.path(), baits, targets, &prefix, None, options).execute(None).unwrap();
+    BigWigReader::open(dir.path().join(format!("out{PER_BASE_BIGWIG_SUFFIX}"))).unwrap()
+}
+
+/// The items stored for `chrom` as `(start, end, value)`: one per position of fixedStep data, one
+/// per zero-valued bedGraph item.
+fn bigwig_items(reader: &mut BigWigReader<BufReader<File>>, chrom: &str) -> Vec<(u32, u32, f32)> {
+    reader
+        .chrom_items(chrom)
+        .unwrap()
+        .map(|item| {
+            let item = item.unwrap();
+            (item.start, item.end, item.value)
+        })
+        .collect()
+}
+
+/// Every position of a target gets its depth, including zero where no read lands.
+#[test]
+fn per_base_bigwig_writes_the_depth_at_every_target_position() {
+    let bed = BedBuilder::new().interval("chr1", 0, 5).to_temp_bed().unwrap();
+    let mut sam = coord_builder(&[("chr1", 10_000)]);
+    add_single_record(&mut sam, "read1", "chr1", 1, "3M", &[30; 3], 60, Flags::empty());
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base_bigwig(&sam, bed.path(), bed.path(), &dir);
+
+    assert_eq!(reader.values("chr1", 0, 5).unwrap(), [1.0, 1.0, 1.0, 0.0, 0.0]);
+}
+
+/// Positions outside targets have no data, not zero depth, even where reads cover them.
+#[test]
+fn per_base_bigwig_has_no_data_outside_targets() {
+    let bed =
+        BedBuilder::new().interval("chr1", 10, 20).interval("chr1", 40, 50).to_temp_bed().unwrap();
+    let mut sam = coord_builder(&[("chr1", 10_000)]);
+    add_single_record(&mut sam, "read1", "chr1", 1, "60M", &[30; 60], 60, Flags::empty());
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base_bigwig(&sam, bed.path(), bed.path(), &dir);
+
+    let expected: Vec<(u32, u32, f32)> =
+        (10..20).chain(40..50).map(|position| (position, position + 1, 1.0)).collect();
+    assert_eq!(bigwig_items(&mut reader, "chr1"), expected);
+}
+
+/// A target that no read covers is stored as one zero-valued item spanning the target.
+#[test]
+fn per_base_bigwig_stores_a_target_without_coverage_as_one_zero_item() {
+    let bed =
+        BedBuilder::new().interval("chr1", 0, 50).interval("chr1", 500, 550).to_temp_bed().unwrap();
+    let mut sam = coord_builder(&[("chr1", 10_000)]);
+    add_single_record(&mut sam, "read1", "chr1", 1, "50M", &[30; 50], 60, Flags::empty());
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base_bigwig(&sam, bed.path(), bed.path(), &dir);
+
+    let items = bigwig_items(&mut reader, "chr1");
+    assert_eq!(items.len(), 51);
+    assert_eq!(items[50], (500, 550, 0.0));
+}
+
+/// Every BAM contig is in the bigWig's chromosome list, in BAM header order, including contigs
+/// without targets.
+#[test]
+fn per_base_bigwig_lists_every_bam_contig_in_header_order() {
+    let bed = BedBuilder::new().interval("chr10", 0, 10).to_temp_bed().unwrap();
+    let mut sam = coord_builder(&[("chr2", 1_000), ("chr10", 1_000), ("chr1", 1_000)]);
+    add_single_record(&mut sam, "read1", "chr10", 1, "10M", &[30; 10], 60, Flags::empty());
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base_bigwig(&sam, bed.path(), bed.path(), &dir);
+
+    let names: Vec<&str> = reader.chroms().iter().map(|chrom| chrom.name.as_str()).collect();
+    assert_eq!(names, ["chr2", "chr10", "chr1"]);
+    assert_eq!(reader.values("chr10", 0, 10).unwrap(), [1.0; 10]);
+}
+
+/// The bigWig holds the same depth as the TSV at every target position, with the default
+/// filters applied and targets on several contigs.
+#[test]
+fn per_base_bigwig_matches_the_tsv() {
+    let bed = BedBuilder::new()
+        .interval("chr1", 100, 200)
+        .interval("chr1", 300, 400)
+        .interval("chr2", 50, 150)
+        .to_temp_bed()
+        .unwrap();
+    let mut sam = coord_builder(&[("chr1", 10_000), ("chr2", 10_000)]);
+    // Overlapping mates, clipped to count once.
+    for _ in 0..3 {
+        sam.add(pair(sam.next_id()).at("chr1", 91, 131).len(60));
+    }
+    // Low base quality over its second half, excluded there.
+    let mut qual = vec![30u8; 50];
+    qual[25..].fill(5);
+    add_single_record(&mut sam, "low_bq", "chr1", 151, "50M", &qual, 60, Flags::empty());
+    sam.add(pair(sam.next_id()).at("chr1", 281, 351).len(50));
+    sam.add(
+        pair("dup")
+            .at("chr1", 301, 341)
+            .len(50)
+            .r1(ReadBuilder::duplicate)
+            .r2(ReadBuilder::duplicate),
+    );
+    sam.add(pair("low_mapq").at("chr2", 41, 101).len(50).mapq(10));
+    sam.add(pair(sam.next_id()).at("chr2", 61, 91).len(50));
+    let bam = sam.to_temp_bam().unwrap();
+    let tsv_dir = TempDir::new().unwrap();
+    let bigwig_dir = TempDir::new().unwrap();
+
+    for (dir, format) in [
+        (&tsv_dir, PerBaseCoverageFormat::Uncompressed),
+        (&bigwig_dir, PerBaseCoverageFormat::Bigwig),
+    ] {
+        let options = HybCapOptions { per_base_coverage: Some(format), ..HybCapOptions::default() };
+        let prefix = dir.path().join("out");
+        make_cmd(bam.path(), bed.path(), bed.path(), &prefix, None, options).execute(None).unwrap();
+    }
+
+    let rows: Vec<PerBaseCoverage> =
+        read_metrics_tsv(&tsv_dir.path().join(format!("out{PER_BASE_SUFFIX}"))).unwrap();
+    let mut reader =
+        BigWigReader::open(bigwig_dir.path().join(format!("out{PER_BASE_BIGWIG_SUFFIX}"))).unwrap();
+    assert_eq!(rows.len(), 300);
+    assert!(rows.iter().any(|row| row.coverage > 1), "expected some depth above 1");
+    let tsv_depths: Vec<f32> =
+        rows.iter().map(|row| f32::from(u16::try_from(row.coverage).unwrap())).collect();
+    let bigwig_depths: Vec<f32> = rows
+        .iter()
+        .map(|row| {
+            let start = u32::try_from(row.pos - 1).unwrap();
+            reader.values(&row.chrom, start, start + 1).unwrap()[0]
+        })
+        .collect();
+    assert_eq!(bigwig_depths, tsv_depths);
+}
+
+/// Zoom levels start at 10 kb and step ×10, up to the longest contig, when each level has fewer
+/// records than the one before.
+#[test]
+fn per_base_bigwig_zoom_levels_start_at_10_kb() {
+    // Three targets in three 10 kb bins, two 100 kb bins and one 1 Mb bin.
+    let bed = BedBuilder::new()
+        .interval("chr1", 100, 200)
+        .interval("chr1", 20_100, 20_200)
+        .interval("chr1", 500_100, 500_200)
+        .to_temp_bed()
+        .unwrap();
+    let mut sam = coord_builder(&[("chr1", 1_000_000)]);
+    add_single_record(&mut sam, "read1", "chr1", 101, "100M", &[30; 100], 60, Flags::empty());
+    let dir = TempDir::new().unwrap();
+
+    let reader = run_per_base_bigwig(&sam, bed.path(), bed.path(), &dir);
+
+    let reductions: Vec<u32> =
+        reader.zoom_levels().iter().map(bigwig::ZoomLevel::reduction).collect();
+    assert_eq!(reductions, [10_000, 100_000, 1_000_000]);
+}
+
+/// A zero-length target has no positions, so it adds nothing to the bigWig and does not fail
+/// the run.
+#[test]
+fn per_base_bigwig_skips_zero_length_targets() {
+    let baits = BedBuilder::new().interval("chr1", 10, 20).to_temp_bed().unwrap();
+    let targets =
+        BedBuilder::new().interval("chr1", 5, 5).interval("chr1", 10, 20).to_temp_bed().unwrap();
+    let mut sam = coord_builder(&[("chr1", 10_000)]);
+    add_single_record(&mut sam, "read1", "chr1", 11, "10M", &[30; 10], 60, Flags::empty());
+    let dir = TempDir::new().unwrap();
+
+    let mut reader = run_per_base_bigwig(&sam, baits.path(), targets.path(), &dir);
+
+    let expected: Vec<(u32, u32, f32)> =
+        (10..20).map(|position| (position, position + 1, 1.0)).collect();
+    assert_eq!(bigwig_items(&mut reader, "chr1"), expected);
 }
 
 /// Bait classification: on-bait vs near-bait vs off-bait.

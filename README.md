@@ -182,9 +182,10 @@ Collect hybrid capture metrics:
 ```bash
 riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed
 riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed -r ref.fa
+riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed --per-base-coverage bigwig
 ```
 
-The input BAM must be coordinate-sorted.
+The input BAM must be coordinate-sorted. `--per-base-coverage bigwig` also writes the depth at every target position as a bigWig (`out_prefix.hybcap-per-base.bw`); `--per-base-coverage` alone writes it as a TSV.
 
 Collect RNA-seq metrics (the gene-model format — UCSC refFlat, GTF, or GFF3 — is auto-detected):
 

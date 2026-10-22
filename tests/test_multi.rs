@@ -16,7 +16,9 @@ use riker_lib::commands::gcbias::{
     SUMMARY_SUFFIX as GCBIAS_SUMMARY_SUFFIX,
 };
 use riker_lib::commands::hybcap::{
-    HybCapMetric, METRICS_SUFFIX as HYBCAP_SUFFIX, MultiHybCapOptions,
+    HybCapMetric, HybCapOptions, METRICS_SUFFIX as HYBCAP_SUFFIX, MultiHybCapOptions,
+    PER_BASE_BIGWIG_SUFFIX as HYBCAP_PER_BASE_SUFFIX,
+    PerBaseCoverageFormat as HybCapPerBaseCoverageFormat,
 };
 use riker_lib::commands::isize::{
     InsertSizeMetric, METRICS_SUFFIX as ISIZE_SUFFIX, MultiIsizeOptions,
@@ -28,7 +30,9 @@ use riker_lib::commands::wgs::{
     PER_BASE_BIGWIG_SUFFIX as WGS_PER_BASE_SUFFIX, PerBaseCoverageFormat, Wgs, WgsMetrics,
     WgsOptions,
 };
-use riker_lib::test_support::{FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read};
+use riker_lib::test_support::{
+    BedBuilder, FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
+};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -745,6 +749,33 @@ fn test_hybcap_via_multi() -> Result<()> {
     let metrics: Vec<HybCapMetric> = read_metrics_tsv(&metrics_path)?;
     assert_eq!(metrics.len(), 1);
     assert!(metrics[0].total_reads > 0, "should have counted some reads");
+
+    Ok(())
+}
+
+/// `--hybcap::per-base-coverage bigwig` reaches the hybcap collector, which writes the per-base
+/// bigWig.
+#[test]
+fn test_hybcap_via_multi_writes_per_base_bigwig() -> Result<()> {
+    let bed = BedBuilder::new().interval("chr1", 100, 200).to_temp_bed()?;
+    let mut bld = coord_builder(&[("chr1", 10_000)]);
+    bld.add(pair(bld.next_id()).at("chr1", 101, 151).len(50));
+    let bam = bld.to_temp_bam()?;
+    let dir = TempDir::new()?;
+    let prefix = dir.path().join("out");
+
+    let mut multi = build_multi(bam.path(), &prefix, None, vec![CollectorKind::HybCap]);
+    multi.hybcap_opts = HybCapOptions {
+        baits: bed.path().to_path_buf(),
+        targets: bed.path().to_path_buf(),
+        per_base_coverage: Some(HybCapPerBaseCoverageFormat::Bigwig),
+        ..HybCapOptions::default()
+    }
+    .into();
+    multi.execute(None)?;
+
+    let mut reader = bigwig::BigWigReader::open(out_path(&prefix, HYBCAP_PER_BASE_SUFFIX))?;
+    assert_eq!(reader.values("chr1", 100, 200)?, vec![1.0; 100]);
 
     Ok(())
 }
