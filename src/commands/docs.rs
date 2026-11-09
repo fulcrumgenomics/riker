@@ -14,6 +14,10 @@ use crate::commands::error::{IndelMetric, MismatchMetric, OverlappingMismatchMet
 use crate::commands::gcbias::{GcBiasDetailMetric, GcBiasSummaryMetric};
 use crate::commands::hybcap::{HybCapMetric, PerBaseCoverage, PerTargetCoverage};
 use crate::commands::isize::{InsertSizeHistogramEntry, InsertSizeMetric};
+use crate::commands::methyl::{
+    MethylBetaEntry, MethylContigMetric, MethylCoverageEntry, MethylMbiasEntry, MethylMetrics,
+    MethylReadConversionEntry,
+};
 use crate::commands::rna::{
     RnaBiotypeMetric, RnaInsertSizeHistogramEntry, RnaInsertSizeMetric, RnaSeqMetric,
 };
@@ -36,6 +40,12 @@ macro_rules! render_all_metric_docs {
             PerBaseCoverage,
             InsertSizeMetric,
             InsertSizeHistogramEntry,
+            MethylMetrics,
+            MethylCoverageEntry,
+            MethylContigMetric,
+            MethylMbiasEntry,
+            MethylBetaEntry,
+            MethylReadConversionEntry,
             RnaSeqMetric,
             RnaBiotypeMetric,
             RnaInsertSizeMetric,

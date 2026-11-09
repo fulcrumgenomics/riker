@@ -17,6 +17,7 @@ use riker_lib::commands::error::Error;
 use riker_lib::commands::gcbias::GcBias;
 use riker_lib::commands::hybcap::HybCap;
 use riker_lib::commands::isize::InsertSize;
+use riker_lib::commands::methyl::Methyl;
 use riker_lib::commands::multi::Multi;
 use riker_lib::commands::rna::Rna;
 use riker_lib::commands::wgs::Wgs;
@@ -79,6 +80,7 @@ enum Subcommand {
     Gcbias(GcBias),
     Hybcap(HybCap),
     Isize(InsertSize),
+    Methyl(Methyl),
     Multi(Box<Multi>),
     Rna(Rna),
     Wgs(Wgs),
@@ -94,6 +96,7 @@ impl Command for Subcommand {
             Subcommand::Gcbias(c) => c.execute(threads),
             Subcommand::Hybcap(c) => c.execute(threads),
             Subcommand::Isize(c) => c.execute(threads),
+            Subcommand::Methyl(c) => c.execute(threads),
             Subcommand::Multi(c) => c.execute(threads),
             Subcommand::Rna(c) => c.execute(threads),
             Subcommand::Wgs(c) => c.execute(threads),

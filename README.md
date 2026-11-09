@@ -120,6 +120,7 @@ cargo build --release
 | `wgs` | Collect whole-genome coverage metrics | `picard CollectWgsMetrics` |
 | `gcbias` | Collect GC bias metrics | `picard CollectGcBiasMetrics` |
 | `hybcap` | Collect hybrid capture (bait/target) metrics | `picard CollectHsMetrics` |
+| `methyl` | Collect methylation QC metrics (CpG yield and exclusions, CpG coverage, conversion, M-bias) for bisulfite, EM-seq, TAPS and Illumina 5-base data | Bismark reports, `MethylDackel mbias`, BISCUIT QC, `picard CollectRrbsMetrics` |
 | `rna` | Collect RNA-seq metrics (read origin, base composition, gene detection, splice junctions, strand, coverage bias, transcript integrity, transcript-space insert size) | `picard CollectRnaSeqMetrics`, `fgbio EstimateRnaSeqInsertSize`, RSeQC, RNA-SeQC, Qualimap |
 | `multi` | Run multiple collectors in a single BAM pass | `picard CollectMultipleMetrics` |
 | `docs` | Print metric field documentation | -- |
@@ -186,6 +187,16 @@ riker hybcap -i sample.bam -o out_prefix --baits baits.bed --targets targets.bed
 ```
 
 The input BAM must be coordinate-sorted. `--per-base-coverage bigwig` also writes the depth at every target position as a bigWig (`out_prefix.hybcap-per-base.bw`); `--per-base-coverage` alone writes it as a TSV.
+
+Collect methylation QC metrics:
+
+```bash
+riker methyl -i sample.bam -r ref.fa -o out_prefix
+riker methyl -i sample.bam -r ref.fa -o out_prefix --chemistry illumina-5base
+riker methyl -i sample.bam -r ref.fa -o out_prefix --control-contig lambda pUC19
+```
+
+The input BAM must be coordinate-sorted and from a directional library: the strand each read reports is inferred from its flags. Usable CpG observations are broken down by why the rest were excluded, both in sequenced bases and in CpG observations, and normalised per read and per Mb sequenced.
 
 Collect RNA-seq metrics (the gene-model format — UCSC refFlat, GTF, or GFF3 — is auto-detected):
 

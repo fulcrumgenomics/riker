@@ -22,8 +22,8 @@ pub use cigar::ParsedCigar;
 pub use fasta_builder::{DEFAULT_CONTIGS, FastaBuilder, default_contig_id};
 pub use runner::drive_collector;
 pub use sam_builder::{
-    Adapters, IntoRecords, PairBuilder, ReadBuilder, SamBuilder, SortOrder, coord_builder,
-    count_stored_cram_tags, pair, read,
+    Adapters, IntoRecords, Methylation, PairBuilder, ReadBuilder, SamBuilder, SortOrder,
+    coord_builder, count_stored_cram_tags, pair, read,
 };
 pub use vcf_builder::{InfoType, InfoValue, VariantEntry, VcfBuilder};
 
