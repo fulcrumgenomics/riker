@@ -12,9 +12,13 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
+# Runners are pinned to ubuntu-24.04: on the ubuntu-26.04 image, bindgen 0.69
+# (run by hts-sys, under rust-htslib) generates htslib structs without their
+# fields, so rust-htslib fails to compile. Revisit when hts-sys moves to a newer
+# bindgen.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -28,7 +32,7 @@ jobs:
         run: cargo ci-test
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -42,7 +46,7 @@ jobs:
         run: cargo ci-lint
 
   format:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -63,7 +67,7 @@ jobs:
   # release-time multivers step is x86_64-only by design.
   dist-build:
     name: Multivers dist build (x86_64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
