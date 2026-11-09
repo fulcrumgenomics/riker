@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Building from source no longer fails with libclang 22**, as on GitHub's Ubuntu 26.04 runners. The locked `hts-sys` is now 2.2.1, whose newer `bindgen` generates complete htslib bindings; with 2.2.0, `rust-htslib` failed to compile with errors about fields missing from htslib's structs.
 - **PDF plots are now byte-identical from run to run.** The `kuva` plotting library is upgraded to 0.6.0, whose PDF backend (krilla) writes resources in a fixed order. The old backend, `svg2pdf`, listed a page's graphics states and fonts in std `HashMap` order, so a chart with more than one of either, such as the semi-transparent fills in the `basic` charts and the `rna` gene-expression chart, could differ byte for byte between runs on the same input. The charts look the same as before.
 
 ## [0.5.0] - 2026-10-16
