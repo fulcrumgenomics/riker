@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use bigwig::{ChromIdOrder, ChromInfo, WriterOptions, ZoomPolicy};
 use clap::{Args, ValueEnum};
 use noodles::sam::Header;
@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OptionalReferenceOptions, OutputOptions};
+use crate::depth_histogram::DepthHistogram;
 use crate::fasta::Fasta;
 use crate::intervals::{Interval, Intervals};
 use crate::math::{safe_div, safe_div_f};
@@ -22,6 +23,7 @@ use crate::metrics::{
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::coordinate_order::CoordinateOrderGuard;
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
@@ -254,8 +256,7 @@ pub struct HybCapCollector {
     expanded_cursor: usize,
     // Coordinate-sort guard: last (ref_id, start) seen; a change of ref_id also
     // triggers the per-contig cursor reset.
-    last_ref_id: Option<usize>,
-    last_start: u32,
+    order_guard: CoordinateOrderGuard,
 
     // Per-target coverage tracking (keyed by (ref_id, start, end))
     target_coverages: Vec<(Interval, TargetCoverage)>,
@@ -348,8 +349,7 @@ impl HybCapCollector {
             target_cursor: 0,
             bait_cursor: 0,
             expanded_cursor: 0,
-            last_ref_id: None,
-            last_start: 0,
+            order_guard: CoordinateOrderGuard::new("hybcap"),
 
             target_coverages: Vec::new(),
             target_gc: Vec::new(),
@@ -389,31 +389,13 @@ impl HybCapCollector {
     /// `(ref_id, start)`; this also catches a BAM whose header claims coordinate
     /// sort but isn't. Cursor resets rely on `ref_id` being non-decreasing.
     fn check_coordinate_order(&mut self, ref_id: usize, start: u32) -> Result<()> {
-        if let Some(last_ref_id) = self.last_ref_id {
-            if ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start) {
-                return Err(anyhow!(
-                    "hybcap requires a coordinate-sorted BAM (ordered by reference, then \
-                     position); encountered {}:{} after {}:{}. Sort with `samtools sort`.",
-                    self.contig_name(ref_id),
-                    u64::from(start) + 1,
-                    self.contig_name(last_ref_id),
-                    u64::from(self.last_start) + 1,
-                ));
-            }
-            if ref_id != last_ref_id {
-                self.target_cursor = 0;
-                self.bait_cursor = 0;
-                self.expanded_cursor = 0;
-            }
+        // `dict` is set in `initialize`, which always runs before `accept`.
+        if self.order_guard.check(ref_id, start, self.dict.as_ref().unwrap())? {
+            self.target_cursor = 0;
+            self.bait_cursor = 0;
+            self.expanded_cursor = 0;
         }
-        self.last_ref_id = Some(ref_id);
-        self.last_start = start;
         Ok(())
-    }
-
-    /// Return the contig name for a `ref_id`, or `?` if unknown. Used only in errors.
-    fn contig_name(&self, ref_id: usize) -> &str {
-        self.dict.as_ref().and_then(|d| d.get_by_index(ref_id)).map_or("?", |m| m.name())
     }
 
     /// Compute alignment span, aligned base count, and alignment blocks in a single
@@ -1218,7 +1200,7 @@ impl Collector for HybCapCollector {
         let dict = self.dict.as_ref().unwrap();
 
         // ── Compute coverage metrics from per-target depth arrays ──
-        let mut depth_histogram: Vec<u64> = Vec::new(); // index = depth, value = count of bases
+        let mut depth_histogram = DepthHistogram::unbounded();
         let mut total_target_depth: u64 = 0;
         let mut min_depth = u64::MAX;
         let mut max_depth: u64 = 0;
@@ -1239,11 +1221,7 @@ impl Collector for HybCapCollector {
 
             // Accumulate into global depth histogram
             for &d in &cov.hq_depths {
-                let d_idx = d as usize;
-                if d_idx >= depth_histogram.len() {
-                    depth_histogram.resize(d_idx + 1, 0);
-                }
-                depth_histogram[d_idx] += 1;
+                depth_histogram.add(u64::from(d));
             }
 
             // If target has zero length, it doesn't contribute to coverage
@@ -1260,14 +1238,13 @@ impl Collector for HybCapCollector {
         let mean_target_coverage = safe_div(total_target_depth, self.merged_target_territory);
 
         // Compute median from depth histogram
-        let median_target_coverage = compute_median(&depth_histogram, self.merged_target_territory);
+        let median_target_coverage = depth_histogram.median_and_mad().0;
 
         // Compute fold_80_base_penalty = mean / 20th percentile
-        let p20 = compute_percentile(&depth_histogram, self.merged_target_territory, 0.20);
-        let fold_80_base_penalty = if p20 > 0.0 { mean_target_coverage / p20 } else { 0.0 };
+        let fold_80_base_penalty = depth_histogram.fold_penalty(mean_target_coverage, 0.20);
 
         // Compute frac_target_bases at each threshold
-        let bases_at_or_above = compute_bases_at_or_above(&depth_histogram);
+        let bases_at_or_above = depth_histogram.at_or_above();
         let frac_at_threshold = |threshold: u64| -> f64 {
             #[expect(clippy::cast_possible_truncation, reason = "coverage thresholds fit in usize")]
             let t = threshold as usize;
@@ -1764,74 +1741,6 @@ fn sweep_run(ivs: &[(u32, u32, u32)], cursor: &mut usize, start: u32, end: u32) 
     (lo, hi)
 }
 
-// ─── Histogram helper functions ───────────────────────────────────────────────
-
-/// Compute the median from a depth histogram, averaging the two middle depths for an even total.
-fn compute_median(histogram: &[u64], total_bases: u64) -> f64 {
-    if total_bases == 0 {
-        return 0.0;
-    }
-
-    let lower_pos = (total_bases - 1) / 2;
-    let upper_pos = total_bases / 2;
-    let mut lower_depth: Option<usize> = None;
-    let mut cumulative: u64 = 0;
-
-    for (depth, &count) in histogram.iter().enumerate() {
-        cumulative += count;
-        if cumulative > lower_pos {
-            let lower_depth = *lower_depth.get_or_insert(depth);
-            if cumulative > upper_pos {
-                return f64::midpoint(lower_depth as f64, depth as f64);
-            }
-        }
-    }
-
-    0.0
-}
-
-/// Compute the given percentile (0.0-1.0) from a depth histogram.
-fn compute_percentile(histogram: &[u64], total_bases: u64, percentile: f64) -> f64 {
-    if total_bases == 0 {
-        return 0.0;
-    }
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "percentile target is always in range"
-    )]
-    let target = (total_bases as f64 * percentile) as u64;
-    let mut cumulative: u64 = 0;
-
-    for (depth, &count) in histogram.iter().enumerate() {
-        cumulative += count;
-        if cumulative >= target {
-            return depth as f64;
-        }
-    }
-
-    0.0
-}
-
-/// Compute bases-at-or-above for each depth. Returns a vec where index i
-/// gives the number of bases with depth >= i.
-fn compute_bases_at_or_above(histogram: &[u64]) -> Vec<u64> {
-    if histogram.is_empty() {
-        return Vec::new();
-    }
-
-    let mut result = vec![0u64; histogram.len()];
-    let mut cumulative: u64 = 0;
-
-    for i in (0..histogram.len()).rev() {
-        cumulative += histogram[i];
-        result[i] = cumulative;
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1881,40 +1790,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_median_simple() {
-        // 5 bases at depth 0, 10 bases at depth 1
-        let hist = vec![5, 10];
-        crate::assert_close!(compute_median(&hist, 15), 1.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_compute_median_even_total_averages_middle_depths() {
-        // 2 bases at depth 1 and 2 at depth 2: the middle depths are 1 and 2
-        let hist = vec![0, 2, 2];
-        crate::assert_close!(compute_median(&hist, 4), 1.5, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_compute_median_even_total_same_middle_depth() {
-        // 1 base at depth 0 and 3 at depth 1: both middle depths are 1
-        let hist = vec![1, 3];
-        crate::assert_close!(compute_median(&hist, 4), 1.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_compute_median_empty() {
-        crate::assert_close!(compute_median(&[], 0), 0.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_compute_percentile() {
-        // 10 bases at depth 0, 10 at depth 1, 10 at depth 2
-        let hist = vec![10, 10, 10];
-        crate::assert_close!(compute_percentile(&hist, 30, 0.20), 0.0, f64::EPSILON); // 20th pctile = depth 0
-        crate::assert_close!(compute_percentile(&hist, 30, 0.50), 1.0, f64::EPSILON); // 50th pctile = depth 1
-    }
-
-    #[test]
     fn test_gc_fraction_pure_acgt() {
         // 4 G/C out of 8 → 0.5.
         crate::assert_close!(HybCapCollector::gc_fraction(b"ACGTACGT"), 0.5, f64::EPSILON);
@@ -1938,13 +1813,6 @@ mod tests {
     fn test_gc_fraction_empty() {
         // safe_div_f returns 0.0 for an empty slice.
         crate::assert_close!(HybCapCollector::gc_fraction(b""), 0.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_compute_bases_at_or_above() {
-        let hist = vec![5, 10, 3, 2];
-        let result = compute_bases_at_or_above(&hist);
-        assert_eq!(result, vec![20, 15, 5, 2]);
     }
 
     #[test]

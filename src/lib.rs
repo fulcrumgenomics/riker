@@ -7,6 +7,7 @@ compile_error!("riker requires a 64-bit or wider platform");
 pub mod collector;
 pub mod commands;
 pub mod counter;
+pub mod depth_histogram;
 pub mod fasta;
 pub mod gene_model;
 pub mod intervals;

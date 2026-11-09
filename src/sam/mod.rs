@@ -1,5 +1,8 @@
 pub mod alignment_reader;
+pub mod cigar;
+pub mod coordinate_order;
 pub mod mate_buffer;
+pub mod mate_overlap;
 pub mod pair_orientation;
 pub mod riker_record;
 
