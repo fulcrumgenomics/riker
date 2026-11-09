@@ -144,7 +144,7 @@ etc.) are declared per-command, not shared.
 
 | Module | Purpose |
 |--------|---------|
-| `src/sam/alignment_reader.rs` | `AlignmentReader` — sequential reads (BAM via noodles, CRAM via rust-htslib); `fill_record()` reads in place, `riker_records()` iterates. `IndexedAlignmentReader` — region queries on indexed BAM/CRAM, both via rust-htslib |
+| `src/sam/alignment_reader.rs` | `AlignmentReader` — sequential reads (BAM via noodles, CRAM via rust-htslib); `set_requirements()` (required before reading) fixes the fields to decode (on CRAM, htslib skips the rest), then `fill_record()` reads in place, `riker_records()` iterates. `IndexedAlignmentReader` — region queries on indexed BAM/CRAM, both via rust-htslib |
 | `src/sam/record_filter.rs` | Filtering predicates (secondary, duplicate, PF, MAPQ) |
 | `src/sam/pair_orientation.rs` | `PairOrientation` enum (FR/RF/Tandem) |
 | `src/fasta.rs` | FASTA loading via noodles `IndexedReader`, wrapped in `Fasta` |

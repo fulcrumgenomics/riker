@@ -3,55 +3,136 @@ use std::path::Path;
 
 use anyhow::Result;
 use noodles::core::Region;
+use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record::cigar::Op;
 use riker_lib::sam::alignment_reader::{AlignmentReader, IndexedAlignmentReader};
 use riker_lib::sam::riker_record::{RikerRecord, RikerRecordRequirements};
-use riker_lib::test_support::{FastaBuilder, SamBuilder, coord_builder, pair, read};
+use riker_lib::test_support::{
+    FastaBuilder, SamBuilder, SortOrder, coord_builder, count_stored_cram_tags, pair, read,
+};
 use tempfile::NamedTempFile;
 
-/// The comparable fields of one record: name, flags, start, end, mapq, cigar
-/// length, sequence, quality scores, and the NM aux tag. Used to assert that
-/// two readers surface byte-identical records.
-type Row = (
-    Option<Vec<u8>>,
-    u16,
-    Option<usize>,
-    Option<usize>,
-    Option<u8>,
-    usize,
-    Vec<u8>,
-    Vec<u8>,
-    Option<i64>,
-);
+/// The comparable fields of one record: every field `RikerRecord` always
+/// populates, plus the sequence and the `NM` and `MC` aux tags, which are
+/// populated only when requested. Used to assert that two readers surface
+/// identical records.
+#[derive(Debug, PartialEq)]
+struct Row {
+    name: Option<Vec<u8>>,
+    flags: u16,
+    reference_sequence_id: Option<usize>,
+    start: Option<usize>,
+    end: Option<usize>,
+    mapping_quality: Option<u8>,
+    cigar: Vec<Op>,
+    mate_reference_sequence_id: Option<usize>,
+    mate_start: Option<usize>,
+    template_length: i32,
+    sequence_len: usize,
+    sequence: Vec<u8>,
+    quality_scores: Vec<u8>,
+    nm: Option<i64>,
+    mc: Option<Vec<u8>>,
+}
 
 /// Project a `RikerRecord` onto its comparable [`Row`].
 fn record_row(record: &RikerRecord) -> Row {
-    (
-        record.name().map(|n| n.to_vec()),
-        record.flags().bits(),
-        record.alignment_start().map(|p| p.get()),
-        record.alignment_end().map(|p| p.get()),
-        record.mapping_quality().map(|q| q.get()),
-        record.cigar_len(),
-        record.sequence().to_vec(),
-        record.quality_scores().to_vec(),
-        record.aux_tag(*b"NM").and_then(|v| v.as_int()),
-    )
+    Row {
+        name: record.name().map(|n| n.to_vec()),
+        flags: record.flags().bits(),
+        reference_sequence_id: record.reference_sequence_id(),
+        start: record.alignment_start().map(|p| p.get()),
+        end: record.alignment_end().map(|p| p.get()),
+        mapping_quality: record.mapping_quality().map(|q| q.get()),
+        cigar: record.cigar_ops().collect(),
+        mate_reference_sequence_id: record.mate_reference_sequence_id(),
+        mate_start: record.mate_alignment_start().map(|p| p.get()),
+        template_length: record.template_length(),
+        sequence_len: record.sequence_len(),
+        sequence: record.sequence().to_vec(),
+        quality_scores: record.quality_scores().to_vec(),
+        nm: record.aux_tag(*b"NM").and_then(|v| v.as_int()),
+        mc: record.aux_tag(*b"MC").and_then(|v| v.as_str().map(|s| s.to_vec())),
+    }
 }
 
-/// Read every record from `path` sequentially with the given decode-thread
-/// count, projecting each to a [`Row`].
+/// Read every record from `path` sequentially with the given requirements and
+/// decode-thread count, projecting each to a [`Row`]. `reference` is needed
+/// only for CRAM.
 fn collect_stream_rows(
     path: &Path,
+    reference: Option<&Path>,
     requirements: &RikerRecordRequirements,
     decode_threads: usize,
 ) -> Result<Vec<Row>> {
-    let mut reader = AlignmentReader::open(path, None, decode_threads)?;
+    let mut reader = AlignmentReader::open(path, reference, decode_threads)?;
+    reader.set_requirements(requirements.clone())?;
     let mut record = reader.empty_record();
     let mut rows = Vec::new();
-    while reader.fill_record(requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         rows.push(record_row(&record));
     }
     Ok(rows)
+}
+
+/// A reference and records that between them exercise every field a CRAM
+/// decode reconstructs: an FR pair (mate fields, template length, `MC`), a
+/// pair split across chr1 and chr2 (mate fields, which CRAM stores per read
+/// rather than linking the mates when they sit in different slices), a
+/// reverse-strand read with varied qualities and planted mismatches (`NM`,
+/// quality orientation), clipping and indels (CIGAR), and an unmapped read.
+fn varied_records() -> (FastaBuilder, SamBuilder) {
+    let reference = FastaBuilder::hg38_mini();
+    let mut builder = SamBuilder::with_contigs(&reference.dict()).sort_order(SortOrder::Coordinate);
+    builder.add(pair("pair1").at("chr1", 100, 300).len(50));
+    builder.add(pair("split_pair").at("chr1", 5_000, 5_000).r2(|r2| r2.at("chr2", 5_000)));
+    let reverse_quals: Vec<u8> = (0..60u8).map(|i| 10 + i % 30).collect();
+    builder.add(
+        read()
+            .name("reverse_with_mismatches")
+            .at("chr1", 1_000)
+            .len(60)
+            .mapq(30)
+            .reverse()
+            .quals(reverse_quals)
+            .sub(10, b'A')
+            .sub(20, b'C'),
+    );
+    builder.add(read().name("clipped_with_indels").at("chr2", 2_000).cigar("5S20M2I20M3D30M5S"));
+    builder.add(read().name("unmapped").unmapped());
+    (reference, builder)
+}
+
+/// [`varied_records`] written as `(fasta, bam, cram)`, the CRAM through htslib,
+/// which drops each `NM` tag for the reader to regenerate.
+fn varied_bam_and_cram() -> Result<(NamedTempFile, NamedTempFile, NamedTempFile)> {
+    let (reference, builder) = varied_records();
+    let fasta = reference.to_temp_fasta()?;
+    let bam = builder.to_temp_bam()?;
+    let cram = builder.to_temp_htslib_cram(fasta.path())?;
+    Ok((fasta, bam, cram))
+}
+
+/// Read [`varied_bam_and_cram`]'s BAM and CRAM with `requirements` and return
+/// the `(bam, cram)` rows.
+fn bam_and_cram_rows(requirements: &RikerRecordRequirements) -> Result<(Vec<Row>, Vec<Row>)> {
+    let (fasta, bam, cram) = varied_bam_and_cram()?;
+    let bam_rows = collect_stream_rows(bam.path(), None, requirements, 0)?;
+    let mut cram_rows = collect_stream_rows(cram.path(), Some(fasta.path()), requirements, 0)?;
+    assert_eq!(bam_rows.len(), 7, "two pairs + two fragments + one unmapped read");
+    clear_unmapped_mapq(&mut cram_rows);
+    Ok((bam_rows, cram_rows))
+}
+
+/// htslib decodes an unmapped CRAM record's MAPQ as 0 whatever it is asked to decode,
+/// where the BAM has 255 (missing). That is a CRAM-format difference, not one the
+/// BAM-vs-CRAM comparisons are after, so clear it on the CRAM side.
+fn clear_unmapped_mapq(cram_rows: &mut [Row]) {
+    for row in cram_rows {
+        if row.flags & Flags::UNMAPPED.bits() != 0 {
+            row.mapping_quality = None;
+        }
+    }
 }
 
 #[test]
@@ -92,11 +173,11 @@ fn test_bamrec_roundtrip_preserves_scalars() -> Result<()> {
     let bam = builder.to_temp_bam()?;
 
     let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
-    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+    reader.set_requirements(RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM"))?;
 
     let mut record = reader.empty_record();
     let mut count = 0;
-    while reader.fill_record(&requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         count += 1;
         // Every record should expose its flags + start (the records we
         // wrote are all mapped) and have non-empty cigar/quality views.
@@ -132,8 +213,9 @@ fn test_bamrec_alignment_end_matches_cigar_span() -> Result<()> {
     let bam = builder.to_temp_bam()?;
 
     let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
+    reader.set_requirements(RikerRecordRequirements::NONE)?;
     let mut record = reader.empty_record();
-    assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
+    assert!(reader.fill_record(&mut record)?);
 
     let RikerRecord::Bam(_) = &record else {
         panic!("expected RikerRecord::Bam variant for BAM input");
@@ -160,8 +242,8 @@ fn test_cram_roundtrip_via_fill_record() -> Result<()> {
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
+    reader.set_requirements(RikerRecordRequirements::NONE)?;
 
-    let requirements = RikerRecordRequirements::NONE;
     let mut record = reader.empty_record();
     // Variant check runs before the first `fill_record`, so what we're
     // locking in is that `empty_record()` allocated the right variant
@@ -172,7 +254,7 @@ fn test_cram_roundtrip_via_fill_record() -> Result<()> {
     };
 
     let mut count = 0;
-    while reader.fill_record(&requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         assert!(record.alignment_start().is_some(), "alignment_start should be Some");
         assert!(record.cigar_len() > 0, "cigar should be non-empty");
         count += 1;
@@ -291,12 +373,12 @@ fn test_cram_fill_record_decodes_sequence_and_aux() -> Result<()> {
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
-    let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
+    reader.set_requirements(RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM"))?;
     let mut record = reader.empty_record();
 
     let mut count = 0;
     let mut frag_seen = false;
-    while reader.fill_record(&requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         count += 1;
         assert!(!record.sequence().is_empty(), "sequence should be populated when requested");
         assert_eq!(record.sequence().len(), record.sequence_len(), "decoded len matches l_seq");
@@ -329,8 +411,9 @@ fn test_htslibrec_alignment_end_matches_cigar_span() -> Result<()> {
     let cram = builder.to_temp_cram(refa.path())?;
 
     let mut reader = AlignmentReader::open(cram.path(), Some(refa.path()), 0)?;
+    reader.set_requirements(RikerRecordRequirements::NONE)?;
     let mut record = reader.empty_record();
-    assert!(reader.fill_record(&RikerRecordRequirements::NONE, &mut record)?);
+    assert!(reader.fill_record(&mut record)?);
 
     let RikerRecord::Htslib(_) = &record else {
         panic!("expected RikerRecord::Htslib variant for CRAM input");
@@ -357,10 +440,10 @@ fn test_sam_fill_record_roundtrips_scalars() -> Result<()> {
 
     let mut reader = AlignmentReader::open(sam.path(), None, 0)?;
 
-    let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
+    reader.set_requirements(RikerRecordRequirements::NONE.with_aux_tag(*b"NM"))?;
     let mut record = reader.empty_record();
     let mut count = 0;
-    while reader.fill_record(&requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         count += 1;
         // Fallback variant on SAM input.
         let RikerRecord::Fallback(_) = &record else {
@@ -394,8 +477,8 @@ fn bam_records_identical_across_decode_thread_counts() -> Result<()> {
     let bam = builder.to_temp_bam()?;
 
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
-    let single = collect_stream_rows(bam.path(), &requirements, 0)?;
-    let multithreaded = collect_stream_rows(bam.path(), &requirements, 4)?;
+    let single = collect_stream_rows(bam.path(), None, &requirements, 0)?;
+    let multithreaded = collect_stream_rows(bam.path(), None, &requirements, 4)?;
 
     assert_eq!(single.len(), 5, "two pairs + one fragment = 5 records");
     assert_eq!(single, multithreaded, "multithreaded BAM decode must match single-threaded");
@@ -473,10 +556,151 @@ fn sam_ignores_decode_threads() -> Result<()> {
     let sam = builder.to_temp_sam()?;
 
     let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"NM");
-    let unset = collect_stream_rows(sam.path(), &requirements, 0)?;
-    let with_threads = collect_stream_rows(sam.path(), &requirements, 4)?;
+    let unset = collect_stream_rows(sam.path(), None, &requirements, 0)?;
+    let with_threads = collect_stream_rows(sam.path(), None, &requirements, 4)?;
 
     assert_eq!(unset.len(), 3, "one pair + one fragment = 3 records");
     assert_eq!(unset, with_threads, "decode_threads must not affect SAM reads");
+    Ok(())
+}
+
+/// With no requirements, a CRAM yields the same always-populated fields as the
+/// BAM it was made from (flags, positions, CIGAR, mate fields, qualities),
+/// although htslib skips decoding its sequence and aux tags.
+#[test]
+fn cram_without_requirements_matches_bam() -> Result<()> {
+    let (bam_rows, cram_rows) = bam_and_cram_rows(&RikerRecordRequirements::NONE)?;
+    assert_eq!(cram_rows, bam_rows);
+    Ok(())
+}
+
+/// Skipping the sequence decode must keep each read's length, which `gcbias`,
+/// `hybcap` and `rna` read without declaring the sequence.
+#[test]
+fn cram_without_requirements_keeps_sequence_length() -> Result<()> {
+    let (_, cram_rows) = bam_and_cram_rows(&RikerRecordRequirements::NONE)?;
+    let lengths: Vec<usize> = cram_rows.iter().map(|row| row.sequence_len).collect();
+    // In coordinate order: pair1 (x2), reverse_with_mismatches, split_pair read 1,
+    // clipped_with_indels, split_pair read 2, unmapped.
+    assert_eq!(lengths, [50, 50, 60, 100, 82, 100, 100]);
+    assert!(cram_rows.iter().all(|row| row.sequence.is_empty()), "bases were not requested");
+    Ok(())
+}
+
+/// Requesting the sequence makes a CRAM decode the bases, matching the BAM.
+#[test]
+fn cram_with_sequence_requirement_matches_bam() -> Result<()> {
+    let (bam_rows, cram_rows) = bam_and_cram_rows(&RikerRecordRequirements::NONE.with_sequence())?;
+    assert!(cram_rows.iter().all(|row| row.sequence.len() == row.sequence_len));
+    assert_eq!(cram_rows, bam_rows);
+    Ok(())
+}
+
+/// htslib drops `NM` from a CRAM when it matches the reference and regenerates
+/// it on read, which takes the sequence decode. Requesting `NM` alone, as
+/// `gcbias` does, must still surface the BAM's values.
+#[test]
+fn cram_with_only_nm_requirement_regenerates_dropped_nm() -> Result<()> {
+    let (fasta, bam, cram) = varied_bam_and_cram()?;
+    let stored_nm = count_stored_cram_tags(cram.path(), fasta.path(), *b"NM")?;
+    assert_eq!(stored_nm, 0, "precondition: NM is not stored");
+
+    let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
+    let bam_rows = collect_stream_rows(bam.path(), None, &requirements, 0)?;
+    let cram_rows = collect_stream_rows(cram.path(), Some(fasta.path()), &requirements, 0)?;
+    let nm = |rows: &[Row]| rows.iter().map(|row| row.nm).collect::<Vec<_>>();
+    let has_mismatches = nm(&bam_rows).iter().any(|n| n.is_some_and(|n| n > 0));
+    assert!(has_mismatches, "precondition: a read has mismatches");
+    assert_eq!(nm(&cram_rows), nm(&bam_rows));
+    Ok(())
+}
+
+/// Requesting an aux tag the CRAM stores verbatim (`MC`, as `rna` does) decodes
+/// the tags without the bases, matching the BAM.
+#[test]
+fn cram_with_only_mc_requirement_matches_bam() -> Result<()> {
+    let (bam_rows, cram_rows) =
+        bam_and_cram_rows(&RikerRecordRequirements::NONE.with_aux_tag(*b"MC"))?;
+    assert!(cram_rows.iter().any(|row| row.mc.is_some()), "precondition: the pair carries MC");
+    assert!(cram_rows.iter().all(|row| row.sequence.is_empty()), "bases were not requested");
+    assert_eq!(cram_rows, bam_rows);
+    Ok(())
+}
+
+/// The requirements reach htslib before its decode threads read ahead, so a
+/// threaded CRAM read spanning several containers surfaces the same records as
+/// a single-threaded one.
+#[test]
+fn cram_records_identical_across_decode_thread_counts() -> Result<()> {
+    let reference = FastaBuilder::hg38_mini();
+    let fasta = reference.to_temp_fasta()?;
+    let mut builder = SamBuilder::with_contigs(&reference.dict()).sort_order(SortOrder::Coordinate);
+    // htslib starts a new container every 10,000 records, so 25,000 span three.
+    for i in 0..12_500 {
+        builder.add(pair(format!("p{i}")).at("chr1", 100 + i % 4_000, 400 + i % 4_000).len(50));
+    }
+    let cram = builder.to_temp_htslib_cram(fasta.path())?;
+
+    let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"MC");
+    let single = collect_stream_rows(cram.path(), Some(fasta.path()), &requirements, 0)?;
+    let multithreaded = collect_stream_rows(cram.path(), Some(fasta.path()), &requirements, 4)?;
+    assert_eq!(single.len(), 25_000);
+    assert_eq!(single, multithreaded);
+    Ok(())
+}
+
+/// The owned-record iterator decodes per the reader's requirements on CRAM too.
+#[test]
+fn cram_riker_records_matches_bam() -> Result<()> {
+    let (fasta, bam, cram) = varied_bam_and_cram()?;
+    let requirements = RikerRecordRequirements::NONE.with_sequence();
+    let expected = collect_stream_rows(bam.path(), None, &requirements, 0)?;
+
+    let mut reader = AlignmentReader::open(cram.path(), Some(fasta.path()), 0)?;
+    reader.set_requirements(requirements)?;
+    let mut rows: Vec<Row> = reader
+        .riker_records()?
+        .map(|record| record.map(|r| record_row(&r)))
+        .collect::<Result<_>>()?;
+    clear_unmapped_mapq(&mut rows);
+    assert_eq!(rows, expected);
+    Ok(())
+}
+
+/// Requirements are fixed once reading starts: htslib may already have decoded
+/// CRAM containers ahead of the reader with the old ones.
+#[test]
+fn set_requirements_after_first_read_is_an_error() -> Result<()> {
+    let bam = varied_records().1.to_temp_bam()?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
+    reader.set_requirements(RikerRecordRequirements::NONE)?;
+    let mut record = reader.empty_record();
+    assert!(reader.fill_record(&mut record)?);
+
+    let err = reader
+        .set_requirements(RikerRecordRequirements::NONE.with_sequence())
+        .expect_err("changing requirements mid-read must fail");
+    assert!(err.to_string().contains("before the first record"), "unexpected error: {err}");
+    Ok(())
+}
+
+/// A reader never told what to decode refuses to read, rather than handing
+/// back records with no bases or aux tags.
+#[test]
+fn fill_record_without_requirements_is_an_error() -> Result<()> {
+    let bam = varied_records().1.to_temp_bam()?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
+    let mut record = reader.empty_record();
+    let err = reader.fill_record(&mut record).expect_err("reading without requirements must fail");
+    assert!(err.to_string().contains("set_requirements"), "unexpected error: {err}");
+    Ok(())
+}
+
+#[test]
+fn riker_records_without_requirements_is_an_error() -> Result<()> {
+    let bam = varied_records().1.to_temp_bam()?;
+    let mut reader = AlignmentReader::open(bam.path(), None, 0)?;
+    let err = reader.riker_records().err().expect("reading without requirements must fail");
+    assert!(err.to_string().contains("set_requirements"), "unexpected error: {err}");
     Ok(())
 }

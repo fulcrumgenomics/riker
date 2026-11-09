@@ -59,6 +59,9 @@ pub trait Collector: Send {
     /// needs so we don't silently forget to opt into an expensive field
     /// when adding a new collector. Return
     /// [`RikerRecordRequirements::NONE`] if no expensive fields are needed.
+    /// On BAM and CRAM an undeclared sequence or aux tag reads as absent (on
+    /// CRAM htslib never decodes it at all); SAM decodes everything, so a
+    /// SAM-based test cannot catch a missing declaration.
     fn field_needs(&self) -> RikerRecordRequirements;
 
     /// Relative per-record processing cost, used only by `multi` to balance
@@ -121,9 +124,9 @@ fn drive_records(
     progress: &mut ProgressLogger,
     header: &Header,
 ) -> Result<()> {
-    let requirements = collector.field_needs();
+    reader.set_requirements(collector.field_needs())?;
     let mut record = reader.empty_record();
-    while reader.fill_record(&requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         progress.record_with(&record, header);
         collector.accept(&record, header)?;
     }

@@ -278,6 +278,42 @@ impl SamBuilder {
         Ok(tmp)
     }
 
+    /// Write to a temp `.cram` through htslib, as `samtools view -C` does. Unlike
+    /// [`Self::to_temp_cram`], whose noodles writer stores every tag, htslib drops `NM`
+    /// and `MD` tags that match the reference and regenerates them on read, as in most
+    /// CRAMs in the wild.
+    ///
+    /// # Errors
+    /// Returns an error if the intermediate BAM or the CRAM cannot be written.
+    pub fn to_temp_htslib_cram(&self, fasta_path: &Path) -> Result<NamedTempFile> {
+        use noodles::sam::header::record::value::map::reference_sequence::tag::URI;
+        use rust_htslib::bam::{Format, Header as HtsHeader, Read, Reader, Writer};
+
+        // htslib resolves the reference when the writer opens and writes the header, before
+        // `Writer::set_reference` could take effect, so point each `@SQ` at the FASTA instead.
+        let mut header = self.header.clone();
+        let uri = format!("file:{}", fasta_path.display());
+        for reference_sequence in header.reference_sequences_mut().values_mut() {
+            reference_sequence.other_fields_mut().insert(URI, uri.clone().into());
+        }
+        let bam = NamedTempFile::with_suffix(".bam")?;
+        self.write_bam_with_header(bam.path(), &header)?;
+
+        let tmp = NamedTempFile::with_suffix(".cram")?;
+        let mut reader = Reader::from_path(bam.path())?;
+        let mut writer = Writer::from_path(
+            tmp.path(),
+            &HtsHeader::from_template(reader.header()),
+            Format::Cram,
+        )?;
+        for record in reader.records() {
+            writer.write(&record?)?;
+        }
+        // Dropping the writer is what finishes the CRAM (final container + EOF block).
+        drop(writer);
+        Ok(tmp)
+    }
+
     /// Write to a temp `.bam` with a sibling `.bam.bai` index (for indexed reads, e.g. `error`).
     ///
     /// # Errors
@@ -309,13 +345,7 @@ impl SamBuilder {
     /// # Errors
     /// Returns an error if the file cannot be created or a record cannot be written.
     pub fn write_bam(&self, path: &Path) -> Result<()> {
-        let file = std::fs::File::create(path)?;
-        let mut writer = bam::io::Writer::new(BufWriter::new(file));
-        writer.write_header(&self.header)?;
-        for record in self.sorted_records() {
-            AlignmentWrite::write_alignment_record(&mut writer, &self.header, record)?;
-        }
-        Ok(())
+        self.write_bam_with_header(path, &self.header)
     }
 
     /// Write all records to a plain SAM at `path`, honoring the sort order.
@@ -366,6 +396,17 @@ impl SamBuilder {
             .insert(SORT_ORDER, value.to_vec().into());
     }
 
+    /// Write all records to a BAM at `path` under `header`, honoring the sort order.
+    fn write_bam_with_header(&self, path: &Path, header: &Header) -> Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = bam::io::Writer::new(BufWriter::new(file));
+        writer.write_header(header)?;
+        for record in self.sorted_records() {
+            AlignmentWrite::write_alignment_record(&mut writer, header, record)?;
+        }
+        Ok(())
+    }
+
     /// The records in write order per [`Self::sort_order`].
     fn sorted_records(&self) -> Vec<&RecordBuf> {
         let mut records: Vec<&RecordBuf> = self.records.iter().collect();
@@ -385,6 +426,26 @@ impl Default for SamBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Count the records in `cram` that store `tag` in the file, reading through htslib
+/// with its `NM`/`MD` regeneration switched off so only stored tags surface. Checks
+/// the premise of a test on a [`SamBuilder::to_temp_htslib_cram`] CRAM: that htslib
+/// really dropped the `NM` or `MD` tags the test needs regenerated.
+///
+/// # Errors
+/// Returns an error if the CRAM cannot be read against `fasta_path`.
+pub fn count_stored_cram_tags(cram: &Path, fasta_path: &Path, tag: [u8; 2]) -> Result<usize> {
+    use rust_htslib::bam::{Read, Reader};
+    use rust_htslib::htslib::hts_fmt_option_CRAM_OPT_DECODE_MD;
+    let mut reader = Reader::from_path(cram)?;
+    reader.set_reference(fasta_path)?;
+    reader.set_cram_options(hts_fmt_option_CRAM_OPT_DECODE_MD, 0)?;
+    let mut stored = 0;
+    for record in reader.records() {
+        stored += usize::from(record?.aux(&tag).is_ok());
+    }
+    Ok(stored)
 }
 
 /// A coordinate-sorted [`SamBuilder`] over `contigs` — the shorthand for tools that
