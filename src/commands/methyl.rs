@@ -32,6 +32,7 @@ use crate::sam::mate_overlap::{Alone, Buffering, OverlapAction, OverlapBitmap, P
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
+use crate::simd;
 
 // ─── File suffixes ─────────────────────────────────────────────────────────────
 
@@ -86,6 +87,12 @@ const CONTEXT_MASK: u8 = 0b111;
 
 /// Shift of the bottom-strand field in a context code.
 const BOTTOM_SHIFT: u8 = 3;
+
+/// Mask for both strand fields of a context code.
+const STRAND_FIELDS_MASK: u8 = 0b11_1111;
+
+/// Context-code bit set at both cytosines of an in-scope CpG.
+const SCOPE_BIT: u8 = 0b100_0000;
 
 // ─── Options ──────────────────────────────────────────────────────────────────
 
@@ -416,7 +423,7 @@ impl MethylCollector {
         Ok(())
     }
 
-    /// Walk a passing read's aligned bases, examining only cytosines: each cytosine on the strand
+    /// Walk a passing read's aligned bases 64 positions at a time: each cytosine on the strand
     /// the read reports is tallied into the current contig's CpG funnel, conversion counts and
     /// per-site depths and (off control contigs) M-bias, and each CpH cytosine on the other strand
     /// into the directionality check. Cytosine calls are excluded in order: end mask, base
@@ -432,16 +439,10 @@ impl MethylCollector {
         let min_bq = self.min_bq;
         let mbias = &mut self.mbias;
         // `current` is set before any read is walked.
-        let ContigState { contexts, sites, tally, top_cytosines, bottom_cytosines, .. } =
-            self.current.as_mut().unwrap();
-        let (reported, other) = if read.top_strand {
-            (&*top_cytosines, &*bottom_cytosines)
-        } else {
-            (&*bottom_cytosines, &*top_cytosines)
-        };
+        let ContigState { contexts, sites, tally, .. } = self.current.as_mut().unwrap();
         let quals = record.quality_scores();
         let bases = record.sequence();
-        let quality_ok = |read_pos: usize| quals.get(read_pos).is_some_and(|&qual| qual >= min_bq);
+        let strand = StrandCodes::new(read.top_strand);
         let mut evidence = ReadEvidence::default();
         let mut site_cursor = 0usize;
 
@@ -458,91 +459,70 @@ impl MethylCollector {
             }
             site_cursor = sites.seek(site_cursor, block_start.saturating_sub(1));
 
-            // Cytosines on the strand the read reports, visited via the bitset so the bases in
-            // between cost nothing.
-            for ref_pos in SetBits::new(reported.as_raw_slice(), block_start, block_end) {
-                let read_pos = read_offset + (ref_pos - block_start);
-                let Some(context) = strand_context(contexts[ref_pos], read.top_strand) else {
-                    continue;
-                };
-                let cycle = read.cycle(read_pos);
-                let call = call_base(bases[read_pos], read.top_strand);
-                let quality_ok = quality_ok(read_pos);
-
-                if quality_ok && !is_control && call != Call::Other {
-                    mbias.record(read.role, context == Context::CpG, cycle, call == Call::Retained);
-                }
-
-                // The site index of a CpG cytosine, when that site is in scope.
-                let cpg_site = if context == Context::CpG {
-                    let c_pos = if read.top_strand { ref_pos } else { ref_pos - 1 };
-                    site_cursor = sites.advance(site_cursor, c_pos);
-                    sites.in_scope(site_cursor).then_some(site_cursor)
-                } else {
-                    None
-                };
-
-                if read.is_masked(cycle) {
-                    if cpg_site.is_some() {
-                        tally.cpg.potential += 1;
-                        tally.cpg.end_mask += 1;
-                    }
-                    continue;
-                }
-                if !quality_ok {
-                    if cpg_site.is_some() {
-                        tally.cpg.potential += 1;
-                        tally.cpg.baseq += 1;
-                    }
-                    continue;
-                }
-
-                if context != Context::CpG && call != Call::Other {
-                    evidence.cph_sites += 1;
-                    if call == Call::Retained {
-                        evidence.retained_cph += 1;
-                    }
-                }
-
+            for window_start in (block_start..block_end).step_by(64) {
+                let len = (block_end - window_start).min(64);
+                let read_pos = read_offset + (window_start - block_start);
+                // A missing quality (QUAL `*`, or shorter than SEQ) fails the base-quality test.
+                let window_quals =
+                    quals.get(read_pos..).map_or(&[][..], |q| &q[..q.len().min(len)]);
+                let window = CytosineWindow::classify(
+                    &contexts[window_start..window_start + len],
+                    &bases[read_pos..read_pos + len],
+                    window_quals,
+                    min_bq,
+                    &strand,
+                );
                 // Positions fit in u32 for every supported reference.
                 #[allow(clippy::cast_possible_truncation)]
-                let pos = ref_pos as u32;
-                let covered = action.is_mate_covered(pos);
-                if !covered {
-                    action.on_counted(pos);
+                let window_ref_pos = window_start as u32;
+                let unmasked = read.unmasked_bits(read_pos, len);
+                let [cpa, cpc, cpg, cpt] = window.reported;
+                let cph = cpa | cpc | cpt;
+                let informative = window.retained | window.converted;
+
+                if !is_control {
+                    let calls = window.quality_ok & informative;
+                    mbias.record_window(read, read_pos, cpg & calls, cph & calls, window.retained);
                 }
 
-                if context == Context::CpG {
-                    if let Some(site) = cpg_site {
-                        tally.cpg.potential += 1;
-                        if call == Call::Other {
-                            tally.cpg.non_informative += 1;
-                        } else if covered {
-                            tally.cpg.overlap += 1;
-                        } else {
-                            tally.cpg.good += 1;
-                            tally.count_call(Context::CpG, call);
-                            sites.count_call(site, call);
-                        }
-                    }
-                } else if call != Call::Other && !covered {
-                    tally.count_call(context, call);
-                }
-            }
+                // Calls past the end mask and base quality, which the mate may already have made.
+                let counted = (cpg | cph) & unmasked & window.quality_ok;
+                let covered = action.mate_covered_bits(window_ref_pos) & counted;
+                action.on_counted_bits(window_ref_pos, counted & !covered);
+                let kept = counted & !covered;
 
-            // CpH cytosines on the other strand: the directionality check.
-            for ref_pos in SetBits::new(other.as_raw_slice(), block_start, block_end) {
-                let read_pos = read_offset + (ref_pos - block_start);
-                if strand_context(contexts[ref_pos], !read.top_strand) == Some(Context::CpG)
-                    || !quality_ok(read_pos)
-                    || read.is_masked(read.cycle(read_pos))
+                evidence.cph_sites += (cph & counted & informative).count_ones() as usize;
+                evidence.retained_cph += (cph & counted & window.retained).count_ones() as usize;
+                for (context, cytosines) in
+                    [(Context::CpA, cpa), (Context::CpC, cpc), (Context::CpT, cpt)]
                 {
-                    continue;
+                    tally.count_calls(context, cytosines & kept, &window);
                 }
-                let call = call_base(bases[read_pos], !read.top_strand);
-                if call != Call::Other {
-                    tally.count_off_strand_call(call);
+
+                let scoped = cpg & window.in_scope;
+                let passed = scoped & counted;
+                let good = passed & informative & !covered;
+                let funnel = &mut tally.cpg;
+                funnel.potential += u64::from(scoped.count_ones());
+                funnel.end_mask += u64::from((scoped & !unmasked).count_ones());
+                funnel.baseq += u64::from((scoped & unmasked & !window.quality_ok).count_ones());
+                funnel.non_informative += u64::from((passed & !informative).count_ones());
+                funnel.overlap += u64::from((passed & informative & covered).count_ones());
+                funnel.good += u64::from(good.count_ones());
+                tally.count_calls(Context::CpG, good, &window);
+                for bit in set_bits(good) {
+                    // A bottom-strand read reports a site's G, one past its C.
+                    let c_pos = window_start + bit - usize::from(!read.top_strand);
+                    site_cursor = sites.advance(site_cursor, c_pos);
+                    let retained = window.retained >> bit & 1 == 1;
+                    sites.count_call(site_cursor, retained);
                 }
+
+                let off_strand = window.off_strand_cph & window.quality_ok & unmasked;
+                tally.off_strand_retained +=
+                    u64::from((off_strand & window.off_strand_retained).count_ones());
+                tally.off_strand_converted +=
+                    u64::from((off_strand & window.off_strand_converted).count_ones());
             }
         }
         evidence
@@ -555,19 +535,11 @@ impl MethylCollector {
     /// # Errors
     /// Returns an error if the contig cannot be read from the reference.
     fn begin_contig(&mut self, ref_id: usize) -> Result<()> {
-        let contexts = self.load_contexts(ref_id)?;
+        let mut contexts = self.load_contexts(ref_id)?;
         let sites = CpgSites::new(&contexts, self.scope_mask(ref_id));
-        let top_cytosines = cytosine_bits(&contexts, true);
-        let bottom_cytosines = cytosine_bits(&contexts, false);
+        sites.mark_in_scope(&mut contexts);
         self.mate_buffer.clear();
-        self.current = Some(ContigState {
-            ref_id,
-            contexts,
-            top_cytosines,
-            bottom_cytosines,
-            sites,
-            tally: Tally::default(),
-        });
+        self.current = Some(ContigState { ref_id, contexts, sites, tally: Tally::default() });
         Ok(())
     }
 
@@ -1330,12 +1302,9 @@ impl fmt::Display for Chemistry {
 /// The contig being processed: its reference, CpG sites and tallies.
 struct ContigState {
     ref_id: usize,
-    /// One context code per reference position (see [`encode_contexts`]).
+    /// One context code per reference position (see [`encode_contexts`]), with [`SCOPE_BIT`] set
+    /// at both cytosines of each in-scope CpG.
     contexts: Vec<u8>,
-    /// Positions holding a top-strand cytosine (a reference C with a known context).
-    top_cytosines: BitVec<u64, Lsb0>,
-    /// Positions holding a bottom-strand cytosine (a reference G with a known context).
-    bottom_cytosines: BitVec<u64, Lsb0>,
     sites: CpgSites,
     tally: Tally,
 }
@@ -1400,13 +1369,21 @@ impl CpgSites {
         from
     }
 
-    /// Count a good call at site `site`.
-    fn count_call(&mut self, site: usize, call: Call) {
-        match call {
-            Call::Retained => self.retained[site] = self.retained[site].saturating_add(1),
-            Call::Converted => self.converted[site] = self.converted[site].saturating_add(1),
-            Call::Other => {}
+    /// Set [`SCOPE_BIT`] in `contexts` at both cytosines (the C, and the G that the bottom strand
+    /// reads) of each in-scope site.
+    fn mark_in_scope(&self, contexts: &mut [u8]) {
+        for (site, &pos) in self.positions.iter().enumerate() {
+            if self.in_scope(site) {
+                contexts[pos as usize] |= SCOPE_BIT;
+                contexts[pos as usize + 1] |= SCOPE_BIT;
+            }
         }
+    }
+
+    /// Count a good call at site `site` that read unconverted (`retained`) or converted.
+    fn count_call(&mut self, site: usize, retained: bool) {
+        let counts = if retained { &mut self.retained } else { &mut self.converted };
+        counts[site] = counts[site].saturating_add(1);
     }
 
     /// The number of in-scope CpG cytosines `record`, starting at 0-based `start`, has aligned
@@ -1461,22 +1438,10 @@ impl Tally {
         }
     }
 
-    /// Count a good call in `context`.
-    fn count_call(&mut self, context: Context, call: Call) {
-        match call {
-            Call::Retained => self.retained[context as usize] += 1,
-            Call::Converted => self.converted[context as usize] += 1,
-            Call::Other => {}
-        }
-    }
-
-    /// Count an off-strand CpH call.
-    fn count_off_strand_call(&mut self, call: Call) {
-        match call {
-            Call::Retained => self.off_strand_retained += 1,
-            Call::Converted => self.off_strand_converted += 1,
-            Call::Other => {}
-        }
+    /// Count good calls in `context` at the positions of `window` set in `cytosines`.
+    fn count_calls(&mut self, context: Context, cytosines: u64, window: &CytosineWindow) {
+        self.retained[context as usize] += u64::from((cytosines & window.retained).count_ones());
+        self.converted[context as usize] += u64::from((cytosines & window.converted).count_ones());
     }
 
     /// Fraction of calls in `context` that read converted.
@@ -1577,10 +1542,9 @@ struct ReadInfo {
     sequence_len: usize,
     /// Hard-clipped bases before the first sequenced base, in sequencing order.
     leading_hard_clip: usize,
-    /// Full length of the read as sequenced: stored bases plus hard clips.
-    sequenced_len: usize,
-    mask_5p: usize,
-    mask_3p: usize,
+    /// The stored-sequence positions outside both end masks: `[unmasked_start, unmasked_end)`.
+    unmasked_start: usize,
+    unmasked_end: usize,
 }
 
 impl ReadInfo {
@@ -1592,20 +1556,42 @@ impl ReadInfo {
         let (clip_left, clip_right) = hard_clip_lengths(record);
         let (clip_left, clip_right) = (clip_left as usize, clip_right as usize);
         let sequence_len = record.sequence_len();
+        let leading_hard_clip = if reverse { clip_right } else { clip_left };
         let (mask_5p, mask_3p) = match role {
             ReadRole::R2 => (masks.r2_5p, masks.r2_3p),
             ReadRole::R1 | ReadRole::Fragment => (masks.r1_5p, masks.r1_3p),
         };
+
+        // Unmasked cycles are `[mask_5p, sequenced_len - mask_3p)`; map them onto stored
+        // positions, which run backwards through the cycles on a reverse-strand read.
+        #[expect(clippy::cast_possible_wrap, reason = "read lengths are far below i64::MAX")]
+        let (len, lead, first_cycle, end_cycle) = (
+            sequence_len as i64,
+            leading_hard_clip as i64,
+            mask_5p as i64,
+            (sequence_len + clip_left + clip_right) as i64 - mask_3p as i64,
+        );
+        let (start_pos, end_pos) = if reverse {
+            (len + lead - end_cycle, len + lead - first_cycle)
+        } else {
+            (first_cycle - lead, end_cycle - lead)
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to [0, sequence length]"
+        )]
+        let clamp = |pos: i64| pos.clamp(0, len) as usize;
+        let unmasked_end = clamp(end_pos);
         Self {
             ref_start: start,
             top_strand,
             role,
             reverse,
             sequence_len,
-            leading_hard_clip: if reverse { clip_right } else { clip_left },
-            sequenced_len: sequence_len + clip_left + clip_right,
-            mask_5p,
-            mask_3p,
+            leading_hard_clip,
+            unmasked_start: clamp(start_pos).min(unmasked_end),
+            unmasked_end,
         }
     }
 
@@ -1615,9 +1601,95 @@ impl ReadInfo {
         self.leading_hard_clip + from_5p
     }
 
-    /// Whether the base at 0-based `cycle` falls in an end mask.
-    fn is_masked(&self, cycle: usize) -> bool {
-        cycle < self.mask_5p || self.sequenced_len - 1 - cycle < self.mask_3p
+    /// Of the `len` (≤ 64) stored positions from `read_pos`, those outside both end masks: bit
+    /// `i` for `read_pos + i`.
+    fn unmasked_bits(&self, read_pos: usize, len: usize) -> u64 {
+        let start = self.unmasked_start.saturating_sub(read_pos).min(len);
+        let end = self.unmasked_end.saturating_sub(read_pos).min(len);
+        bit_range(start, end)
+    }
+}
+
+/// The context codes and read bases that identify a read's calls, by the strand it reports.
+struct StrandCodes {
+    /// The context code (strand fields only) of a reported-strand cytosine in each [`Context`].
+    reported: [u8; 4],
+    /// The context code of an off-strand CpG cytosine.
+    off_strand_cpg: u8,
+    /// Upper-case read bases: unconverted then converted on the reported strand, then the same
+    /// on the other strand.
+    bases: [u8; 4],
+}
+
+impl StrandCodes {
+    /// The codes for a read reporting the top strand (or, if `top_strand` is false, the bottom).
+    fn new(top_strand: bool) -> Self {
+        let (reported_shift, other_shift) =
+            if top_strand { (0, BOTTOM_SHIFT) } else { (BOTTOM_SHIFT, 0) };
+        let contexts = [Context::CpA, Context::CpC, Context::CpG, Context::CpT];
+        Self {
+            reported: contexts.map(|context| context.field() << reported_shift),
+            off_strand_cpg: Context::CpG.field() << other_shift,
+            bases: if top_strand { *b"CTGA" } else { *b"GACT" },
+        }
+    }
+}
+
+/// Up to 64 consecutive aligned positions of a read, classified against the reference: bit `i`
+/// of each mask describes the window's `i`th position.
+struct CytosineWindow {
+    /// Cytosines on the strand the read reports, by [`Context`].
+    reported: [u64; 4],
+    /// CpH cytosines on the other strand.
+    off_strand_cph: u64,
+    /// Positions of in-scope CpGs.
+    in_scope: u64,
+    /// The read base is the reported strand's unconverted base (C, or G on the bottom strand).
+    retained: u64,
+    /// The read base is the reported strand's converted base (T, or A on the bottom strand).
+    converted: u64,
+    /// The read base is the other strand's unconverted base.
+    off_strand_retained: u64,
+    /// The read base is the other strand's converted base.
+    off_strand_converted: u64,
+    /// The base has a quality of at least the minimum.
+    quality_ok: u64,
+}
+
+impl CytosineWindow {
+    /// Classify the parallel `codes`, `bases` and `quals` of up to 64 aligned positions; a
+    /// position past the end of `quals` fails the quality test.
+    fn classify(
+        codes: &[u8],
+        bases: &[u8],
+        quals: &[u8],
+        min_bq: u8,
+        strand: &StrandCodes,
+    ) -> Self {
+        let [cpa, cpc, cpg, cpt] = strand.reported;
+        let [cpa, cpc, cpg, cpt, no_cytosine, cpg_on_other_strand] = simd::masked_eq_bitmasks(
+            codes,
+            STRAND_FIELDS_MASK,
+            [cpa, cpc, cpg, cpt, 0, strand.off_strand_cpg],
+        );
+        let [in_scope] = simd::masked_eq_bitmasks(codes, SCOPE_BIT, [SCOPE_BIT]);
+        // Clearing bit 5 upper-cases ASCII letters.
+        let [retained, converted, off_strand_retained, off_strand_converted] =
+            simd::masked_eq_bitmasks(bases, !0x20, strand.bases);
+        // A position holds a cytosine on at most one strand, so any cytosine that is neither on
+        // the reported strand nor an off-strand CpG is an off-strand CpH.
+        let off_strand_cph = bit_range(0, codes.len())
+            & !(no_cytosine | cpa | cpc | cpg | cpt | cpg_on_other_strand);
+        Self {
+            reported: [cpa, cpc, cpg, cpt],
+            off_strand_cph,
+            in_scope,
+            retained,
+            converted,
+            off_strand_retained,
+            off_strand_converted,
+            quality_ok: simd::ge_bitmask(quals, min_bq),
+        }
     }
 }
 
@@ -1672,6 +1744,11 @@ enum Context {
 }
 
 impl Context {
+    /// The value a strand field of a context code holds for this context.
+    fn field(self) -> u8 {
+        self as u8 + 1
+    }
+
     /// The context a strand field of a context code holds, or `None` for 0 (no cytosine).
     fn from_field(field: u8) -> Option<Context> {
         match field {
@@ -1681,69 +1758,6 @@ impl Context {
             4 => Some(Context::CpT),
             _ => None,
         }
-    }
-}
-
-/// A read's base at a cytosine it reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Call {
-    /// Read as C (G on the bottom strand): not converted.
-    Retained,
-    /// Read as T (A on the bottom strand): converted.
-    Converted,
-    /// Any other base: a variant or sequencing error.
-    Other,
-}
-
-/// The set bits of a bitset stored as `u64` words (bit `i` of word `w` is position `64w + i`)
-/// within `[start, end)`, in ascending order, scanning a word at a time.
-struct SetBits<'a> {
-    words: &'a [u64],
-    /// Index of the word `current` came from.
-    word_index: usize,
-    /// Index of the word holding position `end - 1`.
-    last_word: usize,
-    /// Mask of the positions below `end` in the last word.
-    last_mask: u64,
-    /// Unvisited set bits of the current word.
-    current: u64,
-}
-
-impl<'a> SetBits<'a> {
-    /// The set bits of `words` within `[start, end)`; empty when `start >= end`.
-    fn new(words: &'a [u64], start: usize, end: usize) -> Self {
-        if start >= end {
-            return Self { words, word_index: 0, last_word: 0, last_mask: 0, current: 0 };
-        }
-        let word_index = start / 64;
-        let last_word = (end - 1) / 64;
-        let last_mask = u64::MAX >> (63 - (end - 1) % 64);
-        let mut current = words[word_index] & (u64::MAX << (start % 64));
-        if word_index == last_word {
-            current &= last_mask;
-        }
-        Self { words, word_index, last_word, last_mask, current }
-    }
-}
-
-impl Iterator for SetBits<'_> {
-    type Item = usize;
-
-    #[inline]
-    fn next(&mut self) -> Option<usize> {
-        while self.current == 0 {
-            if self.word_index >= self.last_word {
-                return None;
-            }
-            self.word_index += 1;
-            self.current = self.words[self.word_index];
-            if self.word_index == self.last_word {
-                self.current &= self.last_mask;
-            }
-        }
-        let bit = self.current.trailing_zeros() as usize;
-        self.current &= self.current - 1;
-        Some(self.word_index * 64 + bit)
     }
 }
 
@@ -1764,19 +1778,56 @@ struct MbiasCounts {
 }
 
 impl MbiasCounts {
-    /// Record a call at 0-based `cycle`.
-    fn record(&mut self, role: ReadRole, cpg: bool, cycle: usize, retained: bool) {
-        if cycle > MAX_MBIAS_CYCLE {
-            return;
-        }
-        let slot = &mut self.slots[Self::slot(role, cpg)];
-        if cycle >= slot.len() {
-            slot.resize(cycle + 1, CycleCounts::default());
-        }
-        if retained {
-            slot[cycle].retained += 1;
+    /// Record the calls `read` makes over a window of stored positions starting at `read_pos`
+    /// (bit `i` for `read_pos + i`): `cpg` and `cph` mark the informative calls at CpG and CpH
+    /// cytosines, and `retained` which of them read unconverted.
+    fn record_window(
+        &mut self,
+        read: &ReadInfo,
+        read_pos: usize,
+        cpg: u64,
+        cph: u64,
+        retained: u64,
+    ) {
+        // Re-index the window by cycle, so bit `j` is the call at cycle `first_cycle + j`. A
+        // reverse-strand read was sequenced from its last stored base, so its bits run backwards
+        // and the window can start before cycle 0; the wrapping arithmetic still lands every set
+        // bit on its true cycle.
+        let (first_cycle, cpg, cph, retained) = if read.reverse {
+            let last_cycle = read.cycle(read_pos);
+            (
+                last_cycle.wrapping_sub(63),
+                cpg.reverse_bits(),
+                cph.reverse_bits(),
+                retained.reverse_bits(),
+            )
         } else {
-            slot[cycle].converted += 1;
+            (read.cycle(read_pos), cpg, cph, retained)
+        };
+        let in_range = if first_cycle > usize::MAX - 63 {
+            u64::MAX
+        } else {
+            MAX_MBIAS_CYCLE
+                .checked_sub(first_cycle)
+                .map_or(0, |room| bit_range(0, (room + 1).min(64)))
+        };
+
+        for (is_cpg, calls) in [(true, cpg), (false, cph)] {
+            let calls = calls & in_range;
+            if calls == 0 {
+                continue;
+            }
+            let slot = &mut self.slots[Self::slot(read.role, is_cpg)];
+            let top_cycle = first_cycle.wrapping_add(63 - calls.leading_zeros() as usize);
+            if top_cycle >= slot.len() {
+                slot.resize(top_cycle + 1, CycleCounts::default());
+            }
+            for bit in set_bits(calls & retained) {
+                slot[first_cycle.wrapping_add(bit)].retained += 1;
+            }
+            for bit in set_bits(calls & !retained) {
+                slot[first_cycle.wrapping_add(bit)].converted += 1;
+            }
         }
     }
 
@@ -1852,17 +1903,25 @@ fn count_cpg_sites(sequence: &[u8], scope_mask: Option<&BitVec>) -> u64 {
     }
 }
 
-/// A bit per position of `contexts`, set where it records a cytosine on the top (or bottom)
-/// strand.
-fn cytosine_bits(contexts: &[u8], top_strand: bool) -> BitVec<u64, Lsb0> {
-    let shift = if top_strand { 0 } else { BOTTOM_SHIFT };
-    let mut bits = bitvec![u64, Lsb0; 0; contexts.len()];
-    for (word, chunk) in bits.as_raw_mut_slice().iter_mut().zip(contexts.chunks(64)) {
-        *word = chunk.iter().enumerate().fold(0u64, |word, (bit, &code)| {
-            word | (u64::from((code >> shift) & CONTEXT_MASK != 0) << bit)
-        });
+/// The indices of the set bits of `word`, ascending.
+fn set_bits(mut word: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        if word == 0 {
+            return None;
+        }
+        let bit = word.trailing_zeros() as usize;
+        word &= word - 1;
+        Some(bit)
+    })
+}
+
+/// A mask with bits `[start, end)` set (`end` ≤ 64); empty when `start >= end`.
+fn bit_range(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
     }
-    bits
+    let below_end = if end >= 64 { u64::MAX } else { (1u64 << end) - 1 };
+    below_end & !((1u64 << start) - 1)
 }
 
 /// The context of the cytosine a context code records on one strand, if any.
@@ -1870,15 +1929,6 @@ fn strand_context(code: u8, top_strand: bool) -> Option<Context> {
     let field =
         if top_strand { code & CONTEXT_MASK } else { (code >> BOTTOM_SHIFT) & CONTEXT_MASK };
     Context::from_field(field)
-}
-
-/// Classify a read base at a cytosine on the reported strand.
-fn call_base(base: u8, top_strand: bool) -> Call {
-    match (base.to_ascii_uppercase(), top_strand) {
-        (b'C', true) | (b'G', false) => Call::Retained,
-        (b'T', true) | (b'A', false) => Call::Converted,
-        _ => Call::Other,
-    }
 }
 
 /// The 95% Agresti–Coull interval on a proportion of `successes` in `total` trials, clamped to
@@ -1946,26 +1996,6 @@ mod tests {
     }
 
     #[test]
-    fn cytosine_bits_mark_each_strands_cytosines() {
-        let codes = encoded(b"ACGTAGCA");
-        let top: Vec<usize> = cytosine_bits(&codes, true).iter_ones().collect();
-        let bottom: Vec<usize> = cytosine_bits(&codes, false).iter_ones().collect();
-        assert_eq!(top, vec![1, 6]);
-        assert_eq!(bottom, vec![2, 5]);
-    }
-
-    #[test]
-    fn set_bits_visits_bits_within_the_range_across_words() {
-        let words = [0b1001u64, 0, 1u64 << 63 | 1];
-        let all: Vec<usize> = SetBits::new(&words, 0, 192).collect();
-        assert_eq!(all, vec![0, 3, 128, 191]);
-        let middle: Vec<usize> = SetBits::new(&words, 1, 191).collect();
-        assert_eq!(middle, vec![3, 128]);
-        assert_eq!(SetBits::new(&words, 4, 4).count(), 0);
-        assert_eq!(SetBits::new(&words, 3, 4).collect::<Vec<_>>(), vec![3]);
-    }
-
-    #[test]
     fn count_cpg_sites_counts_cg_dinucleotides_in_scope() {
         assert_eq!(count_cpg_sites(b"ACGTTCGCG", None), 3);
         let mut mask = bitvec![0; 9];
@@ -1980,16 +2010,6 @@ mod tests {
         for code in codes {
             assert!(strand_context(code, true).is_none() || strand_context(code, false).is_none());
         }
-    }
-
-    #[test]
-    fn call_base_reads_c_and_t_on_top_and_g_and_a_on_bottom() {
-        assert_eq!(call_base(b'C', true), Call::Retained);
-        assert_eq!(call_base(b'T', true), Call::Converted);
-        assert_eq!(call_base(b'A', true), Call::Other);
-        assert_eq!(call_base(b'G', false), Call::Retained);
-        assert_eq!(call_base(b'A', false), Call::Converted);
-        assert_eq!(call_base(b'T', false), Call::Other);
     }
 
     fn encoded(sequence: &[u8]) -> Vec<u8> {
@@ -2057,15 +2077,180 @@ mod tests {
     }
 
     #[test]
-    fn end_masks_cover_cycles_from_each_end() {
+    fn end_masks_exclude_positions_from_each_end() {
         let masks = EndMasks { r1_5p: 2, r1_3p: 1, r2_5p: 0, r2_3p: 0 };
         let record = crate::test_support::read().cigar("10M").into_riker_record();
         let info = ReadInfo::new(&record, 0, true, masks);
-        assert!(info.is_masked(0));
-        assert!(info.is_masked(1));
-        assert!(!info.is_masked(2));
-        assert!(!info.is_masked(8));
-        assert!(info.is_masked(9));
+        assert_eq!(info.unmasked_bits(0, 10), 0b01_1111_1100);
+        assert_eq!(info.unmasked_bits(4, 6), 0b01_1111);
+    }
+
+    #[test]
+    fn unmasked_positions_are_those_whose_cycles_avoid_both_end_masks() {
+        for cigar in ["10M", "3H10M", "10M2H", "3H10M2H"] {
+            for reverse in [false, true] {
+                for (mask_5p, mask_3p) in [(0, 0), (1, 0), (0, 2), (4, 3), (9, 9), (20, 0)] {
+                    let masks = EndMasks { r1_5p: mask_5p, r1_3p: mask_3p, r2_5p: 0, r2_3p: 0 };
+                    let mut builder = crate::test_support::read().cigar(cigar);
+                    if reverse {
+                        builder = builder.reverse();
+                    }
+                    let info = ReadInfo::new(&builder.into_riker_record(), 0, true, masks);
+                    let sequenced_len = 10 + hard_clip_total(cigar);
+                    for read_pos in 0..10 {
+                        let cycle = info.cycle(read_pos);
+                        let masked = cycle < mask_5p || sequenced_len - 1 - cycle < mask_3p;
+                        let unmasked = info.unmasked_bits(read_pos, 1) == 1;
+                        assert_eq!(
+                            unmasked, !masked,
+                            "{cigar} reverse={reverse} masks={mask_5p}/{mask_3p} pos={read_pos}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The total hard-clipped length in a CIGAR of `<n>H` and `M` operations.
+    fn hard_clip_total(cigar: &str) -> usize {
+        cigar
+            .split_inclusive(['H', 'M'])
+            .filter_map(|op| op.strip_suffix('H'))
+            .map(|n| n.parse::<usize>().unwrap())
+            .sum()
+    }
+
+    #[test]
+    fn record_window_files_forward_read_calls_by_cycle() {
+        let masks = EndMasks { r1_5p: 0, r1_3p: 0, r2_5p: 0, r2_3p: 0 };
+        let forward = crate::test_support::read().cigar("8H10M").into_riker_record();
+        let info = ReadInfo::new(&forward, 0, true, masks);
+        let mut mbias = MbiasCounts::default();
+        mbias.record_window(&info, 2, 0b1, 0b100, 0b1);
+        assert_eq!(mbias.cycles(ReadRole::Fragment, true)[10].retained, 1);
+        assert_eq!(mbias.cycles(ReadRole::Fragment, false)[12].converted, 1);
+        assert_eq!(mbias.cycles(ReadRole::Fragment, false).len(), 13);
+    }
+
+    #[test]
+    fn record_window_files_reverse_read_calls_by_cycle() {
+        let masks = EndMasks { r1_5p: 0, r1_3p: 0, r2_5p: 0, r2_3p: 0 };
+        let reverse = crate::test_support::read().cigar("10M8H").reverse().into_riker_record();
+        let info = ReadInfo::new(&reverse, 0, false, masks);
+        let mut mbias = MbiasCounts::default();
+        // Stored position 0 is cycle 17 and position 9 is cycle 8.
+        mbias.record_window(&info, 0, 0b1, 1 << 9, 0b1);
+        assert_eq!(mbias.cycles(ReadRole::Fragment, true)[17].retained, 1);
+        assert_eq!(mbias.cycles(ReadRole::Fragment, false)[8].converted, 1);
+        assert_eq!(mbias.cycles(ReadRole::Fragment, false).len(), 9);
+    }
+
+    /// The cycles with a retained call in the single-end CpG M-bias slot.
+    fn retained_cycles(mbias: &MbiasCounts) -> Vec<usize> {
+        let cycles = mbias.cycles(ReadRole::Fragment, true);
+        (0..cycles.len()).filter(|&cycle| cycles[cycle].retained > 0).collect()
+    }
+
+    #[test]
+    fn record_window_ignores_forward_read_cycles_past_the_limit() {
+        let masks = EndMasks { r1_5p: 0, r1_3p: 0, r2_5p: 0, r2_3p: 0 };
+        let clip = MAX_MBIAS_CYCLE - 5;
+        let forward = crate::test_support::read().cigar(format!("{clip}H10M")).into_riker_record();
+        let info = ReadInfo::new(&forward, 0, true, masks);
+        let mut mbias = MbiasCounts::default();
+        mbias.record_window(&info, 0, 0b11_1111_1111, 0, 0b11_1111_1111);
+        assert_eq!(retained_cycles(&mbias), (clip..=MAX_MBIAS_CYCLE).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn record_window_ignores_reverse_read_cycles_past_the_limit() {
+        let masks = EndMasks { r1_5p: 0, r1_3p: 0, r2_5p: 0, r2_3p: 0 };
+        let clip = MAX_MBIAS_CYCLE - 5;
+        let reverse =
+            crate::test_support::read().cigar(format!("10M{clip}H")).reverse().into_riker_record();
+        let info = ReadInfo::new(&reverse, 0, true, masks);
+        let mut mbias = MbiasCounts::default();
+        mbias.record_window(&info, 0, 0b11_1111_1111, 0, 0b11_1111_1111);
+        assert_eq!(retained_cycles(&mbias), (clip..=MAX_MBIAS_CYCLE).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn set_bits_visits_each_set_bit_in_ascending_order() {
+        assert_eq!(set_bits(0b1001 | 1 << 63).collect::<Vec<_>>(), vec![0, 3, 63]);
+        assert_eq!(set_bits(0).count(), 0);
+    }
+
+    #[test]
+    fn bit_range_sets_bits_from_start_up_to_end() {
+        assert_eq!(bit_range(2, 5), 0b1_1100);
+        assert_eq!(bit_range(0, 64), u64::MAX);
+        assert_eq!(bit_range(63, 64), 1 << 63);
+        assert_eq!(bit_range(5, 5), 0);
+        assert_eq!(bit_range(6, 2), 0);
+    }
+
+    /// Classify `reference` (encoded, every CpG in scope) against `bases` at quality 30.
+    fn classify(reference: &[u8], bases: &[u8], top_strand: bool) -> CytosineWindow {
+        let mut codes = encoded(reference);
+        CpgSites::new(&codes, None).mark_in_scope(&mut codes);
+        let quals = vec![30; bases.len()];
+        CytosineWindow::classify(&codes, bases, &quals, 20, &StrandCodes::new(top_strand))
+    }
+
+    #[test]
+    fn classify_marks_top_strand_cytosines_by_context() {
+        // C at 1 (CpG) and 6 (CpA) on the top strand; G at 2 (CpG) and 5 (CpT) on the bottom.
+        let window = classify(b"ACGTAGCA", b"ACGTAGCA", true);
+        assert_eq!(window.reported, [1 << 6, 0, 1 << 1, 0]);
+        assert_eq!(window.off_strand_cph, 1 << 5);
+    }
+
+    #[test]
+    fn classify_marks_bottom_strand_cytosines_by_context() {
+        let window = classify(b"ACGTAGCA", b"ACGTAGCA", false);
+        assert_eq!(window.reported, [0, 0, 1 << 2, 1 << 5]);
+        assert_eq!(window.off_strand_cph, 1 << 6);
+    }
+
+    #[test]
+    fn classify_reads_c_and_t_on_top_and_g_and_a_on_bottom_in_either_case() {
+        let top = classify(b"ACGTAGCA", b"AcGTAGtA", true);
+        assert_eq!(top.retained & top.reported[Context::CpG as usize], 1 << 1);
+        assert_eq!(top.converted & top.reported[Context::CpA as usize], 1 << 6);
+        let bottom = classify(b"ACGTAGCA", b"ACgTAaCA", false);
+        assert_eq!(bottom.retained & bottom.reported[Context::CpG as usize], 1 << 2);
+        assert_eq!(bottom.converted & bottom.reported[Context::CpT as usize], 1 << 5);
+    }
+
+    #[test]
+    fn classify_reads_the_off_strand_bases_of_the_other_strand() {
+        let top_read = classify(b"ACGTAGCA", b"ACGTAACA", true);
+        assert_eq!(top_read.off_strand_cph & top_read.off_strand_converted, 1 << 5);
+        let bottom_read = classify(b"ACGTAGCA", b"ACGTAGCA", false);
+        assert_eq!(bottom_read.off_strand_cph & bottom_read.off_strand_retained, 1 << 6);
+    }
+
+    #[test]
+    fn classify_fails_quality_where_quals_run_out() {
+        let codes = encoded(b"ACGTAGCA");
+        let window = CytosineWindow::classify(
+            &codes,
+            b"ACGTAGCA",
+            &[30, 10, 30],
+            20,
+            &StrandCodes::new(true),
+        );
+        assert_eq!(window.quality_ok, 0b101);
+    }
+
+    #[test]
+    fn mark_in_scope_flags_both_cytosines_of_each_scoped_site() {
+        let mut codes = encoded(b"ACGTTCGCG");
+        let mut mask = bitvec![0; 9];
+        mask.set(5, true);
+        CpgSites::new(&codes, Some(mask)).mark_in_scope(&mut codes);
+        let scoped: Vec<usize> = (0..9).filter(|&pos| codes[pos] & SCOPE_BIT != 0).collect();
+        assert_eq!(scoped, vec![5, 6]);
     }
 
     #[test]

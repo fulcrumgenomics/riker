@@ -60,6 +60,74 @@ impl OverlapBitmap {
             }
         }
     }
+
+    /// [`Self::covered_at`] for the 64 positions from `ref_pos`: bit `i` is set when the first
+    /// read counted a base at `ref_pos + i`.
+    #[must_use]
+    pub fn covered_bits(&self, ref_pos: u32) -> u64 {
+        let offset = self.offset_of(ref_pos);
+        if offset <= -64 || offset >= self.signed_len() {
+            return 0;
+        }
+        // Storage bits past the region's end are never set (see `mark_bits`), so whole words
+        // can be read.
+        let words = self.bitmap.as_raw_slice();
+        if offset < 0 {
+            return words[0] << -offset;
+        }
+        let (index, shift) = word_and_shift(offset);
+        let low = words[index] >> shift;
+        let high = match words.get(index + 1) {
+            Some(&word) if shift > 0 => word << (64 - shift),
+            _ => 0,
+        };
+        low | high
+    }
+
+    /// [`Self::mark`] for each set bit `i` of `bits`, at `ref_pos + i`. Positions outside the
+    /// overlap region are ignored.
+    pub fn mark_bits(&mut self, ref_pos: u32, bits: u64) {
+        let offset = self.offset_of(ref_pos);
+        // Bit `i` lands inside the region when `0 <= offset + i < len`.
+        let first = (-offset).clamp(0, 64);
+        let end = (self.signed_len() - offset).clamp(0, 64);
+        if first >= end {
+            return;
+        }
+        let keep = if end == 64 { u64::MAX } else { (1u64 << end) - 1 } & !((1u64 << first) - 1);
+        let bits = bits & keep;
+        let words = self.bitmap.as_raw_mut_slice();
+        if offset < 0 {
+            words[0] |= bits >> -offset;
+            return;
+        }
+        let (index, shift) = word_and_shift(offset);
+        words[index] |= bits << shift;
+        if shift > 0
+            && let Some(word) = words.get_mut(index + 1)
+        {
+            *word |= bits >> (64 - shift);
+        }
+    }
+
+    /// The region's length, signed for offset arithmetic.
+    fn signed_len(&self) -> i64 {
+        i64::try_from(self.bitmap.len()).unwrap_or(i64::MAX)
+    }
+
+    /// The signed offset of `ref_pos` from the region's start.
+    fn offset_of(&self, ref_pos: u32) -> i64 {
+        i64::from(ref_pos) - i64::from(self.overlap_start)
+    }
+}
+
+/// The storage word holding bit `offset` (non-negative) and its position within the word.
+fn word_and_shift(offset: i64) -> (usize, u32) {
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "offset >= 0")]
+    let offset = offset as usize;
+    #[expect(clippy::cast_possible_truncation, reason = "a value below 64")]
+    let shift = (offset % 64) as u32;
+    (offset / 64, shift)
 }
 
 /// Per-record strategy for a walk over a read's aligned bases, capturing the two decisions the
@@ -80,6 +148,16 @@ pub trait OverlapAction {
     /// Record that this read counted a base at `ref_pos`, so a later-arriving mate skips it.
     #[inline]
     fn on_counted(&mut self, _ref_pos: u32) {}
+
+    /// [`Self::is_mate_covered`] for the 64 positions from `ref_pos`: bit `i` for `ref_pos + i`.
+    #[inline]
+    fn mate_covered_bits(&self, _ref_pos: u32) -> u64 {
+        0
+    }
+
+    /// [`Self::on_counted`] at `ref_pos + i` for each set bit `i` of `bits`.
+    #[inline]
+    fn on_counted_bits(&mut self, _ref_pos: u32, _bits: u64) {}
 }
 
 /// Action for a read with no overlapping mate.
@@ -100,6 +178,11 @@ impl OverlapAction for Buffering<'_> {
     fn on_counted(&mut self, ref_pos: u32) {
         self.bitmap.mark(ref_pos);
     }
+
+    #[inline]
+    fn on_counted_bits(&mut self, ref_pos: u32, bits: u64) {
+        self.bitmap.mark_bits(ref_pos, bits);
+    }
 }
 
 /// Action for the second read of an overlapping pair: skips positions the first read counted.
@@ -112,6 +195,11 @@ impl OverlapAction for Pairing<'_> {
     #[inline]
     fn is_mate_covered(&self, ref_pos: u32) -> bool {
         self.cached.covered_at(ref_pos)
+    }
+
+    #[inline]
+    fn mate_covered_bits(&self, ref_pos: u32) -> u64 {
+        self.cached.covered_bits(ref_pos)
     }
 }
 
@@ -179,6 +267,52 @@ mod tests {
         let pairing = Pairing { cached: &first };
         assert!(pairing.is_mate_covered(103));
         assert!(!pairing.is_mate_covered(104));
+    }
+
+    /// A bitmap over 130 positions from 1,000 with every third position marked.
+    fn sparse_bitmap() -> OverlapBitmap {
+        let marked: Vec<u32> = (1_000..1_130).filter(|pos| pos % 3 == 0).collect();
+        bitmap(1_000, 130, &marked)
+    }
+
+    #[test]
+    fn covered_bits_agree_with_covered_at_at_every_offset() {
+        let cached = sparse_bitmap();
+        for ref_pos in 900..1_200 {
+            let expected: u64 =
+                (0..64).filter(|&i| cached.covered_at(ref_pos + i)).map(|i| 1u64 << i).sum();
+            assert_eq!(cached.covered_bits(ref_pos), expected, "ref_pos {ref_pos}");
+        }
+    }
+
+    #[test]
+    fn mark_bits_agrees_with_marking_each_position() {
+        let bits = 0x8000_0000_0000_0001 | 0b1011_0110 << 20;
+        for ref_pos in 900..1_200 {
+            let mut by_word = OverlapBitmap::new(1_000, 130);
+            by_word.mark_bits(ref_pos, bits);
+            let mut by_position = OverlapBitmap::new(1_000, 130);
+            for i in (0..64).filter(|i| bits >> i & 1 == 1) {
+                by_position.mark(ref_pos + i);
+            }
+            assert_eq!(by_word.bitmap, by_position.bitmap, "ref_pos {ref_pos}");
+        }
+    }
+
+    #[test]
+    fn mark_bits_leaves_storage_past_the_region_clear() {
+        let mut cached = OverlapBitmap::new(1_000, 70);
+        cached.mark_bits(1_060, u64::MAX);
+        assert_eq!(cached.covered_bits(1_060), 0b11_1111_1111);
+        assert_eq!(cached.bitmap.as_raw_slice()[1] >> 6, 0);
+    }
+
+    #[test]
+    fn buffering_marks_words_and_pairing_reads_them_back() {
+        let mut first = OverlapBitmap::new(100, 10);
+        Buffering { bitmap: &mut first }.on_counted_bits(102, 0b101);
+        let pairing = Pairing { cached: &first };
+        assert_eq!(pairing.mate_covered_bits(100), 0b1_0100);
     }
 
     #[test]

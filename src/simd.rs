@@ -207,6 +207,67 @@ pub fn count_n_case_insensitive(seq: &[u8]) -> u64 {
     count
 }
 
+// ─── Byte-classification bitmasks ───────────────────────────────────────────────
+//
+// These classify a window of up to 64 bytes into `u64` masks (bit `i` for byte `i`), so a
+// caller can combine several per-position predicates with plain bitwise operations and count
+// or visit the survivors with `count_ones` / `trailing_zeros`. Bits at or beyond the window's
+// length are always clear.
+
+/// For each of `targets`, a mask with bit `i` set where `bytes[i] & mask == target`.
+///
+/// `bytes` holds at most 64 bytes; bits at or beyond `bytes.len()` are clear.
+#[must_use]
+pub fn masked_eq_bitmasks<const N: usize>(bytes: &[u8], mask: u8, targets: [u8; N]) -> [u64; N] {
+    debug_assert!(bytes.len() <= 64, "a window holds at most 64 bytes");
+    let mask_v = u8x16::splat(mask);
+    let target_vs = targets.map(u8x16::splat);
+    let mut masks = [0u64; N];
+    for_each_padded_chunk(bytes, |chunk_index, chunk| {
+        let masked = chunk & mask_v;
+        for (bits, target) in masks.iter_mut().zip(target_vs) {
+            *bits |= u64::from(masked.simd_eq(target).to_bitmask()) << (16 * chunk_index);
+        }
+    });
+    masks.map(|bits| bits & window_mask(bytes.len()))
+}
+
+/// A mask with bit `i` set where `bytes[i] >= threshold`.
+///
+/// `bytes` holds at most 64 bytes; bits at or beyond `bytes.len()` are clear, even when
+/// `threshold` is 0.
+#[must_use]
+pub fn ge_bitmask(bytes: &[u8], threshold: u8) -> u64 {
+    debug_assert!(bytes.len() <= 64, "a window holds at most 64 bytes");
+    let threshold_v = u8x16::splat(threshold);
+    let mut bits = 0u64;
+    for_each_padded_chunk(bytes, |chunk_index, chunk| {
+        bits |= u64::from(chunk.simd_ge(threshold_v).to_bitmask()) << (16 * chunk_index);
+    });
+    bits & window_mask(bytes.len())
+}
+
+/// Call `visit(chunk_index, chunk)` for each 16-byte chunk of `bytes`, zero-padding the last
+/// partial chunk.
+#[inline]
+fn for_each_padded_chunk(bytes: &[u8], mut visit: impl FnMut(usize, u8x16)) {
+    let (chunks, tail) = bytes.as_chunks::<16>();
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        visit(chunk_index, u8x16::new(*chunk));
+    }
+    if !tail.is_empty() {
+        let mut padded = [0u8; 16];
+        padded[..tail.len()].copy_from_slice(tail);
+        visit(chunks.len(), u8x16::new(padded));
+    }
+}
+
+/// A mask of the low `len` bits (`len` ≤ 64).
+#[inline]
+fn window_mask(len: usize) -> u64 {
+    if len >= 64 { u64::MAX } else { (1u64 << len) - 1 }
+}
+
 // ─── BAM sequence nibble decoder ────────────────────────────────────────────────
 //
 // BAM stores sequence bases packed two per byte: the high nibble is the first base,
@@ -450,6 +511,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── masked_eq_bitmasks / ge_bitmask ───────────────────────────────────────
+
+    fn scalar_masked_eq(bytes: &[u8], mask: u8, target: u8) -> u64 {
+        bytes.iter().enumerate().filter(|&(_, &b)| b & mask == target).map(|(i, _)| 1u64 << i).sum()
+    }
+
+    fn scalar_ge(bytes: &[u8], threshold: u8) -> u64 {
+        bytes.iter().enumerate().filter(|&(_, &b)| b >= threshold).map(|(i, _)| 1u64 << i).sum()
+    }
+
+    #[test]
+    fn masked_eq_bitmasks_matches_scalar_across_lengths() {
+        let mut rng = XorShift::new(0x5EED_0001);
+        for len in 0..=64 {
+            let mut bytes = vec![0u8; len];
+            rng.fill_byte(&mut bytes, b"ACGTNacgtn=\0\x03\x18\x43");
+            let targets = [b'C', b'T', 0, 0x03];
+            let masks = masked_eq_bitmasks(&bytes, 0xDF, targets);
+            for (bits, target) in masks.into_iter().zip(targets) {
+                assert_eq!(
+                    bits,
+                    scalar_masked_eq(&bytes, 0xDF, target),
+                    "len={len} target={target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn masked_eq_bitmasks_leaves_bits_past_the_window_clear() {
+        let [zeros] = masked_eq_bitmasks(&[0u8; 5], 0xFF, [0]);
+        assert_eq!(zeros, 0b1_1111);
+    }
+
+    #[test]
+    fn ge_bitmask_matches_scalar_across_lengths_and_thresholds() {
+        let mut rng = XorShift::new(0x5EED_0002);
+        for len in 0..=64 {
+            let mut quals = vec![0u8; len];
+            rng.fill_byte(&mut quals, &(0u8..=60).collect::<Vec<u8>>());
+            for threshold in [1u8, 20, 30, 61, 255] {
+                assert_eq!(
+                    ge_bitmask(&quals, threshold),
+                    scalar_ge(&quals, threshold),
+                    "len={len} threshold={threshold}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ge_bitmask_with_zero_threshold_sets_only_the_window() {
+        assert_eq!(ge_bitmask(&[0u8; 3], 0), 0b111);
+        assert_eq!(ge_bitmask(&[0u8; 64], 0), u64::MAX);
+        assert_eq!(ge_bitmask(&[], 0), 0);
     }
 
     // ── pileup_depth_alone ─────────────────────────────────────────────────────
