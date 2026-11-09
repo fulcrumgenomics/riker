@@ -432,7 +432,13 @@ impl MethylCollector {
         let min_bq = self.min_bq;
         let mbias = &mut self.mbias;
         // `current` is set before any read is walked.
-        let ContigState { contexts, sites, tally, .. } = self.current.as_mut().unwrap();
+        let ContigState { contexts, sites, tally, top_cytosines, bottom_cytosines, .. } =
+            self.current.as_mut().unwrap();
+        let (reported, other) = if read.top_strand {
+            (&*top_cytosines, &*bottom_cytosines)
+        } else {
+            (&*bottom_cytosines, &*top_cytosines)
+        };
         let quals = record.quality_scores();
         let bases = record.sequence();
         let quality_ok = |read_pos: usize| quals.get(read_pos).is_some_and(|&qual| qual >= min_bq);
@@ -452,24 +458,11 @@ impl MethylCollector {
             }
             site_cursor = sites.seek(site_cursor, block_start.saturating_sub(1));
 
-            for offset in 0..block_end - block_start {
-                let ref_pos = block_start + offset;
-                let read_pos = read_offset + offset;
-                let code = contexts[ref_pos];
-                if code == 0 {
-                    continue;
-                }
-                let Some(context) = strand_context(code, read.top_strand) else {
-                    // A CpH cytosine on the other strand: the directionality check.
-                    if strand_context(code, !read.top_strand).is_some_and(|c| c != Context::CpG)
-                        && quality_ok(read_pos)
-                        && !read.is_masked(read.cycle(read_pos))
-                    {
-                        let call = call_base(bases[read_pos], !read.top_strand);
-                        if call != Call::Other {
-                            tally.count_off_strand_call(call);
-                        }
-                    }
+            // Cytosines on the strand the read reports, visited via the bitset so the bases in
+            // between cost nothing.
+            for ref_pos in SetBits::new(reported.as_raw_slice(), block_start, block_end) {
+                let read_pos = read_offset + (ref_pos - block_start);
+                let Some(context) = strand_context(contexts[ref_pos], read.top_strand) else {
                     continue;
                 };
                 let cycle = read.cycle(read_pos);
@@ -483,7 +476,7 @@ impl MethylCollector {
                 // The site index of a CpG cytosine, when that site is in scope.
                 let cpg_site = if context == Context::CpG {
                     let c_pos = if read.top_strand { ref_pos } else { ref_pos - 1 };
-                    site_cursor = sites.seek(site_cursor, c_pos);
+                    site_cursor = sites.advance(site_cursor, c_pos);
                     sites.in_scope(site_cursor).then_some(site_cursor)
                 } else {
                     None
@@ -536,6 +529,21 @@ impl MethylCollector {
                     tally.count_call(context, call);
                 }
             }
+
+            // CpH cytosines on the other strand: the directionality check.
+            for ref_pos in SetBits::new(other.as_raw_slice(), block_start, block_end) {
+                let read_pos = read_offset + (ref_pos - block_start);
+                if strand_context(contexts[ref_pos], !read.top_strand) == Some(Context::CpG)
+                    || !quality_ok(read_pos)
+                    || read.is_masked(read.cycle(read_pos))
+                {
+                    continue;
+                }
+                let call = call_base(bases[read_pos], !read.top_strand);
+                if call != Call::Other {
+                    tally.count_off_strand_call(call);
+                }
+            }
         }
         evidence
     }
@@ -549,8 +557,17 @@ impl MethylCollector {
     fn begin_contig(&mut self, ref_id: usize) -> Result<()> {
         let contexts = self.load_contexts(ref_id)?;
         let sites = CpgSites::new(&contexts, self.scope_mask(ref_id));
+        let top_cytosines = cytosine_bits(&contexts, true);
+        let bottom_cytosines = cytosine_bits(&contexts, false);
         self.mate_buffer.clear();
-        self.current = Some(ContigState { ref_id, contexts, sites, tally: Tally::default() });
+        self.current = Some(ContigState {
+            ref_id,
+            contexts,
+            top_cytosines,
+            bottom_cytosines,
+            sites,
+            tally: Tally::default(),
+        });
         Ok(())
     }
 
@@ -1315,6 +1332,10 @@ struct ContigState {
     ref_id: usize,
     /// One context code per reference position (see [`encode_contexts`]).
     contexts: Vec<u8>,
+    /// Positions holding a top-strand cytosine (a reference C with a known context).
+    top_cytosines: BitVec<u64, Lsb0>,
+    /// Positions holding a bottom-strand cytosine (a reference G with a known context).
+    bottom_cytosines: BitVec<u64, Lsb0>,
     sites: CpgSites,
     tally: Tally,
 }
@@ -1368,6 +1389,15 @@ impl CpgSites {
     /// walk a read left to right, so `from` only ever moves forward.
     fn seek(&self, from: usize, pos: usize) -> usize {
         from + self.positions[from..].partition_point(|&site_pos| (site_pos as usize) < pos)
+    }
+
+    /// As [`Self::seek`], but scanning forward one site at a time: cheaper than a binary search
+    /// when `pos` is at most a few sites past `from`, as successive CpGs within a read are.
+    fn advance(&self, mut from: usize, pos: usize) -> usize {
+        while from < self.positions.len() && (self.positions[from] as usize) < pos {
+            from += 1;
+        }
+        from
     }
 
     /// Count a good call at site `site`.
@@ -1665,6 +1695,58 @@ enum Call {
     Other,
 }
 
+/// The set bits of a bitset stored as `u64` words (bit `i` of word `w` is position `64w + i`)
+/// within `[start, end)`, in ascending order, scanning a word at a time.
+struct SetBits<'a> {
+    words: &'a [u64],
+    /// Index of the word `current` came from.
+    word_index: usize,
+    /// Index of the word holding position `end - 1`.
+    last_word: usize,
+    /// Mask of the positions below `end` in the last word.
+    last_mask: u64,
+    /// Unvisited set bits of the current word.
+    current: u64,
+}
+
+impl<'a> SetBits<'a> {
+    /// The set bits of `words` within `[start, end)`; empty when `start >= end`.
+    fn new(words: &'a [u64], start: usize, end: usize) -> Self {
+        if start >= end {
+            return Self { words, word_index: 0, last_word: 0, last_mask: 0, current: 0 };
+        }
+        let word_index = start / 64;
+        let last_word = (end - 1) / 64;
+        let last_mask = u64::MAX >> (63 - (end - 1) % 64);
+        let mut current = words[word_index] & (u64::MAX << (start % 64));
+        if word_index == last_word {
+            current &= last_mask;
+        }
+        Self { words, word_index, last_word, last_mask, current }
+    }
+}
+
+impl Iterator for SetBits<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        while self.current == 0 {
+            if self.word_index >= self.last_word {
+                return None;
+            }
+            self.word_index += 1;
+            self.current = self.words[self.word_index];
+            if self.word_index == self.last_word {
+                self.current &= self.last_mask;
+            }
+        }
+        let bit = self.current.trailing_zeros() as usize;
+        self.current &= self.current - 1;
+        Some(self.word_index * 64 + bit)
+    }
+}
+
 // ─── M-bias ───────────────────────────────────────────────────────────────────
 
 /// Retained and converted calls at one cycle.
@@ -1770,6 +1852,19 @@ fn count_cpg_sites(sequence: &[u8], scope_mask: Option<&BitVec>) -> u64 {
     }
 }
 
+/// A bit per position of `contexts`, set where it records a cytosine on the top (or bottom)
+/// strand.
+fn cytosine_bits(contexts: &[u8], top_strand: bool) -> BitVec<u64, Lsb0> {
+    let shift = if top_strand { 0 } else { BOTTOM_SHIFT };
+    let mut bits = bitvec![u64, Lsb0; 0; contexts.len()];
+    for (word, chunk) in bits.as_raw_mut_slice().iter_mut().zip(contexts.chunks(64)) {
+        *word = chunk.iter().enumerate().fold(0u64, |word, (bit, &code)| {
+            word | (u64::from((code >> shift) & CONTEXT_MASK != 0) << bit)
+        });
+    }
+    bits
+}
+
 /// The context of the cytosine a context code records on one strand, if any.
 fn strand_context(code: u8, top_strand: bool) -> Option<Context> {
     let field =
@@ -1851,6 +1946,26 @@ mod tests {
     }
 
     #[test]
+    fn cytosine_bits_mark_each_strands_cytosines() {
+        let codes = encoded(b"ACGTAGCA");
+        let top: Vec<usize> = cytosine_bits(&codes, true).iter_ones().collect();
+        let bottom: Vec<usize> = cytosine_bits(&codes, false).iter_ones().collect();
+        assert_eq!(top, vec![1, 6]);
+        assert_eq!(bottom, vec![2, 5]);
+    }
+
+    #[test]
+    fn set_bits_visits_bits_within_the_range_across_words() {
+        let words = [0b1001u64, 0, 1u64 << 63 | 1];
+        let all: Vec<usize> = SetBits::new(&words, 0, 192).collect();
+        assert_eq!(all, vec![0, 3, 128, 191]);
+        let middle: Vec<usize> = SetBits::new(&words, 1, 191).collect();
+        assert_eq!(middle, vec![3, 128]);
+        assert_eq!(SetBits::new(&words, 4, 4).count(), 0);
+        assert_eq!(SetBits::new(&words, 3, 4).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
     fn count_cpg_sites_counts_cg_dinucleotides_in_scope() {
         assert_eq!(count_cpg_sites(b"ACGTTCGCG", None), 3);
         let mut mask = bitvec![0; 9];
@@ -1900,6 +2015,22 @@ mod tests {
         assert!(!sites.in_scope(0));
         assert!(sites.in_scope(1));
         assert!(!sites.in_scope(2));
+    }
+
+    #[test]
+    fn advance_agrees_with_seek() {
+        let sites = CpgSites::new(&encoded(b"ACGTTCGCG"), None);
+        for from in 0..3 {
+            for pos in 0..10 {
+                if sites.positions.get(from).is_none_or(|&site| site as usize <= pos) {
+                    assert_eq!(
+                        sites.advance(from, pos),
+                        sites.seek(from, pos),
+                        "from {from} pos {pos}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
