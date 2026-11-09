@@ -9,7 +9,8 @@ use riker_lib::commands::gcbias::{
     SUMMARY_SUFFIX,
 };
 use riker_lib::test_support::{
-    BedBuilder, FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
+    BedBuilder, FastaBuilder, SamBuilder, SortOrder, coord_builder, count_stored_cram_tags, pair,
+    read,
 };
 use tempfile::TempDir;
 
@@ -602,6 +603,38 @@ fn test_unmapped_counts_in_total_not_aligned() {
     assert_eq!(summary[0].total_clusters, 2, "both reads counted as clusters");
     assert_eq!(summary[0].aligned_reads, 1, "only the mapped read is aligned");
     assert_eq!(summary[0].filtered_reads, 0, "the unmapped read never enters the aligned funnel");
+}
+
+/// A CRAM written by htslib (as samtools writes them) omits `NM` tags it can regenerate
+/// from the reference. The mismatches behind `empirical_base_quality` must still count,
+/// exactly as on the BAM the CRAM was made from.
+#[test]
+fn test_cram_without_stored_nm_counts_mismatches_like_bam() {
+    let reference = FastaBuilder::new().contig("chr1", vec![b'A'; 20]);
+    let refa = reference.to_temp_fasta().unwrap();
+
+    // Five 10 bp reads with one mismatch each: 5 errors in 50 bases, Q10.
+    let mut sam = coord_builder(&[("chr1", 20)]);
+    for _ in 0..5 {
+        sam.add(
+            read().name(sam.next_id()).at("chr1", 1).len(10).matching_ref(&reference).sub(3, b'C'),
+        );
+    }
+    let bam = sam.to_temp_bam().unwrap();
+    let cram = sam.to_temp_htslib_cram(refa.path()).unwrap();
+    let stored_nm = count_stored_cram_tags(cram.path(), refa.path(), *b"NM").unwrap();
+    assert_eq!(stored_nm, 0, "precondition: NM is not stored");
+
+    let gc0_quality = |input: &std::path::Path| {
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.path().join("out");
+        make_cmd(input, refa.path(), &prefix, opts()).execute(None).unwrap();
+        let detail: Vec<GcBiasDetailMetric> =
+            read_metrics_tsv(&dir.path().join(format!("out{DETAIL_SUFFIX}"))).unwrap();
+        detail[0].empirical_base_quality
+    };
+    assert_close!(gc0_quality(bam.path()), 10.0);
+    assert_close!(gc0_quality(cram.path()), 10.0);
 }
 
 /// The diagnostic GC-bias chart PDF is written alongside the metrics.

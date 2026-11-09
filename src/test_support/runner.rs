@@ -20,8 +20,8 @@ pub fn drive_collector(collector: &mut impl Collector, bam: &Path) -> Result<()>
     let mut reader = AlignmentReader::open(bam, None, 0)?;
     let header = reader.header().clone();
     collector.initialize(&header)?;
-    let requirements = collector.field_needs();
-    for record in reader.riker_records(&requirements) {
+    reader.set_requirements(collector.field_needs())?;
+    for record in reader.riker_records()? {
         collector.accept(&record?, &header)?;
     }
     collector.finish()?;

@@ -287,7 +287,8 @@ impl RikerRecord {
     ///
     /// 1. The consumer's [`RikerRecordRequirements`] didn't include
     ///    `sequence`, so the reader helper never called
-    ///    [`BamRec::decode_sequence`]. (BAM fast path only.)
+    ///    [`BamRec::decode_sequence`] or its CRAM counterpart. BAM and CRAM
+    ///    only.
     /// 2. The file genuinely had no sequence bases (`l_seq == 0`).
     ///
     /// Collectors that need to distinguish the two should either ensure
@@ -1353,6 +1354,16 @@ impl AuxTagRequirements {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
+
+    /// Whether the consumer may read `tag`, by value or presence.
+    #[must_use]
+    pub fn includes(&self, tag: TagKey) -> bool {
+        match self {
+            Self::None => false,
+            Self::Specific { values, presence } => values.contains(&tag) || presence.contains(&tag),
+            Self::All => true,
+        }
+    }
 }
 
 // ─── Module-level helpers ───────────────────────────────────────────────────
@@ -2154,6 +2165,24 @@ mod tests {
         let b = RikerRecordRequirements::NONE;
         assert!(a.clone().union(b.clone()).needs_sequence());
         assert!(b.union(a).needs_sequence());
+    }
+
+    #[test]
+    fn aux_requirements_none_includes_no_tag() {
+        assert!(!AuxTagRequirements::None.includes(*b"NM"));
+    }
+
+    #[test]
+    fn aux_requirements_include_value_and_presence_tags_only() {
+        let aux = AuxTagRequirements::None.with(*b"NM").with_presence(*b"SA");
+        assert!(aux.includes(*b"NM"));
+        assert!(aux.includes(*b"SA"));
+        assert!(!aux.includes(*b"MD"));
+    }
+
+    #[test]
+    fn aux_requirements_all_includes_every_tag() {
+        assert!(AuxTagRequirements::All.includes(*b"MD"));
     }
 
     // ── get_integer_tag ──

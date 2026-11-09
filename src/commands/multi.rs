@@ -537,16 +537,11 @@ fn run_single_threaded(
         collector.initialize(&header)?;
     }
 
-    let requirements = combined_requirements(&collectors);
+    reader.set_requirements(combined_requirements(&collectors))?;
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
 
-    let read_result = run_single_threaded_loop(
-        &mut reader,
-        &mut collectors,
-        &requirements,
-        &header,
-        &mut progress,
-    );
+    let read_result =
+        run_single_threaded_loop(&mut reader, &mut collectors, &header, &mut progress);
     progress.finish();
     read_result?;
 
@@ -560,12 +555,11 @@ fn run_single_threaded(
 fn run_single_threaded_loop(
     reader: &mut AlignmentReader,
     collectors: &mut [Box<dyn Collector>],
-    requirements: &RikerRecordRequirements,
     header: &Header,
     progress: &mut ProgressLogger,
 ) -> Result<()> {
     let mut record = reader.empty_record();
-    while reader.fill_record(requirements, &mut record)? {
+    while reader.fill_record(&mut record)? {
         progress.record_with(&record, header);
         for collector in collectors.iter_mut() {
             collector.accept(&record, header)?;
@@ -627,7 +621,7 @@ fn run_parallel(
 
     // Each collector declares which expensive fields it reads; the union
     // tells the reader which decoder steps to run per record.
-    let requirements = combined_requirements(&collectors);
+    reader.set_requirements(combined_requirements(&collectors))?;
 
     // Assign collectors to worker groups, balancing declared cost so the
     // heaviest collectors get their own worker. Each group is owned
@@ -677,7 +671,6 @@ fn run_parallel(
 
         // Reader owns all group senders + the batch pool. Dropping the
         // senders on return closes the channels so workers drain and exit.
-        let requirements_ref = &requirements;
         let reader_handle = scope.spawn(move || {
             let reader_result = reader_thread_loop(
                 &mut reader,
@@ -685,7 +678,6 @@ fn run_parallel(
                 &group_senders,
                 pool_tx,
                 pool_rx,
-                requirements_ref,
                 poison_ref,
             );
             // On a reader error, poison before dropping the senders so any
@@ -784,7 +776,6 @@ fn partition_collectors(
 /// deterministic.
 #[allow(
     clippy::needless_pass_by_value,
-    clippy::too_many_arguments,
     reason = "pool_tx and pool_rx move into this (scoped) thread: the reader \
               is the only thread that receives from the pool, and we want the \
               reader's handle on pool_tx to drop when the reader exits so \
@@ -798,7 +789,6 @@ fn reader_thread_loop(
     group_senders: &[Sender<Batch>],
     pool_tx: Sender<Vec<RikerRecord>>,
     pool_rx: Receiver<Vec<RikerRecord>>,
-    requirements: &RikerRecordRequirements,
     poison: &AtomicBool,
 ) -> Result<()> {
     let mut progress = ProgressLogger::new("multi", "reads", 5_000_000);
@@ -815,7 +805,7 @@ fn reader_thread_loop(
 
         let mut len = 0;
         while len < records.len() {
-            match reader.fill_record(requirements, &mut records[len]) {
+            match reader.fill_record(&mut records[len]) {
                 Ok(false) => break,
                 Ok(true) => {
                     progress.record_with(&records[len], header);
@@ -890,7 +880,8 @@ fn group_worker_loop(
 mod tests {
     use super::*;
     use crate::sam::riker_record::RikerRecord;
-    use crate::test_support::{SamBuilder, read};
+    use crate::test_support::{FastaBuilder, SamBuilder, SortOrder, pair, read};
+    use std::sync::atomic::AtomicU64;
 
     /// Collector that fails on the Nth `accept` call to exercise the
     /// poison-flag shutdown path of `run_parallel`.
@@ -944,6 +935,93 @@ mod tests {
         fn field_needs(&self) -> RikerRecordRequirements {
             RikerRecordRequirements::NONE
         }
+    }
+
+    /// Collector that declares one field and fails on any record lacking it:
+    /// the bases, or the `MC` tag every read of a mapped pair carries. Bases
+    /// htslib was not asked to decode still have the read's length but read as
+    /// `=`, which no real base is. Counts the records it checked into
+    /// `checked`.
+    struct DeclaredFieldProbe {
+        needs: RikerRecordRequirements,
+        checked: Arc<AtomicU64>,
+    }
+
+    impl Collector for DeclaredFieldProbe {
+        fn initialize(&mut self, _h: &Header) -> Result<()> {
+            Ok(())
+        }
+        fn accept(&mut self, record: &RikerRecord, _h: &Header) -> Result<()> {
+            let bases = record.sequence();
+            if self.needs.needs_sequence()
+                && (bases.len() != record.sequence_len() || bases.contains(&b'='))
+            {
+                return Err(anyhow!("a record lacks the bases its collector declared"));
+            }
+            if self.needs.aux_tags().includes(*b"MC") && record.aux_tag(*b"MC").is_none() {
+                return Err(anyhow!("a record lacks the MC tag its collector declared"));
+            }
+            self.checked.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn field_needs(&self) -> RikerRecordRequirements {
+            self.needs.clone()
+        }
+    }
+
+    /// Two probes declaring different fields: the bases, and the `MC` tag.
+    fn sequence_and_mc_probes(checked: &Arc<AtomicU64>) -> Vec<Box<dyn Collector>> {
+        let probe = |needs| DeclaredFieldProbe { needs, checked: Arc::clone(checked) };
+        vec![
+            Box::new(probe(RikerRecordRequirements::NONE.with_sequence())),
+            Box::new(probe(RikerRecordRequirements::NONE.with_aux_tag(*b"MC"))),
+        ]
+    }
+
+    /// A CRAM of 20 mapped FR pairs on chr1, each read carrying `MC`, with its
+    /// reference: `(fasta, cram)`. Written by htslib, as samtools would, so its
+    /// data series sit in the separate blocks that let htslib skip them.
+    fn paired_cram() -> Result<(tempfile::NamedTempFile, tempfile::NamedTempFile)> {
+        let reference = FastaBuilder::hg38_mini();
+        let fasta = reference.to_temp_fasta()?;
+        let mut builder =
+            SamBuilder::with_contigs(&reference.dict()).sort_order(SortOrder::Coordinate);
+        for i in 0..20 {
+            builder.add(pair(format!("p{i}")).at("chr1", 100 + i * 10, 400 + i * 10).len(50));
+        }
+        let cram = builder.to_temp_htslib_cram(fasta.path())?;
+        Ok((fasta, cram))
+    }
+
+    /// htslib decodes only the CRAM fields the reader is told about, so the
+    /// reader must be given the union of every collector's needs: each of two
+    /// collectors declaring different fields must see its own.
+    #[test]
+    fn run_single_threaded_decodes_union_of_collector_needs_on_cram() -> Result<()> {
+        let (fasta, cram) = paired_cram()?;
+        let reader = AlignmentReader::open(cram.path(), Some(fasta.path()), 0)?;
+        let checked = Arc::new(AtomicU64::new(0));
+        run_single_threaded(reader, sequence_and_mc_probes(&checked))?;
+        assert_eq!(checked.load(Ordering::Relaxed), 80, "two probes x 40 records");
+        Ok(())
+    }
+
+    /// As [`run_single_threaded_decodes_union_of_collector_needs_on_cram`], for
+    /// the reader-thread pipeline.
+    #[test]
+    fn run_parallel_decodes_union_of_collector_needs_on_cram() -> Result<()> {
+        let (fasta, cram) = paired_cram()?;
+        let reader = AlignmentReader::open(cram.path(), Some(fasta.path()), 2)?;
+        let checked = Arc::new(AtomicU64::new(0));
+        run_parallel(reader, sequence_and_mc_probes(&checked), 2)?;
+        assert_eq!(checked.load(Ordering::Relaxed), 80, "two probes x 40 records");
+        Ok(())
     }
 
     /// Write a tiny temp BAM with `n` mapped records on chr1 for the

@@ -31,10 +31,14 @@
 //!   records overlapping a region to a callback, reusing one scratch
 //!   slot for the whole region.
 //!
-//! Both consult a [`RikerRecordRequirements`] passed by the caller. On
-//! BAM and CRAM (where aux decode is lazy) the requirements gate which
-//! decoders run; on SAM noodles decodes eagerly so requirements are
-//! informational.
+//! Both consult a [`RikerRecordRequirements`] from the caller: given once, before
+//! any record is read, to [`AlignmentReader::set_requirements`], or passed per
+//! query to [`IndexedAlignmentReader::query_for_each`]. On BAM and CRAM (where
+//! aux decode is lazy) the requirements gate which decoders run; on SAM noodles
+//! decodes eagerly so requirements are informational. The sequential reader
+//! also hands them to htslib, which then skips decoding the CRAM data series no
+//! consumer reads (see [`IndexedAlignmentReader`] for why the indexed one does
+//! not).
 //!
 //! ## BAM via noodles + bgzf; CRAM via rust-htslib
 //!
@@ -79,6 +83,16 @@ use super::riker_record::{
 /// several blocks per refill and keeps the per-byte syscall overhead negligible.
 const BAM_READ_BUFFER_BYTES: usize = 256 * 1024;
 
+/// htslib's `CRAM_OPT_DECODE_MD` default for reading: `-1`, "auto", which
+/// regenerates `NM`/`MD` tags the CRAM writer dropped. rust-htslib passes
+/// option values as an unsigned `sam_fields`; htslib reads this one back as an
+/// `int`, so all bits set is `-1`.
+const CRAM_DECODE_MD_AUTO: rust_htslib::htslib::sam_fields = rust_htslib::htslib::sam_fields::MAX;
+
+/// Error for reading an [`AlignmentReader`] before it was told what to decode.
+const REQUIREMENTS_NOT_SET: &str =
+    "AlignmentReader::set_requirements must be called before reading records";
+
 // ─── AlignmentReader (sequential) ───────────────────────────────────────────
 
 /// Sequential SAM/BAM/CRAM reader. `Send`-safe; used by every command
@@ -86,11 +100,21 @@ const BAM_READ_BUFFER_BYTES: usize = 256 * 1024;
 /// requires this type because the alternative
 /// ([`IndexedAlignmentReader`]) holds a non-`Send` boxed index.
 ///
-/// Open via [`open`](Self::open). For region queries on indexed BAM/CRAM
-/// inputs, use [`IndexedAlignmentReader::open`] instead.
+/// Open via [`open`](Self::open), declare what the consumers read with
+/// [`set_requirements`](Self::set_requirements), then read. For region queries
+/// on indexed BAM/CRAM inputs, use [`IndexedAlignmentReader::open`] instead.
 pub struct AlignmentReader {
     inner: Inner,
     header: Header,
+    /// The fields every record read from here is decoded with. Reading while
+    /// this is `None` is an error rather than a default, so a caller that
+    /// forgets [`set_requirements`](Self::set_requirements) fails instead of
+    /// silently reading records with no bases or aux tags.
+    requirements: Option<RikerRecordRequirements>,
+    /// Whether a record has been read, after which the requirements are fixed:
+    /// htslib's CRAM decode threads may already have decoded containers ahead
+    /// of the reader using them.
+    started: bool,
 }
 
 /// Format-specific reader state for [`AlignmentReader`]. `Bam` is
@@ -118,22 +142,25 @@ impl AlignmentReader {
     /// BAM, a non-zero count engages the `bgzf` crate's `MultithreadedReader`;
     /// for CRAM it sizes htslib's decode pool. SAM ignores it.
     ///
+    /// Call [`set_requirements`](Self::set_requirements) before reading any
+    /// record.
+    ///
     /// # Errors
     /// Returns an error if the file cannot be opened, the header cannot
     /// be read, or a CRAM file is opened without a reference.
     pub fn open(path: &Path, reference: Option<&Path>, decode_threads: usize) -> Result<Self> {
-        match detect_format(path)? {
+        let (inner, header) = match detect_format(path)? {
             AlignmentFormat::Sam => {
                 let file = File::open(path).with_context(|| open_context(path))?;
                 let mut reader = sam::io::Reader::new(BufReader::new(file));
                 let header = reader.read_header().with_context(|| header_context(path))?;
-                Ok(Self { inner: Inner::Sam(reader), header })
+                (Inner::Sam(reader), header)
             }
             AlignmentFormat::GzippedSam => {
                 let file = File::open(path).with_context(|| open_context(path))?;
                 let mut reader = sam::io::Reader::new(BufReader::new(MultiGzDecoder::new(file)));
                 let header = reader.read_header().with_context(|| header_context(path))?;
-                Ok(Self { inner: Inner::GzippedSam(Box::new(reader)), header })
+                (Inner::GzippedSam(Box::new(reader)), header)
             }
             AlignmentFormat::Bam => {
                 let file = File::open(path).with_context(|| open_context(path))?;
@@ -143,7 +170,7 @@ impl AlignmentReader {
                     None => {
                         let mut reader = bam::io::Reader::from(noodles_bgzf::io::Reader::new(buf));
                         let header = reader.read_header().with_context(|| header_context(path))?;
-                        Ok(Self { inner: Inner::Bam(reader), header })
+                        (Inner::Bam(reader), header)
                     }
                     // Parallel BGZF decompression via the bgzf crate's reader, whose
                     // read-ahead depth is `worker_count.max(8)` (avoids noodles' one-worker stall).
@@ -151,7 +178,7 @@ impl AlignmentReader {
                         let mt = bgzf::MultithreadedReader::with_worker_count(workers, buf);
                         let mut reader = bam::io::Reader::from(mt);
                         let header = reader.read_header().with_context(|| header_context(path))?;
-                        Ok(Self { inner: Inner::BamMt(reader), header })
+                        (Inner::BamMt(reader), header)
                     }
                 }
             }
@@ -169,13 +196,39 @@ impl AlignmentReader {
                     set_htslib_threads(&mut reader, decode_threads, path)?;
                     let header = parse_htslib_header(reader.header().as_bytes())
                         .with_context(|| header_context(path))?;
-                    Ok(Self { inner: Inner::Htslib(Box::new(reader)), header })
+                    (Inner::Htslib(Box::new(reader)), header)
                 }
                 None => {
                     bail!("CRAM files require a reference FASTA (--reference): {}", path.display())
                 }
             },
+        };
+        Ok(Self { inner, header, requirements: None, started: false })
+    }
+
+    /// Declare the fields the consumers will read from every record (for
+    /// `multi`, the union across its collectors). Must be called before the
+    /// first record is read; the requirements then hold for the rest of the
+    /// file.
+    ///
+    /// On CRAM this also tells htslib which data series to decode, so fields
+    /// left out are never decoded at all. A consumer must therefore declare
+    /// everything it reads: on BAM and CRAM an undeclared sequence or aux tag
+    /// reads as absent. SAM decodes every field regardless, so a SAM-based test
+    /// cannot catch a missing declaration.
+    ///
+    /// # Errors
+    /// Returns an error if a record has already been read, or if htslib
+    /// rejects the CRAM options.
+    pub fn set_requirements(&mut self, requirements: RikerRecordRequirements) -> Result<()> {
+        if self.started {
+            bail!("record requirements must be set before the first record is read");
         }
+        if let Inner::Htslib(reader) = &mut self.inner {
+            set_cram_required_fields(reader.as_mut(), &requirements)?;
+        }
+        self.requirements = Some(requirements);
+        Ok(())
     }
 
     /// The parsed header.
@@ -198,9 +251,9 @@ impl AlignmentReader {
         }
     }
 
-    /// Read the next record into `slot` in place, decoding only the
-    /// fields named in `requirements`. Returns `Ok(true)` on success,
-    /// `Ok(false)` at EOF. Works for every format.
+    /// Read the next record into `slot` in place, decoding the fields named
+    /// by [`set_requirements`](Self::set_requirements). Returns `Ok(true)`
+    /// on success, `Ok(false)` at EOF. Works for every format.
     ///
     /// `slot`'s variant must match this reader's format — BAM readers
     /// fill [`RikerRecord::Bam`]; CRAM readers fill
@@ -209,13 +262,12 @@ impl AlignmentReader {
     /// to pre-allocate a slot of the correct variant.
     ///
     /// # Errors
-    /// Returns an error if the underlying read fails or if the slot's
+    /// Returns an error if [`set_requirements`](Self::set_requirements) has
+    /// not been called, if the underlying read fails, or if the slot's
     /// variant doesn't match the reader's format.
-    pub fn fill_record(
-        &mut self,
-        requirements: &RikerRecordRequirements,
-        slot: &mut RikerRecord,
-    ) -> Result<bool> {
+    pub fn fill_record(&mut self, slot: &mut RikerRecord) -> Result<bool> {
+        let Some(requirements) = &self.requirements else { bail!(REQUIREMENTS_NOT_SET) };
+        self.started = true;
         match (&mut self.inner, slot) {
             (Inner::Bam(reader), RikerRecord::Bam(bam_rec)) => {
                 fill_bam_slot(reader, bam_rec, requirements)
@@ -243,18 +295,22 @@ impl AlignmentReader {
     }
 
     /// Returns an iterator that yields one [`RikerRecord`] per record in
-    /// the file, allocating a fresh [`BamRec`] / [`FallbackRec`] /
+    /// the file, decoded per [`set_requirements`](Self::set_requirements)
+    /// and allocating a fresh [`BamRec`] / [`FallbackRec`] /
     /// [`HtslibRec`] per yield. Works for every format. Use
     /// [`fill_record`](Self::fill_record) for hot paths instead —
     /// `fill_record` reuses one slot across the whole loop. This
     /// iterator is the right tool for low-volume callers where
     /// per-record allocation isn't the bottleneck.
-    pub fn riker_records<'a>(
-        &'a mut self,
-        requirements: &'a RikerRecordRequirements,
-    ) -> Box<dyn Iterator<Item = Result<RikerRecord>> + 'a> {
+    ///
+    /// # Errors
+    /// Returns an error if [`set_requirements`](Self::set_requirements) has
+    /// not been called.
+    pub fn riker_records(&mut self) -> Result<Box<dyn Iterator<Item = Result<RikerRecord>> + '_>> {
+        let Some(requirements) = &self.requirements else { bail!(REQUIREMENTS_NOT_SET) };
+        self.started = true;
         let header = &self.header;
-        match &mut self.inner {
+        let records: Box<dyn Iterator<Item = Result<RikerRecord>> + '_> = match &mut self.inner {
             Inner::Bam(reader) => Box::new(BamRikerRecordIter { reader, requirements }),
             Inner::BamMt(reader) => Box::new(BamRikerRecordIter { reader, requirements }),
             Inner::Sam(reader) => Box::new(reader.record_bufs(header).map(|result| {
@@ -268,7 +324,8 @@ impl AlignmentReader {
             Inner::Htslib(reader) => {
                 Box::new(HtslibRikerRecordIter { reader: reader.as_mut(), requirements })
             }
-        }
+        };
+        Ok(records)
     }
 }
 
@@ -283,6 +340,10 @@ impl AlignmentReader {
 /// reserved for callers that need
 /// [`query_for_each`](Self::query_for_each) (currently just `error`
 /// standalone).
+///
+/// Unlike [`AlignmentReader`], it does not narrow htslib's CRAM decode to the
+/// requirements: its one caller, `error`, reads the sequence and `NM`, which
+/// need the bases and aux tags decoded anyway.
 ///
 /// Open via [`open`](Self::open). Only BAM (`.bai`/`.csi`) and CRAM
 /// (`.crai`) are supported; SAM has no widely-deployed index format.
@@ -576,6 +637,76 @@ fn pick_bam_index(
     }
 }
 
+/// Tell htslib to decode only the CRAM data series that `requirements` need
+/// (see [`cram_required_fields`]), and to regenerate dropped `NM`/`MD` tags
+/// only when a consumer reads them. Must happen before the first record is
+/// read: htslib's decode threads read ahead with whatever setting is in force.
+///
+/// # Errors
+/// Returns an error if htslib rejects either option.
+fn set_cram_required_fields(
+    reader: &mut rust_htslib::bam::Reader,
+    requirements: &RikerRecordRequirements,
+) -> Result<()> {
+    use rust_htslib::htslib as hts;
+    reader
+        .set_cram_options(
+            hts::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
+            cram_required_fields(requirements),
+        )
+        .context("Failed to set the CRAM fields to decode")?;
+    // htslib rebuilds the tags whenever it decodes aux tags against a loaded
+    // reference, e.g. for `basic` + `rna` in `multi`: an MD string per read
+    // that nothing reads.
+    let decode_md = if reads_nm_or_md(requirements) { CRAM_DECODE_MD_AUTO } else { 0 };
+    reader
+        .set_cram_options(hts::hts_fmt_option_CRAM_OPT_DECODE_MD, decode_md)
+        .context("Failed to set whether to regenerate CRAM NM/MD tags")
+}
+
+/// The htslib `CRAM_OPT_REQUIRED_FIELDS` mask for `requirements`.
+///
+/// The fields [`RikerRecord`] always populates (name, flags, positions, MAPQ,
+/// CIGAR, mate fields, qualities) are always requested. Requesting qualities
+/// also keeps the sequence length: with neither `SAM_SEQ` nor `SAM_QUAL`
+/// htslib reports a zero-length read, and `sequence_len()` must stay
+/// accurate without a sequence decode.
+///
+/// `SAM_AUX` decodes every aux tag (htslib cannot pick tags), including the
+/// read group, which CRAM stores as its own data series. `SAM_SEQ` is added
+/// for a declared sequence, and also when `NM` or `MD` is read: htslib
+/// regenerates those while decoding the sequence against the reference, which
+/// for most slices it loads only when the sequence is required.
+fn cram_required_fields(requirements: &RikerRecordRequirements) -> rust_htslib::htslib::sam_fields {
+    use rust_htslib::htslib as hts;
+    let mut fields = hts::sam_fields_SAM_QNAME
+        | hts::sam_fields_SAM_FLAG
+        | hts::sam_fields_SAM_RNAME
+        | hts::sam_fields_SAM_POS
+        | hts::sam_fields_SAM_MAPQ
+        | hts::sam_fields_SAM_CIGAR
+        | hts::sam_fields_SAM_RNEXT
+        | hts::sam_fields_SAM_PNEXT
+        | hts::sam_fields_SAM_TLEN
+        | hts::sam_fields_SAM_QUAL;
+    let aux_tags = requirements.aux_tags();
+    if !aux_tags.is_none() {
+        fields |= hts::sam_fields_SAM_AUX;
+    }
+    if requirements.needs_sequence() || reads_nm_or_md(requirements) {
+        fields |= hts::sam_fields_SAM_SEQ;
+    }
+    fields
+}
+
+/// Whether a consumer reads `NM` or `MD`. htslib's CRAM writer (samtools)
+/// drops both tags by default, and the reader regenerates them from the
+/// reference.
+fn reads_nm_or_md(requirements: &RikerRecordRequirements) -> bool {
+    let aux_tags = requirements.aux_tags();
+    aux_tags.includes(*b"NM") || aux_tags.includes(*b"MD")
+}
+
 /// Read one CRAM record into `hts_rec` and apply `requirements`. Used
 /// by the sequential [`AlignmentReader::fill_record`] path. The
 /// generic bound makes it callable on either rust-htslib reader type;
@@ -817,5 +948,101 @@ mod tests {
         touch(&cram);
         let err = validate_cram_index_exists(&cram).expect_err("missing .crai should fail");
         assert!(err.to_string().contains("CRAM index not found"));
+    }
+
+    /// Whether the CRAM mask for `requirements` requests `(bases, aux tags)`.
+    fn cram_mask_bases_and_aux(requirements: &RikerRecordRequirements) -> (bool, bool) {
+        use rust_htslib::htslib as hts;
+        let fields = cram_required_fields(requirements);
+        (fields & hts::sam_fields_SAM_SEQ != 0, fields & hts::sam_fields_SAM_AUX != 0)
+    }
+
+    #[test]
+    fn cram_mask_without_requirements_requests_only_the_always_populated_fields() {
+        use rust_htslib::htslib as hts;
+        let always_populated = hts::sam_fields_SAM_QNAME
+            | hts::sam_fields_SAM_FLAG
+            | hts::sam_fields_SAM_RNAME
+            | hts::sam_fields_SAM_POS
+            | hts::sam_fields_SAM_MAPQ
+            | hts::sam_fields_SAM_CIGAR
+            | hts::sam_fields_SAM_RNEXT
+            | hts::sam_fields_SAM_PNEXT
+            | hts::sam_fields_SAM_TLEN
+            | hts::sam_fields_SAM_QUAL;
+        assert_eq!(cram_required_fields(&RikerRecordRequirements::NONE), always_populated);
+    }
+
+    #[test]
+    fn cram_mask_for_the_sequence_requests_the_bases_only() {
+        let requirements = RikerRecordRequirements::NONE.with_sequence();
+        assert_eq!(cram_mask_bases_and_aux(&requirements), (true, false));
+    }
+
+    #[test]
+    fn cram_mask_for_a_stored_tag_requests_the_aux_tags_only() {
+        let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"MC");
+        assert_eq!(cram_mask_bases_and_aux(&requirements), (false, true));
+    }
+
+    #[test]
+    fn cram_mask_for_nm_requests_the_bases_and_aux_tags() {
+        let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
+        assert_eq!(cram_mask_bases_and_aux(&requirements), (true, true));
+    }
+
+    #[test]
+    fn cram_mask_for_md_presence_requests_the_bases_and_aux_tags() {
+        let requirements = RikerRecordRequirements::NONE.with_aux_tag_presence(*b"MD");
+        assert_eq!(cram_mask_bases_and_aux(&requirements), (true, true));
+    }
+
+    #[test]
+    fn cram_mask_for_all_aux_tags_requests_the_bases_and_aux_tags() {
+        let requirements = RikerRecordRequirements::NONE.with_all_aux_tags();
+        assert_eq!(cram_mask_bases_and_aux(&requirements), (true, true));
+    }
+
+    /// Read a CRAM of ten mapped reads, which htslib wrote without `NM`/`MD`,
+    /// through htslib with the options `requirements` set, and count the
+    /// records htslib returns with an `NM` and with an `MD` tag. Reads htslib
+    /// directly because riker's accessors hide undeclared tags.
+    fn nm_and_md_tags_decoded(requirements: &RikerRecordRequirements) -> Result<(usize, usize)> {
+        use crate::test_support::{FastaBuilder, SamBuilder, SortOrder, read};
+        let reference = FastaBuilder::hg38_mini();
+        let fasta = reference.to_temp_fasta()?;
+        let mut builder =
+            SamBuilder::with_contigs(&reference.dict()).sort_order(SortOrder::Coordinate);
+        for i in 0..10 {
+            builder.add(read().name(format!("r{i}")).at("chr1", 100 + i * 20).len(50).sub(5, b'A'));
+        }
+        let cram = builder.to_temp_htslib_cram(fasta.path())?;
+
+        let mut reader = rust_htslib::bam::Reader::from_path(cram.path())?;
+        reader.set_reference(fasta.path())?;
+        set_cram_required_fields(&mut reader, requirements)?;
+        let (mut with_nm, mut with_md) = (0, 0);
+        for record in reader.records() {
+            let record = record?;
+            with_nm += usize::from(record.aux(b"NM").is_ok());
+            with_md += usize::from(record.aux(b"MD").is_ok());
+        }
+        Ok((with_nm, with_md))
+    }
+
+    /// Decoding both the bases and the aux tags would let htslib rebuild the
+    /// dropped `NM` and `MD` tags; with neither declared it must not.
+    #[test]
+    fn cram_decode_skips_nm_and_md_regeneration_when_neither_is_read() -> Result<()> {
+        let requirements = RikerRecordRequirements::NONE.with_sequence().with_aux_tag(*b"MC");
+        assert_eq!(nm_and_md_tags_decoded(&requirements)?, (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn cram_decode_regenerates_nm_and_md_when_nm_is_read() -> Result<()> {
+        let requirements = RikerRecordRequirements::NONE.with_aux_tag(*b"NM");
+        assert_eq!(nm_and_md_tags_decoded(&requirements)?, (10, 10));
+        Ok(())
     }
 }
