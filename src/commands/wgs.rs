@@ -433,6 +433,7 @@ impl WgsCollector {
         self.depth_histogram.plot_pdf(
             mean,
             &self.plot_title,
+            None,
             "Coverage Depth (X)",
             "Fraction of Genome",
             &self.plot_path,

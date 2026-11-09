@@ -108,10 +108,11 @@ fn fully_cpg_methylated_reads_give_full_cpg_methylation_and_full_cph_conversion(
     let (_dir, prefix) = run(false, tiling_reads(&Methylation::AllCpg), MethylOptions::default());
     let m = metrics(&prefix);
     assert_eq!(m.cpg_territory, 40);
-    assert_eq!(m.cpg_observations_potential, 40);
-    assert_eq!(m.cpg_observations, 40);
-    assert_close!(m.frac_cpg_obs_excluded_total, 0.0);
+    assert_eq!(m.cpg_obs_potential, 40);
+    assert_eq!(m.cpg_obs, 40);
+    assert_close!(m.frac_excluded_total, 0.0);
     assert_close!(m.cpg_methylation, 1.0);
+    assert_close!(m.cpg_conversion, 0.0);
     assert_close!(m.cpa_conversion, 1.0);
     assert_close!(m.cph_conversion, 1.0);
 }
@@ -144,7 +145,6 @@ fn taps_chemistry_reads_converted_cytosines_as_methylated() {
     assert_eq!(m.chemistry, "taps");
     assert_close!(m.cpg_methylation, 1.0);
     assert_close!(m.cph_conversion, 0.0);
-    assert!(m.frac_reads_cph_retained_ge_3.is_none());
 }
 
 #[test]
@@ -153,8 +153,8 @@ fn observations_are_normalised_per_read_and_per_mb() {
     let m = metrics(&prefix);
     assert_eq!(m.reads, 10);
     assert_eq!(m.bases_sequenced, 640);
-    assert_close!(m.cpg_observations_per_read, 4.0);
-    assert_close!(m.cpg_observations_per_mb, 40.0 / 640.0 * 1_000_000.0, 0.01);
+    assert_close!(m.cpg_obs_per_read, 4.0);
+    assert_close!(m.cpg_obs_per_mb_sequenced, 40.0 / 640.0 * 1_000_000.0, 0.01);
 }
 
 // ─── Strands and coverage ────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ fn bottom_strand_reads_measure_bottom_strand_cph_conversion() {
     assert_close!(m.cpt_conversion, 1.0);
     assert_close!(m.cpc_conversion, 1.0);
     assert_close!(m.cpg_methylation, 1.0);
-    assert_eq!(m.cpg_observations, 40);
+    assert_eq!(m.cpg_obs, 40);
 }
 
 #[test]
@@ -198,12 +198,6 @@ fn coverage_statistics_cover_every_territory_cpg() {
     let m = metrics(&prefix);
     assert_close!(m.frac_cpgs_at_1x, 0.5);
     assert_close!(m.mean_cpg_depth, 0.5);
-}
-
-#[test]
-fn cpg_to_genome_depth_ratio_is_one_without_cpg_specific_loss() {
-    let (_dir, prefix) = run(false, tiling_reads(&Methylation::AllCpg), MethylOptions::default());
-    assert_close!(metrics(&prefix).cpg_to_genome_depth_ratio.unwrap(), 1.0);
 }
 
 // ─── Read-level exclusions ───────────────────────────────────────────────────
@@ -221,15 +215,12 @@ fn read_level_exclusions_are_attributed_in_order() {
     ];
     let (_dir, prefix) = run(false, reads, MethylOptions::default());
     let m = metrics(&prefix);
-    assert_eq!(m.cpg_observations_potential, 20);
-    assert_eq!(m.cpg_observations, 4);
-    assert_close!(m.frac_cpg_obs_excluded_qc_fail, 0.4);
-    assert_close!(m.frac_cpg_obs_excluded_dupe, 0.2);
-    assert_close!(m.frac_cpg_obs_excluded_mapq, 0.2);
-    assert_close!(m.frac_cpg_obs_excluded_total, 0.8);
-    assert_close!(m.frac_bases_excluded_qc_fail, 0.4);
-    assert_close!(m.frac_bases_excluded_dupe, 0.2);
-    assert_close!(m.frac_bases_excluded_mapq, 0.2);
+    assert_eq!(m.cpg_obs_potential, 20);
+    assert_eq!(m.cpg_obs, 4);
+    assert_close!(m.frac_excluded_qc_fail, 0.4);
+    assert_close!(m.frac_excluded_dupe, 0.2);
+    assert_close!(m.frac_excluded_mapq, 0.2);
+    assert_close!(m.frac_excluded_total, 0.8);
 }
 
 #[test]
@@ -240,11 +231,11 @@ fn include_duplicates_counts_duplicate_reads() {
     ];
     let options = MethylOptions { include_duplicates: true, ..MethylOptions::default() };
     let (_dir, prefix) = run(false, reads, options);
-    assert_eq!(metrics(&prefix).cpg_observations, 8);
+    assert_eq!(metrics(&prefix).cpg_obs, 8);
 }
 
 #[test]
-fn unmapped_reads_count_only_in_the_base_funnel() {
+fn unmapped_reads_count_only_towards_reads_and_bases_sequenced() {
     let reads = vec![
         fragment("pass", 1).converted(Methylation::AllCpg),
         read().name("unmapped").len(READ_LEN).unmapped(),
@@ -252,8 +243,8 @@ fn unmapped_reads_count_only_in_the_base_funnel() {
     let (_dir, prefix) = run(false, reads, MethylOptions::default());
     let m = metrics(&prefix);
     assert_eq!(m.reads, 2);
-    assert_close!(m.frac_bases_excluded_unmapped, 0.5);
-    assert_eq!(m.cpg_observations_potential, 4);
+    assert_eq!(m.bases_sequenced, 128);
+    assert_eq!(m.cpg_obs_potential, 4);
 }
 
 #[test]
@@ -266,7 +257,7 @@ fn secondary_and_supplementary_alignments_are_ignored() {
     let (_dir, prefix) = run(false, reads, MethylOptions::default());
     let m = metrics(&prefix);
     assert_eq!(m.reads, 1);
-    assert_eq!(m.cpg_observations_potential, 4);
+    assert_eq!(m.cpg_obs_potential, 4);
 }
 
 // ─── Base-level exclusions ───────────────────────────────────────────────────
@@ -276,9 +267,8 @@ fn low_quality_bases_are_excluded() {
     let reads = vec![fragment("lowq", 1).converted(Methylation::AllCpg).qual(10)];
     let (_dir, prefix) = run(false, reads, MethylOptions::default());
     let m = metrics(&prefix);
-    assert_eq!(m.cpg_observations, 0);
-    assert_close!(m.frac_cpg_obs_excluded_baseq, 1.0);
-    assert_close!(m.frac_bases_excluded_baseq, 1.0);
+    assert_eq!(m.cpg_obs, 0);
+    assert_close!(m.frac_excluded_baseq, 1.0);
 }
 
 #[test]
@@ -287,8 +277,8 @@ fn a_cpg_base_that_is_neither_c_nor_t_is_non_informative() {
     let reads = vec![fragment("snp", 1).converted(Methylation::AllCpg).sub(2, b'A')];
     let (_dir, prefix) = run(false, reads, MethylOptions::default());
     let m = metrics(&prefix);
-    assert_eq!(m.cpg_observations, 3);
-    assert_close!(m.frac_cpg_obs_excluded_non_informative, 0.25);
+    assert_eq!(m.cpg_obs, 3);
+    assert_close!(m.frac_excluded_non_informative, 0.25);
 }
 
 #[test]
@@ -306,10 +296,9 @@ fn overlapping_mates_count_each_cpg_once() {
     let bam = sam.to_temp_bam().unwrap();
     let (_dir, prefix) = run_bam(bam.path(), fasta.path(), MethylOptions::default());
     let m = metrics(&prefix);
-    assert_eq!(m.cpg_observations_potential, 8);
-    assert_eq!(m.cpg_observations, 4);
-    assert_close!(m.frac_cpg_obs_excluded_overlap, 0.5);
-    assert_close!(m.frac_bases_excluded_overlap, 0.5);
+    assert_eq!(m.cpg_obs_potential, 8);
+    assert_eq!(m.cpg_obs, 4);
+    assert_close!(m.frac_excluded_overlap, 0.5);
 }
 
 #[test]
@@ -319,9 +308,8 @@ fn end_masks_exclude_bases_by_cycle() {
     let options = MethylOptions { mask_r1_5p: 3, ..MethylOptions::default() };
     let (_dir, prefix) = run(false, reads, options);
     let m = metrics(&prefix);
-    assert_eq!(m.cpg_observations, 3);
-    assert_close!(m.frac_cpg_obs_excluded_end_mask, 0.25);
-    assert_close!(m.frac_bases_excluded_end_mask, 3.0 / 64.0, 1e-5);
+    assert_eq!(m.cpg_obs, 3);
+    assert_close!(m.frac_excluded_end_mask, 0.25);
 }
 
 // ─── Territory, intervals and controls ───────────────────────────────────────
@@ -335,8 +323,7 @@ fn intervals_restrict_the_cpg_territory() {
     let (_dir, prefix) = run(false, tiling_reads(&Methylation::AllCpg), options);
     let m = metrics(&prefix);
     assert_eq!(m.cpg_territory, 4);
-    assert_eq!(m.cpg_observations, 4);
-    assert!(m.cpg_to_genome_depth_ratio.is_none());
+    assert_eq!(m.cpg_obs, 4);
 }
 
 #[test]
@@ -358,7 +345,6 @@ fn control_contigs_are_reported_separately() {
     let m = metrics(&prefix);
     assert_eq!(m.cpg_territory, 40);
     assert_close!(m.cpg_methylation, 1.0);
-    assert_close!(m.frac_bases_excluded_control, 64.0 / 704.0, 1e-5);
 
     let contigs: Vec<MethylContigMetric> =
         read_metrics_tsv(&output(&prefix, CONTIGS_SUFFIX)).unwrap();
@@ -367,7 +353,7 @@ fn control_contigs_are_reported_separately() {
     assert_eq!(lambda.contig, "lambda");
     assert!(lambda.is_control);
     assert_eq!(lambda.cpg_sites, 10);
-    assert_eq!(lambda.cpg_observations, 4);
+    assert_eq!(lambda.cpg_obs, 4);
     assert_close!(lambda.cpg_methylation, 0.0);
     assert_close!(lambda.cph_conversion, 1.0);
 }
@@ -449,7 +435,6 @@ fn unconverted_reads_show_up_in_the_retained_cph_histogram() {
         read_metrics_tsv(&output(&prefix, READ_CONVERSION_SUFFIX)).unwrap();
     assert_eq!(rows[0].reads, 9);
     assert_eq!(rows[4].reads, 1);
-    assert_close!(metrics(&prefix).frac_reads_cph_retained_ge_3.unwrap(), 0.1);
 }
 
 #[test]

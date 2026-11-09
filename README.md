@@ -196,7 +196,7 @@ riker methyl -i sample.bam -r ref.fa -o out_prefix --chemistry illumina-5base
 riker methyl -i sample.bam -r ref.fa -o out_prefix --control-contig lambda pUC19
 ```
 
-The input BAM must be coordinate-sorted and from a directional library: the strand each read reports is inferred from its flags. Usable CpG observations are broken down by why the rest were excluded, both in sequenced bases and in CpG observations, and normalised per read and per Mb sequenced.
+The input BAM must be coordinate-sorted and from a directional library: the strand each read reports is inferred from its flags. Usable CpG observations are broken down by why the rest were excluded and normalised per read and per Mb of sequence data.
 
 Collect RNA-seq metrics (the gene-model format — UCSC refFlat, GTF, or GFF3 — is auto-detected):
 

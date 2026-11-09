@@ -19,20 +19,19 @@ use crate::depth_histogram::DepthHistogram;
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
 use crate::math::safe_div_f;
-use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, serialize_opt_f64_5dp, write_tsv};
+use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
 use crate::plotting::{
     FG_BLUE, FG_GREEN, FG_NAVY, standard_layout, write_plot_pdf, write_twin_y_plot_pdf,
 };
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
-use crate::sam::cigar::{aligned_blocks, count_aligned_bases, hard_clip_lengths};
+use crate::sam::cigar::{aligned_blocks, hard_clip_lengths};
 use crate::sam::coordinate_order::CoordinateOrderGuard;
 use crate::sam::mate_buffer::{MateBuffer, Peek};
 use crate::sam::mate_overlap::{Alone, Buffering, OverlapAction, OverlapBitmap, Pairing};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
-use crate::simd::count_n_case_insensitive;
 
 // ─── File suffixes ─────────────────────────────────────────────────────────────
 
@@ -70,10 +69,6 @@ const MAX_MBIAS_CYCLE: usize = 100_000;
 /// Retained CpH counts at or above this are tallied together in the read-conversion histogram.
 const MAX_RETAINED_CPH_BIN: usize = 20;
 
-/// Reads with at least this many retained CpH count towards `frac_reads_cph_retained_ge_3`,
-/// matching the rule NEB's `mark-nonconverted-reads` uses.
-const RETAINED_CPH_FLAG_THRESHOLD: usize = 3;
-
 /// Number of bins in the CpG methylation-level histogram: one per percentage point, 0–100.
 const BETA_BINS: usize = 101;
 
@@ -85,6 +80,12 @@ const BETA_HIGH: f64 = 0.8;
 
 /// Two-sided 95% normal quantile, for the Agresti–Coull intervals on M-bias rates.
 const Z_95: f64 = 1.959_963_984_540_054;
+
+/// Mask for one strand's field in a context code (see [`encode_contexts`]).
+const CONTEXT_MASK: u8 = 0b111;
+
+/// Shift of the bottom-strand field in a context code.
+const BOTTOM_SHIFT: u8 = 3;
 
 // ─── Options ──────────────────────────────────────────────────────────────────
 
@@ -102,16 +103,16 @@ pub struct MethylOptions {
 
     /// Interval file (IntervalList or BED) restricting the CpG territory.
     ///
-    /// A CpG counts when its C is inside an interval. The base-level funnel,
-    /// CpH conversion, M-bias and per-read metrics are not restricted.
+    /// A CpG counts when its C is inside an interval. CpH conversion, M-bias
+    /// and the per-read metrics are not restricted.
     #[arg(short = 'L', long, value_name = "FILE", value_parser = crate::commands::common::parse_existing_file)]
     pub intervals: Option<PathBuf>,
 
     /// Contig holding a spike-in control (e.g. lambda, pUC19). Repeatable.
     ///
-    /// Reads on a control contig are reported only in the per-contig table and
-    /// as `frac_bases_excluded_control`; they contribute to no genome-level
-    /// metric. Interval restriction never applies to control contigs.
+    /// Reads on a control contig are reported only in the per-contig table;
+    /// they contribute to no genome-level metric. Interval restriction never
+    /// applies to control contigs.
     #[arg(long, value_name = "CONTIG", num_args = 1..)]
     pub control_contig: Option<Vec<String>>,
 
@@ -189,14 +190,13 @@ impl Default for MethylOptions {
 /// Collect methylation QC metrics from a bisulfite, EM-seq, TAPS or Illumina
 /// 5-base BAM file.
 ///
-/// Reports how many usable CpG observations the library yielded and where the
-/// rest went, broken down by reason in two funnels: one over sequenced bases
-/// (unmapped, control, QC-fail, duplicate, MAPQ, unaligned, end mask, base
-/// quality, overlap) and one over CpG observations (the same read and base
-/// filters, plus non-informative bases). Also reports CpG depth statistics,
-/// per-context conversion and methylation, per-contig metrics (spike-in
-/// controls included), M-bias, the CpG methylation-level distribution and
-/// retained CpH per read.
+/// Reports how many usable CpG observations the library yielded and why the
+/// rest were excluded (QC-fail, duplicate, MAPQ, end mask, base quality,
+/// non-informative base, mate overlap), normalised per read and per Mb
+/// sequenced. Also reports CpG depth statistics, per-context conversion and
+/// methylation, per-contig metrics (spike-in controls included), M-bias, the
+/// CpG methylation-level distribution and retained CpH per read. Only
+/// cytosine positions are examined; whole-genome coverage is `wgs`'s job.
 ///
 /// The strand each read reports is inferred from its flags, assuming a
 /// directional library: read 1 (or a single-end read) forward and read 2
@@ -251,8 +251,8 @@ impl Command for Methyl {
 
 /// Accumulates methylation QC metrics over a coordinate-sorted BAM, one contig at a time: on
 /// entering a contig it loads the reference and indexes its CpG sites, tallies each read's
-/// bases and cytosine calls, and on leaving the contig folds the per-site depths into the
-/// genome-wide statistics.
+/// cytosine calls, and on leaving the contig folds the per-site depths into the genome-wide
+/// statistics.
 pub struct MethylCollector {
     // Output paths
     metrics_path: PathBuf,
@@ -292,17 +292,14 @@ pub struct MethylCollector {
     // The contig being processed, and the BAM contigs already processed.
     current: Option<ContigState>,
     processed: Vec<bool>,
-    // Reference buffer reused across contigs.
-    sequence_buffer: Vec<u8>,
+    // Reference / context-code buffer reused across contigs.
+    contig_buffer: Vec<u8>,
 
     // Genome-wide accumulators (every non-control contig).
     reads: u64,
     bases_sequenced: u64,
-    bases_unmapped: u64,
-    bases_control: u64,
     genome: Tally,
     cpg_territory: u64,
-    genome_non_n_bases: u64,
     depth_histogram: DepthHistogram,
     beta_histogram: Vec<u64>,
     beta_sum: f64,
@@ -353,14 +350,11 @@ impl MethylCollector {
             mate_buffer: MateBuffer::new(),
             current: None,
             processed: Vec::new(),
-            sequence_buffer: Vec::new(),
+            contig_buffer: Vec::new(),
             reads: 0,
             bases_sequenced: 0,
-            bases_unmapped: 0,
-            bases_control: 0,
             genome: Tally::default(),
             cpg_territory: 0,
-            genome_non_n_bases: 0,
             depth_histogram: DepthHistogram::capped(options.coverage_cap),
             beta_histogram: vec![0; BETA_BINS],
             beta_sum: 0.0,
@@ -380,11 +374,7 @@ impl MethylCollector {
         }
 
         let flags = record.flags();
-        let sequence_len = record.sequence_len() as u64;
         let is_control = self.is_control[ref_id];
-        if is_control {
-            self.bases_control += sequence_len;
-        }
 
         let top_strand = monitors_top_strand(flags);
         let exclusion = if flags.is_qc_fail() {
@@ -401,10 +391,9 @@ impl MethylCollector {
         let contig = self.current.as_mut().unwrap();
         if let Some(exclusion) = exclusion {
             let potential = contig.sites.count_potential(record, start, top_strand);
-            contig.tally.exclude_read(exclusion, sequence_len, potential);
+            contig.tally.exclude_read(exclusion, potential);
             return Ok(());
         }
-        contig.tally.bases.unaligned += sequence_len.saturating_sub(count_aligned_bases(record));
 
         let read = ReadInfo::new(record, start, top_strand, self.masks);
         let evidence = match self.mate_buffer.probe(record) {
@@ -427,15 +416,12 @@ impl MethylCollector {
         Ok(())
     }
 
-    /// Walk a passing read's aligned bases, tallying each into the current contig's base and
-    /// CpG funnels, conversion counts and per-site depths, and (off control contigs) into
-    /// M-bias. Bases are excluded in order: end mask, base quality, then (CpG funnel only)
-    /// non-informative base, then mate overlap. Returns the read's CpH evidence for the
-    /// retained-CpH histogram.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the per-base loop applies every filter, in order, in one place"
-    )]
+    /// Walk a passing read's aligned bases, examining only cytosines: each cytosine on the strand
+    /// the read reports is tallied into the current contig's CpG funnel, conversion counts and
+    /// per-site depths and (off control contigs) M-bias, and each CpH cytosine on the other strand
+    /// into the directionality check. Cytosine calls are excluded in order: end mask, base
+    /// quality, (CpG funnel only) non-informative base, then mate overlap. Returns the read's CpH
+    /// evidence for the retained-CpH histogram.
     fn walk_read<A: OverlapAction>(
         &mut self,
         record: &RikerRecord,
@@ -446,41 +432,56 @@ impl MethylCollector {
         let min_bq = self.min_bq;
         let mbias = &mut self.mbias;
         // `current` is set before any read is walked.
-        let contig = self.current.as_mut().unwrap();
-        let reference = contig.sequence.as_slice();
-        let sites = &mut contig.sites;
-        let tally = &mut contig.tally;
+        let ContigState { contexts, sites, tally, .. } = self.current.as_mut().unwrap();
         let quals = record.quality_scores();
         let bases = record.sequence();
+        let quality_ok = |read_pos: usize| quals.get(read_pos).is_some_and(|&qual| qual >= min_bq);
         let mut evidence = ReadEvidence::default();
         let mut site_cursor = 0usize;
 
         for block in aligned_blocks(record) {
             let block_start = read.ref_start + block.ref_offset as usize;
+            let read_offset = block.read_offset as usize;
+            // A block past the contig end or a CIGAR longer than SEQ is malformed; the bases
+            // beyond either are dropped.
+            let block_end = (block_start + block.len as usize)
+                .min(contexts.len())
+                .min(block_start + bases.len().saturating_sub(read_offset));
+            if block_start >= block_end {
+                continue;
+            }
             site_cursor = sites.seek(site_cursor, block_start.saturating_sub(1));
-            for offset in 0..block.len as usize {
-                let ref_pos = block_start + offset;
-                let read_pos = block.read_offset as usize + offset;
-                // A block past the contig end or a CIGAR longer than SEQ is malformed; the
-                // remaining bases are dropped.
-                if ref_pos >= reference.len() || read_pos >= bases.len() {
-                    break;
-                }
-                let cycle = read.cycle(read_pos);
-                let context = monitored_context(reference, ref_pos, read.top_strand);
-                let call = context.map(|_| call_base(bases[read_pos], read.top_strand));
-                let quality_ok = quals.get(read_pos).is_some_and(|&qual| qual >= min_bq);
 
-                if quality_ok
-                    && !is_control
-                    && let (Some(context), Some(call)) = (context, call)
-                    && call != Call::Other
-                {
+            for offset in 0..block_end - block_start {
+                let ref_pos = block_start + offset;
+                let read_pos = read_offset + offset;
+                let code = contexts[ref_pos];
+                if code == 0 {
+                    continue;
+                }
+                let Some(context) = strand_context(code, read.top_strand) else {
+                    // A CpH cytosine on the other strand: the directionality check.
+                    if strand_context(code, !read.top_strand).is_some_and(|c| c != Context::CpG)
+                        && quality_ok(read_pos)
+                        && !read.is_masked(read.cycle(read_pos))
+                    {
+                        let call = call_base(bases[read_pos], !read.top_strand);
+                        if call != Call::Other {
+                            tally.count_off_strand_call(call);
+                        }
+                    }
+                    continue;
+                };
+                let cycle = read.cycle(read_pos);
+                let call = call_base(bases[read_pos], read.top_strand);
+                let quality_ok = quality_ok(read_pos);
+
+                if quality_ok && !is_control && call != Call::Other {
                     mbias.record(read.role, context == Context::CpG, cycle, call == Call::Retained);
                 }
 
                 // The site index of a CpG cytosine, when that site is in scope.
-                let cpg_site = if context == Some(Context::CpG) {
+                let cpg_site = if context == Context::CpG {
                     let c_pos = if read.top_strand { ref_pos } else { ref_pos - 1 };
                     site_cursor = sites.seek(site_cursor, c_pos);
                     sites.in_scope(site_cursor).then_some(site_cursor)
@@ -489,7 +490,6 @@ impl MethylCollector {
                 };
 
                 if read.is_masked(cycle) {
-                    tally.bases.end_mask += 1;
                     if cpg_site.is_some() {
                         tally.cpg.potential += 1;
                         tally.cpg.end_mask += 1;
@@ -497,7 +497,6 @@ impl MethylCollector {
                     continue;
                 }
                 if !quality_ok {
-                    tally.bases.baseq += 1;
                     if cpg_site.is_some() {
                         tally.cpg.potential += 1;
                         tally.cpg.baseq += 1;
@@ -505,10 +504,7 @@ impl MethylCollector {
                     continue;
                 }
 
-                if let (Some(context), Some(call)) = (context, call)
-                    && context != Context::CpG
-                    && call != Call::Other
-                {
+                if context != Context::CpG && call != Call::Other {
                     evidence.cph_sites += 1;
                     if call == Call::Retained {
                         evidence.retained_cph += 1;
@@ -519,67 +515,57 @@ impl MethylCollector {
                 #[allow(clippy::cast_possible_truncation)]
                 let pos = ref_pos as u32;
                 let covered = action.is_mate_covered(pos);
-                if covered {
-                    tally.bases.overlap += 1;
-                } else {
-                    tally.bases.passing += 1;
+                if !covered {
                     action.on_counted(pos);
                 }
 
-                match (context, call) {
-                    (Some(Context::CpG), Some(call)) => {
-                        if let Some(site) = cpg_site {
-                            tally.cpg.potential += 1;
-                            if call == Call::Other {
-                                tally.cpg.non_informative += 1;
-                            } else if covered {
-                                tally.cpg.overlap += 1;
-                            } else {
-                                tally.cpg.good += 1;
-                                tally.count_call(Context::CpG, call);
-                                sites.count_call(site, call);
-                            }
+                if context == Context::CpG {
+                    if let Some(site) = cpg_site {
+                        tally.cpg.potential += 1;
+                        if call == Call::Other {
+                            tally.cpg.non_informative += 1;
+                        } else if covered {
+                            tally.cpg.overlap += 1;
+                        } else {
+                            tally.cpg.good += 1;
+                            tally.count_call(Context::CpG, call);
+                            sites.count_call(site, call);
                         }
                     }
-                    (Some(context), Some(call)) => {
-                        if call != Call::Other && !covered {
-                            tally.count_call(context, call);
-                        }
-                    }
-                    _ => {
-                        if !covered
-                            && let Some(call) = off_strand_cph_call(
-                                reference,
-                                ref_pos,
-                                bases[read_pos],
-                                read.top_strand,
-                            )
-                        {
-                            tally.count_off_strand_call(call);
-                        }
-                    }
+                } else if call != Call::Other && !covered {
+                    tally.count_call(context, call);
                 }
             }
         }
         evidence
     }
 
-    /// Start contig `ref_id`: load its reference and index its CpG sites, marking which are in
-    /// scope (on a control contig, all of them; otherwise those inside `-L`, or all without it).
+    /// Start contig `ref_id`: load its reference, encode it as context codes, and index its CpG
+    /// sites, marking which are in scope (on a control contig, all of them; otherwise those
+    /// inside `-L`, or all without it).
     ///
     /// # Errors
     /// Returns an error if the contig cannot be read from the reference.
     fn begin_contig(&mut self, ref_id: usize) -> Result<()> {
-        let mut sequence = std::mem::take(&mut self.sequence_buffer);
-        // `dict` is set in `initialize`, which always runs before `accept`.
-        let name = self.dict.as_ref().unwrap()[ref_id].name().to_string();
-        self.reference.load_contig_into(&name, true, &mut sequence)?;
-        let sites = CpgSites::new(&sequence, self.scope_mask(ref_id));
-        let non_n_bases = sequence.len() as u64 - count_n_case_insensitive(&sequence);
+        let contexts = self.load_contexts(ref_id)?;
+        let sites = CpgSites::new(&contexts, self.scope_mask(ref_id));
         self.mate_buffer.clear();
-        self.current =
-            Some(ContigState { ref_id, sequence, sites, tally: Tally::default(), non_n_bases });
+        self.current = Some(ContigState { ref_id, contexts, sites, tally: Tally::default() });
         Ok(())
+    }
+
+    /// Load contig `ref_id`'s reference into the reused buffer and encode it in place as context
+    /// codes.
+    ///
+    /// # Errors
+    /// Returns an error if the contig cannot be read from the reference.
+    fn load_contexts(&mut self, ref_id: usize) -> Result<Vec<u8>> {
+        let mut buffer = std::mem::take(&mut self.contig_buffer);
+        // `dict` is set in `initialize`, which always runs before contigs are loaded.
+        let name = self.dict.as_ref().unwrap()[ref_id].name().to_string();
+        self.reference.load_contig_into(&name, true, &mut buffer)?;
+        encode_contexts(&mut buffer);
+        Ok(buffer)
     }
 
     /// Finish the current contig, if any: fold its per-site depths into the depth and
@@ -608,12 +594,11 @@ impl MethylCollector {
             }
             self.genome.add(&contig.tally);
             self.cpg_territory += contig.sites.n_in_scope;
-            self.genome_non_n_bases += contig.non_n_bases;
         }
         let row = self.contig_row(contig.ref_id, &contig.tally, contig.sites.n_in_scope);
         self.contig_rows.push((contig.ref_id, row));
         self.processed[contig.ref_id] = true;
-        self.sequence_buffer = contig.sequence;
+        self.contig_buffer = contig.contexts;
     }
 
     /// Tally one CpG's methylation level into the methylation-level histogram and summary.
@@ -634,32 +619,29 @@ impl MethylCollector {
     }
 
     /// Account for a contig no mapped read reached: its in-scope CpGs join the territory at depth
-    /// zero, its non-N bases join the genome territory, and it gets an all-zero per-contig row.
+    /// zero, and it gets an all-zero per-contig row.
     ///
     /// # Errors
     /// Returns an error if the contig cannot be read from the reference.
     fn account_unvisited_contig(&mut self, ref_id: usize) -> Result<()> {
         let is_control = self.is_control[ref_id];
-        // A genome contig with no intervals under `-L` has no CpG territory, and its non-N bases
-        // are unused because the CpG:genome ratio is not reported with `-L`; skip reading it.
+        // A genome contig with no intervals under `-L` has no CpG territory; skip reading it.
         let skip_load =
             !is_control && self.intervals.as_ref().is_some_and(|ivl| !ivl.has_contig(ref_id));
-        let (n_in_scope, non_n_bases) = if skip_load {
-            (0, 0)
+        let n_in_scope = if skip_load {
+            0
         } else {
-            let mut sequence = std::mem::take(&mut self.sequence_buffer);
+            let mut sequence = std::mem::take(&mut self.contig_buffer);
             // `dict` is set in `initialize`, which always runs before `finish`.
             let name = self.dict.as_ref().unwrap()[ref_id].name().to_string();
             self.reference.load_contig_into(&name, true, &mut sequence)?;
-            let sites = CpgSites::new(&sequence, self.scope_mask(ref_id));
-            let non_n_bases = sequence.len() as u64 - count_n_case_insensitive(&sequence);
-            self.sequence_buffer = sequence;
-            (sites.n_in_scope, non_n_bases)
+            let n_in_scope = count_cpg_sites(&sequence, self.scope_mask(ref_id).as_ref());
+            self.contig_buffer = sequence;
+            n_in_scope
         };
         if !is_control {
             self.depth_histogram.add_n(0, n_in_scope);
             self.cpg_territory += n_in_scope;
-            self.genome_non_n_bases += non_n_bases;
         }
         let row = self.contig_row(ref_id, &Tally::default(), n_in_scope);
         self.contig_rows.push((ref_id, row));
@@ -684,7 +666,7 @@ impl MethylCollector {
             contig,
             is_control: self.is_control[ref_id],
             cpg_sites,
-            cpg_observations: tally.cpg.good,
+            cpg_obs: tally.cpg.good,
             mean_cpg_depth: safe_div_f(tally.cpg.good as f64, cpg_sites as f64),
             cpg_methylation: tally.methylation(Context::CpG, self.chemistry),
             cph_conversion: tally.cph_conversion(),
@@ -715,7 +697,7 @@ impl MethylCollector {
         self.write_read_conversion()?;
 
         log::info!(
-            "methyl: cpg_territory={}, cpg_observations={}, metrics={}",
+            "methyl: cpg_territory={}, cpg_obs={}, metrics={}",
             self.cpg_territory,
             self.genome.cpg.good,
             self.metrics_path.display(),
@@ -725,86 +707,46 @@ impl MethylCollector {
 
     /// Build the summary metrics row from the genome-wide accumulators.
     fn summary_metrics(&self) -> MethylMetrics {
-        let bases = &self.genome.bases;
-        let bases_excluded = [
-            self.bases_unmapped,
-            self.bases_control,
-            bases.qc_fail,
-            bases.dupe,
-            bases.mapq,
-            bases.unaligned,
-            bases.end_mask,
-            bases.baseq,
-            bases.overlap,
-        ];
-        let bases_total = bases_excluded.iter().sum::<u64>() + bases.passing;
-        let frac_bases = |n: u64| safe_div_f(n as f64, bases_total as f64);
-
         let cpg = &self.genome.cpg;
-        let frac_cpg = |n: u64| safe_div_f(n as f64, cpg.potential as f64);
-
+        let frac_excluded = |n: u64| safe_div_f(n as f64, cpg.potential as f64);
         let (mean, sd) = self.depth_histogram.mean_and_sd();
         let (median, mad) = self.depth_histogram.median_and_mad();
         let frac_at = |depth: usize| self.depth_histogram.frac_at_or_above(depth);
-
-        let cpg_to_genome_depth_ratio = if self.intervals.is_none() {
-            let cpg_depth = safe_div_f(cpg.good as f64, self.cpg_territory as f64);
-            let genome_depth = safe_div_f(bases.passing as f64, self.genome_non_n_bases as f64);
-            (genome_depth > 0.0).then(|| cpg_depth / genome_depth)
-        } else {
-            None
-        };
-
         let beta_sites: u64 = self.beta_histogram.iter().sum();
-        let reads_with_cph: u64 = self.retained_cph_histogram.iter().sum();
-        let reads_flagged: u64 =
-            self.retained_cph_histogram[RETAINED_CPH_FLAG_THRESHOLD..].iter().sum();
 
         MethylMetrics {
             sample: self.sample.clone(),
             chemistry: self.chemistry.to_string(),
             reads: self.reads,
             bases_sequenced: self.bases_sequenced,
-            bases_passing: bases.passing,
-            frac_bases_excluded_unmapped: frac_bases(self.bases_unmapped),
-            frac_bases_excluded_control: frac_bases(self.bases_control),
-            frac_bases_excluded_qc_fail: frac_bases(bases.qc_fail),
-            frac_bases_excluded_dupe: frac_bases(bases.dupe),
-            frac_bases_excluded_mapq: frac_bases(bases.mapq),
-            frac_bases_excluded_unaligned: frac_bases(bases.unaligned),
-            frac_bases_excluded_end_mask: frac_bases(bases.end_mask),
-            frac_bases_excluded_baseq: frac_bases(bases.baseq),
-            frac_bases_excluded_overlap: frac_bases(bases.overlap),
-            frac_bases_excluded_total: frac_bases(bases_excluded.iter().sum()),
             cpg_territory: self.cpg_territory,
-            cpg_observations_potential: cpg.potential,
-            cpg_observations: cpg.good,
-            cpg_observations_per_read: safe_div_f(cpg.good as f64, self.reads as f64),
-            cpg_observations_per_mb: safe_div_f(
+            cpg_obs_potential: cpg.potential,
+            cpg_obs: cpg.good,
+            cpg_obs_per_read: safe_div_f(cpg.good as f64, self.reads as f64),
+            cpg_obs_per_mb_sequenced: safe_div_f(
                 cpg.good as f64,
                 self.bases_sequenced as f64 / 1_000_000.0,
             ),
-            frac_cpg_obs_excluded_qc_fail: frac_cpg(cpg.qc_fail),
-            frac_cpg_obs_excluded_dupe: frac_cpg(cpg.dupe),
-            frac_cpg_obs_excluded_mapq: frac_cpg(cpg.mapq),
-            frac_cpg_obs_excluded_end_mask: frac_cpg(cpg.end_mask),
-            frac_cpg_obs_excluded_baseq: frac_cpg(cpg.baseq),
-            frac_cpg_obs_excluded_non_informative: frac_cpg(cpg.non_informative),
-            frac_cpg_obs_excluded_overlap: frac_cpg(cpg.overlap),
-            frac_cpg_obs_excluded_total: frac_cpg(cpg.potential - cpg.good),
             mean_cpg_depth: mean,
             sd_cpg_depth: sd,
             median_cpg_depth: median,
             mad_cpg_depth: mad,
+            frac_excluded_qc_fail: frac_excluded(cpg.qc_fail),
+            frac_excluded_dupe: frac_excluded(cpg.dupe),
+            frac_excluded_mapq: frac_excluded(cpg.mapq),
+            frac_excluded_end_mask: frac_excluded(cpg.end_mask),
+            frac_excluded_baseq: frac_excluded(cpg.baseq),
+            frac_excluded_non_informative: frac_excluded(cpg.non_informative),
+            frac_excluded_overlap: frac_excluded(cpg.overlap),
+            frac_excluded_total: frac_excluded(cpg.potential - cpg.good),
             frac_cpgs_at_1x: frac_at(1),
             frac_cpgs_at_5x: frac_at(5),
             frac_cpgs_at_10x: frac_at(10),
             frac_cpgs_at_15x: frac_at(15),
             frac_cpgs_at_20x: frac_at(20),
             frac_cpgs_at_30x: frac_at(30),
-            fold_80_cpg_penalty: self.depth_histogram.fold_penalty(mean, 0.20),
-            cpg_to_genome_depth_ratio,
             cpg_methylation: self.genome.methylation(Context::CpG, self.chemistry),
+            cpg_conversion: self.genome.conversion(Context::CpG),
             cpa_conversion: self.genome.conversion(Context::CpA),
             cpc_conversion: self.genome.conversion(Context::CpC),
             cpt_conversion: self.genome.conversion(Context::CpT),
@@ -820,8 +762,6 @@ impl MethylCollector {
                 beta_sites as f64,
             ),
             frac_cpgs_beta_high: safe_div_f(self.beta_high as f64, beta_sites as f64),
-            frac_reads_cph_retained_ge_3: (!self.chemistry.methylated_converts())
-                .then(|| safe_div_f(reads_flagged as f64, reads_with_cph as f64)),
         }
     }
 
@@ -850,11 +790,29 @@ impl MethylCollector {
         let (mean, _) = self.depth_histogram.mean_and_sd();
         self.depth_histogram.plot_pdf(
             mean,
-            &format!("CpG Depth Distribution of {}", self.sample),
+            "CpG Depth Distribution",
+            Some(&format!("{} · {}", self.sample, self.filter_summary())),
             "CpG Depth (X)",
             "Fraction of CpGs",
             &self.coverage_plot_path,
         )
+    }
+
+    /// A one-line summary of the filters behind each CpG observation, for plot subtitles.
+    fn filter_summary(&self) -> String {
+        let mut parts = vec![format!("MAPQ ≥ {}", self.min_mapq), format!("BQ ≥ {}", self.min_bq)];
+        if self.include_duplicates {
+            parts.push("duplicates included".to_string());
+        }
+        let masks = self.masks;
+        if masks.r1_5p + masks.r1_3p + masks.r2_5p + masks.r2_3p > 0 {
+            parts.push(format!(
+                "masks R1 {}/{}, R2 {}/{}",
+                masks.r1_5p, masks.r1_3p, masks.r2_5p, masks.r2_3p
+            ));
+        }
+        parts.push(format!("depth capped at {}", self.depth_histogram.counts().len() - 1));
+        parts.join(", ")
     }
 
     /// Write the M-bias table and plot.
@@ -944,7 +902,8 @@ impl MethylCollector {
         // chemistry, so fit it to the data.
         let y2_pad = ((cph_max - cph_min) * 0.1).max(0.005);
         let layout = standard_layout(if primary.is_empty() { &secondary } else { &primary })
-            .with_title(format!("M-bias of {}", self.sample))
+            .with_title("M-bias")
+            .with_subtitle(self.sample.clone())
             .with_x_label("Cycle")
             .with_y_label("CpG Methylation")
             .with_y2_label("CpH Methylation")
@@ -984,10 +943,8 @@ impl MethylCollector {
                 .into(),
         ];
         let layout = standard_layout(&plots)
-            .with_title(format!(
-                "CpG Methylation Levels of {} (depth ≥ {})",
-                self.sample, self.min_beta_depth
-            ))
+            .with_title("CpG Methylation Levels")
+            .with_subtitle(format!("{} · CpGs at depth ≥ {}", self.sample, self.min_beta_depth))
             .with_x_label("Methylation Level")
             .with_y_label("Fraction of CpGs")
             .with_x_axis_min(0.0)
@@ -1048,17 +1005,14 @@ impl Collector for MethylCollector {
             return Ok(());
         }
         self.reads += 1;
-        let sequence_len = record.sequence_len() as u64;
-        self.bases_sequenced += sequence_len;
+        self.bases_sequenced += record.sequence_len() as u64;
 
         let (Some(ref_id), Some(start)) =
             (record.reference_sequence_id(), record.alignment_start())
         else {
-            self.bases_unmapped += sequence_len;
             return Ok(());
         };
         if flags.is_unmapped() {
-            self.bases_unmapped += sequence_len;
             return Ok(());
         }
         // Positions fit in u32 for every supported reference.
@@ -1082,7 +1036,7 @@ impl Collector for MethylCollector {
     }
 
     /// Relative per-record worker cost (see [`Collector::cost_hint`]). Not yet measured; set
-    /// to `wgs`'s because both walk every aligned base with mate-overlap deduplication.
+    /// to `wgs`'s, whose per-read walk with mate-overlap deduplication is similar.
     fn cost_hint(&self) -> u32 {
         70
     }
@@ -1100,86 +1054,24 @@ pub struct MethylMetrics {
     /// Primary records (not secondary or supplementary), mapped or not. A BAM with unmapped
     /// reads removed understates this.
     pub reads: u64,
-    /// Sum of the stored sequence lengths of primary records; soft-clipped bases count,
-    /// hard-clipped bases do not.
+    /// Sum of the stored sequence lengths of primary records: the sequence data in the BAM.
+    /// Soft-clipped bases count; hard-clipped bases do not.
     pub bases_sequenced: u64,
-    /// Aligned bases on genome contigs that passed every filter: the base-level funnel's
-    /// remainder.
-    pub bases_passing: u64,
-    /// Fraction of sequenced bases in unmapped reads.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_unmapped: f64,
-    /// Fraction of sequenced bases in reads aligned to a control contig.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_control: f64,
-    /// Fraction of sequenced bases in reads flagged QC-fail (e.g. unconverted templates
-    /// flagged by methylsieve).
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_qc_fail: f64,
-    /// Fraction of sequenced bases in reads marked as duplicates.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_dupe: f64,
-    /// Fraction of sequenced bases in reads below the minimum mapping quality, assessed after
-    /// QC-fail and duplicates.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_mapq: f64,
-    /// Fraction of sequenced bases of passing reads not aligned to the reference: soft clips
-    /// and insertions.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_unaligned: f64,
-    /// Fraction of sequenced bases excluded by the end masks (`--mask-*`).
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_end_mask: f64,
-    /// Fraction of sequenced bases below the minimum base quality.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_baseq: f64,
-    /// Fraction of sequenced bases at positions the overlapping mate already counted.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_overlap: f64,
-    /// Fraction of sequenced bases excluded for any reason.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_bases_excluded_total: f64,
     /// Number of reference CpG sites in the territory (both strands of a CpG are one site).
     pub cpg_territory: u64,
     /// Read bases aligned to the cytosine of a territory CpG on the strand the read reports,
     /// before any filter.
-    pub cpg_observations_potential: u64,
+    pub cpg_obs_potential: u64,
     /// Potential CpG observations that passed every filter and read C or T (G or A on the
     /// bottom strand).
-    pub cpg_observations: u64,
+    pub cpg_obs: u64,
     /// Good CpG observations per primary read.
     #[serde(serialize_with = "serialize_f64_5dp")]
-    pub cpg_observations_per_read: f64,
-    /// Good CpG observations per million sequenced bases.
+    pub cpg_obs_per_read: f64,
+    /// Good CpG observations per million bases of sequence data (`bases_sequenced`), not per
+    /// megabase of genome.
     #[serde(serialize_with = "serialize_f64_2dp")]
-    pub cpg_observations_per_mb: f64,
-    /// Fraction of potential CpG observations in QC-fail reads.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_qc_fail: f64,
-    /// Fraction of potential CpG observations in duplicate reads.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_dupe: f64,
-    /// Fraction of potential CpG observations in reads below the minimum mapping quality,
-    /// assessed after QC-fail and duplicates. The loss among non-duplicate data is this
-    /// divided by `1 - frac_cpg_obs_excluded_qc_fail - frac_cpg_obs_excluded_dupe`.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_mapq: f64,
-    /// Fraction of potential CpG observations excluded by the end masks.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_end_mask: f64,
-    /// Fraction of potential CpG observations below the minimum base quality.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_baseq: f64,
-    /// Fraction of potential CpG observations whose base was neither C nor T (G nor A on the
-    /// bottom strand): a variant or sequencing error.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_non_informative: f64,
-    /// Fraction of potential CpG observations at positions the overlapping mate already counted.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_overlap: f64,
-    /// Fraction of potential CpG observations excluded for any reason.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub frac_cpg_obs_excluded_total: f64,
+    pub cpg_obs_per_mb_sequenced: f64,
     /// Mean CpG depth (good observations per territory CpG, capped at `--coverage-cap`).
     #[serde(serialize_with = "serialize_f64_2dp")]
     pub mean_cpg_depth: f64,
@@ -1192,6 +1084,34 @@ pub struct MethylMetrics {
     /// Median absolute deviation of CpG depth.
     #[serde(serialize_with = "serialize_f64_2dp")]
     pub mad_cpg_depth: f64,
+    /// Fraction of potential CpG observations in QC-fail reads (e.g. unconverted templates
+    /// flagged by methylsieve).
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_qc_fail: f64,
+    /// Fraction of potential CpG observations in duplicate reads.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_dupe: f64,
+    /// Fraction of potential CpG observations in reads below the minimum mapping quality,
+    /// assessed after QC-fail and duplicates. The loss among non-duplicate data is this
+    /// divided by `1 - frac_excluded_qc_fail - frac_excluded_dupe`.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_mapq: f64,
+    /// Fraction of potential CpG observations excluded by the end masks (`--mask-*`).
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_end_mask: f64,
+    /// Fraction of potential CpG observations below the minimum base quality.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_baseq: f64,
+    /// Fraction of potential CpG observations whose base was neither C nor T (G nor A on the
+    /// bottom strand): a variant or sequencing error.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_non_informative: f64,
+    /// Fraction of potential CpG observations at positions the overlapping mate already counted.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_overlap: f64,
+    /// Fraction of potential CpG observations excluded for any reason.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub frac_excluded_total: f64,
     /// Fraction of territory CpGs with depth ≥ 1.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_cpgs_at_1x: f64,
@@ -1210,16 +1130,14 @@ pub struct MethylMetrics {
     /// Fraction of territory CpGs with depth ≥ 30.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_cpgs_at_30x: f64,
-    /// Mean CpG depth divided by its 20th percentile.
-    #[serde(serialize_with = "serialize_f64_5dp")]
-    pub fold_80_cpg_penalty: f64,
-    /// Uncapped mean CpG depth divided by the mean depth of passing bases over the non-N genome.
-    /// With strands merged, 1.0 means no CpG-specific loss. Empty when `-L` is given.
-    #[serde(serialize_with = "serialize_opt_f64_5dp")]
-    pub cpg_to_genome_depth_ratio: Option<f64>,
     /// Fraction of good territory CpG observations that were methylated.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub cpg_methylation: f64,
+    /// Fraction of good territory CpG observations read as T (A on the bottom strand). Under
+    /// em-seq / bisulfite this is `1 - cpg_methylation`; under taps / illumina-5base it equals
+    /// `cpg_methylation`.
+    #[serde(serialize_with = "serialize_f64_5dp")]
+    pub cpg_conversion: f64,
     /// Fraction of CpA observations read as T. Under em-seq / bisulfite this is the conversion
     /// rate; under taps / illumina-5base it is the false-conversion rate.
     #[serde(serialize_with = "serialize_f64_5dp")]
@@ -1234,27 +1152,23 @@ pub struct MethylMetrics {
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub cph_conversion: f64,
     /// Fraction of CpH cytosines on the strand a read does *not* report that it shows as
-    /// converted. Near the sequencing error rate for a directional library; a high value means
-    /// the library is not directional.
+    /// converted, counting both mates of an overlapping pair. Near the sequencing error rate for
+    /// a directional library; a high value means the library is not directional.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub off_strand_cph_conversion: f64,
-    /// Mean methylation level of territory CpGs at depth ≥ `--min-beta-depth`.
+    /// Mean methylation level (β, the methylated fraction of a CpG's good observations) of
+    /// territory CpGs at depth ≥ `--min-beta-depth`.
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub mean_cpg_beta: f64,
-    /// Fraction of those CpGs with methylation level below 0.2.
+    /// Fraction of those CpGs with β < 0.2 (largely unmethylated).
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_cpgs_beta_low: f64,
-    /// Fraction of those CpGs with methylation level from 0.2 to 0.8.
+    /// Fraction of those CpGs with 0.2 ≤ β ≤ 0.8 (partially methylated).
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_cpgs_beta_intermediate: f64,
-    /// Fraction of those CpGs with methylation level above 0.8.
+    /// Fraction of those CpGs with β > 0.8 (largely methylated).
     #[serde(serialize_with = "serialize_f64_5dp")]
     pub frac_cpgs_beta_high: f64,
-    /// Fraction of passing reads with at least one CpH call that retained three or more CpH,
-    /// a sign of failed conversion. Empty under taps / illumina-5base, where unmethylated CpH
-    /// is expected to read as C.
-    #[serde(serialize_with = "serialize_opt_f64_5dp")]
-    pub frac_reads_cph_retained_ge_3: Option<f64>,
 }
 
 /// One depth bin of the CpG depth histogram.
@@ -1289,7 +1203,7 @@ pub struct MethylContigMetric {
     /// Number of CpG sites on the contig in scope (inside `-L` for genome contigs).
     pub cpg_sites: u64,
     /// Good CpG observations on the contig.
-    pub cpg_observations: u64,
+    pub cpg_obs: u64,
     /// Good CpG observations per CpG site.
     #[serde(serialize_with = "serialize_f64_2dp")]
     pub mean_cpg_depth: f64,
@@ -1399,12 +1313,10 @@ impl fmt::Display for Chemistry {
 /// The contig being processed: its reference, CpG sites and tallies.
 struct ContigState {
     ref_id: usize,
-    /// Upper-cased reference sequence.
-    sequence: Vec<u8>,
+    /// One context code per reference position (see [`encode_contexts`]).
+    contexts: Vec<u8>,
     sites: CpgSites,
     tally: Tally,
-    /// Reference bases other than N.
-    non_n_bases: u64,
 }
 
 /// The CpG sites of one contig, with per-site call counts (both strands merged).
@@ -1422,15 +1334,16 @@ struct CpgSites {
 }
 
 impl CpgSites {
-    /// Index the CpG sites of `sequence` (upper-cased). With a `scope_mask` over the contig's
-    /// positions, a site is in scope when its C is set in the mask.
-    fn new(sequence: &[u8], scope_mask: Option<BitVec>) -> Self {
+    /// Index the CpG sites of a contig from its context codes: a site per top-strand CpG
+    /// cytosine. With a `scope_mask` over the contig's positions, a site is in scope when its C
+    /// is set in the mask.
+    fn new(contexts: &[u8], scope_mask: Option<BitVec>) -> Self {
         // Positions fit in u32 for every supported reference.
         #[allow(clippy::cast_possible_truncation)]
-        let positions: Vec<u32> = sequence
-            .windows(2)
+        let positions: Vec<u32> = contexts
+            .iter()
             .enumerate()
-            .filter(|(_, pair)| pair == b"CG")
+            .filter(|&(_, &code)| strand_context(code, true) == Some(Context::CpG))
             .map(|(pos, _)| pos as u32)
             .collect();
         let in_scope: Option<BitVec> = scope_mask.map(|mask| {
@@ -1496,7 +1409,6 @@ impl CpgSites {
 /// Counts for one contig (or, summed, the genome).
 #[derive(Debug, Default, Clone)]
 struct Tally {
-    bases: BaseFunnel,
     cpg: CpgFunnel,
     /// Good calls that read unconverted, by [`Context`] (CpG counted only at in-scope sites).
     retained: [u64; 4],
@@ -1509,23 +1421,13 @@ struct Tally {
 }
 
 impl Tally {
-    /// Exclude a whole read: its sequenced bases and its potential CpG observations go to the
-    /// read-level category.
-    fn exclude_read(&mut self, exclusion: ReadExclusion, bases: u64, potential: u64) {
+    /// Exclude a whole read: its potential CpG observations go to the read-level category.
+    fn exclude_read(&mut self, exclusion: ReadExclusion, potential: u64) {
         self.cpg.potential += potential;
         match exclusion {
-            ReadExclusion::QcFail => {
-                self.bases.qc_fail += bases;
-                self.cpg.qc_fail += potential;
-            }
-            ReadExclusion::Duplicate => {
-                self.bases.dupe += bases;
-                self.cpg.dupe += potential;
-            }
-            ReadExclusion::Mapq => {
-                self.bases.mapq += bases;
-                self.cpg.mapq += potential;
-            }
+            ReadExclusion::QcFail => self.cpg.qc_fail += potential,
+            ReadExclusion::Duplicate => self.cpg.dupe += potential,
+            ReadExclusion::Mapq => self.cpg.mapq += potential,
         }
     }
 
@@ -1576,7 +1478,6 @@ impl Tally {
 
     /// Add `other`'s counts to these.
     fn add(&mut self, other: &Tally) {
-        self.bases.add(&other.bases);
         self.cpg.add(&other.cpg);
         for context in 0..4 {
             self.retained[context] += other.retained[context];
@@ -1584,33 +1485,6 @@ impl Tally {
         }
         self.off_strand_retained += other.off_strand_retained;
         self.off_strand_converted += other.off_strand_converted;
-    }
-}
-
-/// Sequenced bases of mapped primary reads by the category that excluded them, or `passing`.
-#[derive(Debug, Default, Clone)]
-struct BaseFunnel {
-    qc_fail: u64,
-    dupe: u64,
-    mapq: u64,
-    unaligned: u64,
-    end_mask: u64,
-    baseq: u64,
-    overlap: u64,
-    passing: u64,
-}
-
-impl BaseFunnel {
-    /// Add `other`'s counts to these.
-    fn add(&mut self, other: &BaseFunnel) {
-        self.qc_fail += other.qc_fail;
-        self.dupe += other.dupe;
-        self.mapq += other.mapq;
-        self.unaligned += other.unaligned;
-        self.end_mask += other.end_mask;
-        self.baseq += other.baseq;
-        self.overlap += other.overlap;
-        self.passing += other.passing;
     }
 }
 
@@ -1767,6 +1641,19 @@ enum Context {
     CpT = 3,
 }
 
+impl Context {
+    /// The context a strand field of a context code holds, or `None` for 0 (no cytosine).
+    fn from_field(field: u8) -> Option<Context> {
+        match field {
+            1 => Some(Context::CpA),
+            2 => Some(Context::CpC),
+            3 => Some(Context::CpG),
+            4 => Some(Context::CpT),
+            _ => None,
+        }
+    }
+}
+
 /// A read's base at a cytosine it reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
@@ -1835,34 +1722,59 @@ fn monitors_top_strand(flags: Flags) -> bool {
     flags.is_reverse_complemented() == (flags.is_segmented() && flags.is_last_segment())
 }
 
-/// The context of the cytosine at 0-based `pos` on the reported strand, or `None` if there is
-/// no cytosine there on that strand or its neighbour is not A, C, G or T. A top-strand cytosine
-/// is a reference C followed by its next base; a bottom-strand cytosine is a reference G,
-/// whose next base on the bottom strand is the complement of the preceding reference base.
-fn monitored_context(reference: &[u8], pos: usize, top_strand: bool) -> Option<Context> {
-    if top_strand {
-        if reference[pos] != b'C' {
-            return None;
-        }
-        match reference.get(pos + 1)? {
-            b'A' => Some(Context::CpA),
-            b'C' => Some(Context::CpC),
-            b'G' => Some(Context::CpG),
-            b'T' => Some(Context::CpT),
-            _ => None,
-        }
-    } else {
-        if reference[pos] != b'G' || pos == 0 {
-            return None;
-        }
-        match reference[pos - 1] {
-            b'T' => Some(Context::CpA),
-            b'G' => Some(Context::CpC),
-            b'C' => Some(Context::CpG),
-            b'A' => Some(Context::CpT),
-            _ => None,
-        }
+/// Encode `sequence` (upper-cased reference) in place as one context code per position. The low
+/// three bits hold the context of a top-strand cytosine (a reference C, by its next base), the
+/// next three bits that of a bottom-strand cytosine (a reference G, by the complement of its
+/// preceding base); each field is 0 when there is no cytosine on that strand or its neighbour is
+/// not A, C, G or T. At most one field is set, so a code of 0 means no cytosine at all.
+fn encode_contexts(sequence: &mut [u8]) {
+    let mut previous = b'N';
+    for pos in 0..sequence.len() {
+        let current = sequence[pos];
+        let next = sequence.get(pos + 1).copied().unwrap_or(b'N');
+        // Branch-free: each table yields 0 unless `current` is the cytosine it applies to.
+        sequence[pos] = (TOP_FIELD_BY_NEXT[usize::from(next)] * u8::from(current == b'C'))
+            | (BOTTOM_FIELD_BY_PREVIOUS[usize::from(previous)] * u8::from(current == b'G'));
+        previous = current;
     }
+}
+
+/// The top-strand field of a context code for a reference C, by the base that follows it.
+const TOP_FIELD_BY_NEXT: [u8; 256] = {
+    let mut table = [0u8; 256];
+    table[b'A' as usize] = 1;
+    table[b'C' as usize] = 2;
+    table[b'G' as usize] = 3;
+    table[b'T' as usize] = 4;
+    table
+};
+
+/// The bottom-strand field of a context code (already shifted) for a reference G, by the base
+/// before it: the bottom strand reads its complement next.
+const BOTTOM_FIELD_BY_PREVIOUS: [u8; 256] = {
+    let mut table = [0u8; 256];
+    table[b'T' as usize] = 1 << BOTTOM_SHIFT;
+    table[b'G' as usize] = 2 << BOTTOM_SHIFT;
+    table[b'C' as usize] = 3 << BOTTOM_SHIFT;
+    table[b'A' as usize] = 4 << BOTTOM_SHIFT;
+    table
+};
+
+/// The number of CpG sites in `sequence` (upper-cased reference), or of those whose C is set in
+/// `scope_mask` when one is given.
+fn count_cpg_sites(sequence: &[u8], scope_mask: Option<&BitVec>) -> u64 {
+    let cpgs = sequence.windows(2).enumerate().filter(|(_, pair)| *pair == b"CG");
+    match scope_mask {
+        None => cpgs.count() as u64,
+        Some(mask) => cpgs.filter(|&(pos, _)| mask.get(pos).is_some_and(|bit| *bit)).count() as u64,
+    }
+}
+
+/// The context of the cytosine a context code records on one strand, if any.
+fn strand_context(code: u8, top_strand: bool) -> Option<Context> {
+    let field =
+        if top_strand { code & CONTEXT_MASK } else { (code >> BOTTOM_SHIFT) & CONTEXT_MASK };
+    Context::from_field(field)
 }
 
 /// Classify a read base at a cytosine on the reported strand.
@@ -1872,18 +1784,6 @@ fn call_base(base: u8, top_strand: bool) -> Call {
         (b'T', true) | (b'A', false) => Call::Converted,
         _ => Call::Other,
     }
-}
-
-/// The call at a CpH cytosine on the strand the read does *not* report, if the reference has
-/// one at 0-based `pos`: a reference G not preceded by C for a top-strand read, or a reference C
-/// not followed by G for a bottom-strand read.
-fn off_strand_cph_call(reference: &[u8], pos: usize, base: u8, top_strand: bool) -> Option<Call> {
-    let off_strand_cph = if top_strand {
-        reference[pos] == b'G' && pos > 0 && matches!(reference[pos - 1], b'A' | b'G' | b'T')
-    } else {
-        reference[pos] == b'C' && matches!(reference.get(pos + 1), Some(b'A' | b'C' | b'T'))
-    };
-    off_strand_cph.then(|| call_base(base, !top_strand)).filter(|&call| call != Call::Other)
 }
 
 /// The 95% Agresti–Coull interval on a proportion of `successes` in `total` trials, clamped to
@@ -1916,31 +1816,55 @@ mod tests {
         assert!(!monitors_top_strand(Flags::REVERSE_COMPLEMENTED));
     }
 
+    /// The contexts `encode_contexts` records at each position of `sequence` on one strand.
+    fn strand_contexts(sequence: &[u8], top_strand: bool) -> Vec<Option<Context>> {
+        let mut codes = sequence.to_vec();
+        encode_contexts(&mut codes);
+        codes.iter().map(|&code| strand_context(code, top_strand)).collect()
+    }
+
     #[test]
     fn top_strand_context_comes_from_the_next_reference_base() {
-        let reference = b"CACCCGCTCN";
-        assert_eq!(monitored_context(reference, 0, true), Some(Context::CpA));
-        assert_eq!(monitored_context(reference, 2, true), Some(Context::CpC));
-        assert_eq!(monitored_context(reference, 4, true), Some(Context::CpG));
-        assert_eq!(monitored_context(reference, 6, true), Some(Context::CpT));
-        assert_eq!(monitored_context(reference, 8, true), None);
-        assert_eq!(monitored_context(reference, 1, true), None);
+        let contexts = strand_contexts(b"CACCCGCTCN", true);
+        assert_eq!(contexts[0], Some(Context::CpA));
+        assert_eq!(contexts[2], Some(Context::CpC));
+        assert_eq!(contexts[4], Some(Context::CpG));
+        assert_eq!(contexts[6], Some(Context::CpT));
+        assert_eq!(contexts[8], None);
+        assert_eq!(contexts[1], None);
     }
 
     #[test]
     fn bottom_strand_context_comes_from_the_complement_of_the_previous_base() {
-        let reference = b"TGGGCGAGNG";
-        assert_eq!(monitored_context(reference, 1, false), Some(Context::CpA));
-        assert_eq!(monitored_context(reference, 2, false), Some(Context::CpC));
-        assert_eq!(monitored_context(reference, 5, false), Some(Context::CpG));
-        assert_eq!(monitored_context(reference, 7, false), Some(Context::CpT));
-        assert_eq!(monitored_context(reference, 9, false), None);
-        assert_eq!(monitored_context(b"GA", 0, false), None);
+        let contexts = strand_contexts(b"TGGGCGAGNG", false);
+        assert_eq!(contexts[1], Some(Context::CpA));
+        assert_eq!(contexts[2], Some(Context::CpC));
+        assert_eq!(contexts[5], Some(Context::CpG));
+        assert_eq!(contexts[7], Some(Context::CpT));
+        assert_eq!(contexts[9], None);
+        assert_eq!(strand_contexts(b"GA", false)[0], None);
     }
 
     #[test]
     fn context_at_the_contig_end_is_unknown() {
-        assert_eq!(monitored_context(b"AC", 1, true), None);
+        assert_eq!(strand_contexts(b"AC", true)[1], None);
+    }
+
+    #[test]
+    fn count_cpg_sites_counts_cg_dinucleotides_in_scope() {
+        assert_eq!(count_cpg_sites(b"ACGTTCGCG", None), 3);
+        let mut mask = bitvec![0; 9];
+        mask.set(5, true);
+        assert_eq!(count_cpg_sites(b"ACGTTCGCG", Some(&mask)), 1);
+    }
+
+    #[test]
+    fn a_position_records_a_cytosine_on_at_most_one_strand() {
+        let mut codes = b"ACGTNacgt".to_ascii_uppercase();
+        encode_contexts(&mut codes);
+        for code in codes {
+            assert!(strand_context(code, true).is_none() || strand_context(code, false).is_none());
+        }
     }
 
     #[test]
@@ -1953,21 +1877,15 @@ mod tests {
         assert_eq!(call_base(b'T', false), Call::Other);
     }
 
-    #[test]
-    fn off_strand_call_uses_the_other_strands_cph_cytosines() {
-        // Top-strand read at a reference G preceded by A: a bottom-strand CpT.
-        assert_eq!(off_strand_cph_call(b"AG", 1, b'A', true), Some(Call::Converted));
-        assert_eq!(off_strand_cph_call(b"AG", 1, b'G', true), Some(Call::Retained));
-        // A G preceded by C is a CpG, which is excluded.
-        assert_eq!(off_strand_cph_call(b"CG", 1, b'A', true), None);
-        // Bottom-strand read at a reference C followed by A.
-        assert_eq!(off_strand_cph_call(b"CA", 0, b'T', false), Some(Call::Converted));
-        assert_eq!(off_strand_cph_call(b"CG", 0, b'T', false), None);
+    fn encoded(sequence: &[u8]) -> Vec<u8> {
+        let mut codes = sequence.to_vec();
+        encode_contexts(&mut codes);
+        codes
     }
 
     #[test]
     fn cpg_sites_index_every_cg_dinucleotide() {
-        let sites = CpgSites::new(b"ACGTTCGCG", None);
+        let sites = CpgSites::new(&encoded(b"ACGTTCGCG"), None);
         assert_eq!(sites.positions, vec![1, 5, 7]);
         assert_eq!(sites.n_in_scope, 3);
     }
@@ -1977,7 +1895,7 @@ mod tests {
         let mut mask = bitvec![0; 9];
         mask.set(5, true);
         mask.set(8, true);
-        let sites = CpgSites::new(b"ACGTTCGCG", Some(mask));
+        let sites = CpgSites::new(&encoded(b"ACGTTCGCG"), Some(mask));
         assert_eq!(sites.n_in_scope, 1);
         assert!(!sites.in_scope(0));
         assert!(sites.in_scope(1));
@@ -1986,7 +1904,7 @@ mod tests {
 
     #[test]
     fn seek_finds_the_first_site_at_or_after_a_position() {
-        let sites = CpgSites::new(b"ACGTTCGCG", None);
+        let sites = CpgSites::new(&encoded(b"ACGTTCGCG"), None);
         assert_eq!(sites.seek(0, 0), 0);
         assert_eq!(sites.seek(0, 2), 1);
         assert_eq!(sites.seek(1, 7), 2);

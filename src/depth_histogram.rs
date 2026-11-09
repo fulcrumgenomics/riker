@@ -170,8 +170,9 @@ impl DepthHistogram {
 
     /// Write a PDF area chart of the distribution to `path`: the fraction of positions at each
     /// depth, up to the 99.9th-percentile depth so the long tail is trimmed, with a Poisson
-    /// distribution at `mean` (scaled to the covered fraction) overlaid as a dashed line.
-    /// Writes nothing when nothing is tallied or every position is at depth 0.
+    /// distribution at `mean` (scaled to the covered fraction) overlaid as a dashed line, and an
+    /// optional subtitle under the title. Writes nothing when nothing is tallied or every
+    /// position is at depth 0.
     ///
     /// # Errors
     /// Returns an error if the plot cannot be rendered or written.
@@ -179,6 +180,7 @@ impl DepthHistogram {
         &self,
         mean: f64,
         title: &str,
+        subtitle: Option<&str>,
         x_label: &str,
         y_label: &str,
         path: &Path,
@@ -224,8 +226,11 @@ impl DepthHistogram {
             .with_legend("Theoretical");
         let plots: Vec<Plot> = vec![observed.into(), theoretical.into()];
 
-        let layout = standard_layout(&plots)
-            .with_title(title)
+        let mut layout = standard_layout(&plots).with_title(title);
+        if let Some(subtitle) = subtitle {
+            layout = layout.with_subtitle(subtitle);
+        }
+        let layout = layout
             .with_x_label(x_label)
             .with_y_label(y_label)
             .with_minor_ticks(5)

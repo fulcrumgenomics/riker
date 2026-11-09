@@ -410,7 +410,7 @@ fn test_matches_standalone_methyl() -> Result<()> {
     let standalone = std::fs::read_to_string(out_path(&prefix_standalone, METHYL_SUFFIX))?;
     assert_eq!(multi, standalone);
     let metrics: Vec<MethylMetrics> = read_metrics_tsv(&out_path(&prefix_multi, METHYL_SUFFIX))?;
-    assert!(metrics[0].cpg_observations > 0);
+    assert!(metrics[0].cpg_obs > 0);
     assert_close!(metrics[0].cpg_methylation, 1.0);
     Ok(())
 }
