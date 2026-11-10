@@ -23,6 +23,9 @@ use riker_lib::commands::hybcap::{
 use riker_lib::commands::isize::{
     InsertSizeMetric, METRICS_SUFFIX as ISIZE_SUFFIX, MultiIsizeOptions,
 };
+use riker_lib::commands::methyl::{
+    METRICS_SUFFIX as METHYL_SUFFIX, Methyl, MethylMetrics, MethylOptions,
+};
 use riker_lib::commands::multi::{CollectorKind, Multi};
 use riker_lib::commands::rna::{METRICS_SUFFIX as RNA_METRICS_SUFFIX, RnaOptions, RnaSeqMetric};
 use riker_lib::commands::wgs::{
@@ -31,7 +34,7 @@ use riker_lib::commands::wgs::{
     WgsOptions,
 };
 use riker_lib::test_support::{
-    BedBuilder, FastaBuilder, SamBuilder, SortOrder, coord_builder, pair, read,
+    BedBuilder, FastaBuilder, Methylation, SamBuilder, SortOrder, coord_builder, pair, read,
 };
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -100,6 +103,7 @@ fn build_multi(
         alignment_opts,
         error_opts,
         rna_opts: RnaOptions::default().into(),
+        methyl_opts: MethylOptions::default().into(),
     }
 }
 
@@ -371,6 +375,43 @@ fn test_all_collectors() -> Result<()> {
     assert!(isize_path.exists(), "isize metrics file should exist");
     assert!(wgs_path.exists(), "WGS metrics file should exist");
 
+    Ok(())
+}
+
+#[test]
+fn test_matches_standalone_methyl() -> Result<()> {
+    let refa = FastaBuilder::hg38_mini().to_temp_fasta()?;
+    let mut sam = SamBuilder::new().sort_order(SortOrder::Coordinate);
+    for i in 0..20 {
+        sam.add(
+            pair(sam.next_id())
+                .fr("chr1", (100 + i * 300)..(400 + i * 300))
+                .converted(Methylation::AllCpg),
+        );
+    }
+    let bam = sam.to_temp_bam()?;
+
+    let dir_multi = TempDir::new()?;
+    let prefix_multi = dir_multi.path().join("out");
+    make_multi_with_ref(bam.path(), &prefix_multi, refa.path(), vec![CollectorKind::Methyl])
+        .execute(None)?;
+
+    let dir_standalone = TempDir::new()?;
+    let prefix_standalone = dir_standalone.path().join("out");
+    Methyl {
+        input: InputOptions { input: bam.path().to_path_buf() },
+        output: OutputOptions { output: prefix_standalone.clone() },
+        reference: ReferenceOptions { reference: refa.path().to_path_buf() },
+        options: MethylOptions::default(),
+    }
+    .execute(None)?;
+
+    let multi = std::fs::read_to_string(out_path(&prefix_multi, METHYL_SUFFIX))?;
+    let standalone = std::fs::read_to_string(out_path(&prefix_standalone, METHYL_SUFFIX))?;
+    assert_eq!(multi, standalone);
+    let metrics: Vec<MethylMetrics> = read_metrics_tsv(&out_path(&prefix_multi, METHYL_SUFFIX))?;
+    assert!(metrics[0].cpg_obs > 0);
+    assert_close!(metrics[0].cpg_methylation, 1.0);
     Ok(())
 }
 

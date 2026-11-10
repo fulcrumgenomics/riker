@@ -584,6 +584,8 @@ pub struct ReadBuilder {
     // Bases that fill the read's soft-clip op instead of the default `A`. Set by
     // `pair().fr(..)` to lay adapter read-through into a short fragment's overhang.
     readthrough: Option<Vec<u8>>,
+    // Methylation-sequencing conversion applied to the derived bases (see `Self::converted`).
+    conversion: Option<Conversion>,
 }
 
 impl ReadBuilder {
@@ -608,6 +610,7 @@ impl ReadBuilder {
             mate_start: None,
             template_length: 0,
             readthrough: None,
+            conversion: None,
         }
     }
 
@@ -676,6 +679,24 @@ impl ReadBuilder {
     /// the way to plant a mismatch against the reference.
     pub fn sub(mut self, offset: usize, base: u8) -> Self {
         self.subs.push((offset, base));
+        self
+    }
+
+    /// Apply EM-seq / bisulfite conversion to the bases derived from the reference: every
+    /// unmethylated cytosine on the strand the read reports reads as `T` (as `A` in the stored
+    /// sequence of a read reporting the bottom strand). Which strand that is follows the
+    /// directional-library rule: read 1 (or a fragment read) forward and read 2 reverse report
+    /// the top strand; the other two report the bottom strand. Bases set with [`Self::bases`]
+    /// are not converted; [`Self::sub`] substitutions apply afterwards.
+    pub fn converted(mut self, methylation: Methylation) -> Self {
+        self.conversion = Some(Conversion { methylated_converts: false, methylation });
+        self
+    }
+
+    /// As [`Self::converted`], but for TAPS / Illumina 5-base chemistry: every *methylated*
+    /// cytosine reads as `T`.
+    pub fn taps_converted(mut self, methylation: Methylation) -> Self {
+        self.conversion = Some(Conversion { methylated_converts: true, methylation });
         self
     }
 
@@ -794,7 +815,18 @@ impl ReadBuilder {
         let mut bases = if let Some(bases) = self.bases {
             bases
         } else if let Some(reference_span) = &reference_span {
-            derive_bases(reference_span, &parsed.ops, query_len, self.readthrough.as_deref())
+            let mut derived =
+                derive_bases(reference_span, &parsed.ops, query_len, self.readthrough.as_deref());
+            if let Some(conversion) = &self.conversion {
+                let reference =
+                    self.matching_ref.as_ref().unwrap_or(fasta_builder::default_reference());
+                let top_strand = self.flags.contains(Flags::REVERSE_COMPLEMENTED)
+                    == self.flags.contains(Flags::LAST_SEGMENT);
+                let flanked =
+                    flanked_reference(reference, &self.contig, self.start, parsed.ref_len);
+                conversion.apply(&mut derived, &parsed.ops, &flanked, self.start, top_strand);
+            }
+            derived
         } else {
             vec![b'A'; query_len]
         };
@@ -999,6 +1031,21 @@ impl PairBuilder {
         self
     }
 
+    /// Apply EM-seq / bisulfite conversion to both mates (see [`ReadBuilder::converted`]).
+    pub fn converted(mut self, methylation: Methylation) -> Self {
+        self.r1 = self.r1.converted(methylation.clone());
+        self.r2 = self.r2.converted(methylation);
+        self
+    }
+
+    /// Apply TAPS / Illumina 5-base conversion to both mates (see
+    /// [`ReadBuilder::taps_converted`]).
+    pub fn taps_converted(mut self, methylation: Methylation) -> Self {
+        self.r1 = self.r1.taps_converted(methylation.clone());
+        self.r2 = self.r2.taps_converted(methylation);
+        self
+    }
+
     /// Customize read 1 with the full [`ReadBuilder`] API.
     pub fn r1(mut self, configure: impl FnOnce(ReadBuilder) -> ReadBuilder) -> Self {
         self.r1 = configure(self.r1);
@@ -1133,6 +1180,108 @@ impl PairBuilder {
 
         (r1.build_with(resolve), r2.build_with(resolve))
     }
+}
+
+/// Which reference cytosines a converted read (see [`ReadBuilder::converted`]) treats as
+/// methylated. A CpG site is named by the 1-based position of its top-strand `C`; both of its
+/// cytosines (the `C`, and the `G` read on the bottom strand) share its state.
+#[derive(Debug, Clone)]
+pub enum Methylation {
+    /// No cytosine is methylated.
+    None,
+    /// Every CpG cytosine is methylated and every other cytosine is not.
+    AllCpg,
+    /// Only the CpG sites at these 1-based `C` positions are methylated.
+    CpgSites(Vec<usize>),
+}
+
+impl Methylation {
+    /// Whether a cytosine is methylated, given whether it is in a CpG and, if so, the 1-based
+    /// position of that CpG's `C`.
+    fn is_methylated(&self, cpg_site: Option<usize>) -> bool {
+        match (self, cpg_site) {
+            (Methylation::None, _) | (_, None) => false,
+            (Methylation::AllCpg, Some(_)) => true,
+            (Methylation::CpgSites(sites), Some(site)) => sites.contains(&site),
+        }
+    }
+}
+
+/// A methylation-sequencing conversion: which cytosines read as `T`.
+#[derive(Debug, Clone)]
+struct Conversion {
+    /// `true` when methylated cytosines convert (TAPS, 5-base); `false` when unmethylated ones
+    /// do (EM-seq, bisulfite).
+    methylated_converts: bool,
+    methylation: Methylation,
+}
+
+impl Conversion {
+    /// Convert `bases`, derived from the reference along `ops` from 1-based `start`. `flanked`
+    /// is the reference over the read's span with one extra base on each side (`N` past a
+    /// contig end), so a cytosine's context is known at the read's edges. A top-strand read
+    /// converts reference `C`s to `T`; a bottom-strand read converts reference `G`s (the bottom
+    /// strand's cytosines) to `A`.
+    fn apply(
+        &self,
+        bases: &mut [u8],
+        ops: &[(Kind, usize)],
+        flanked: &[u8],
+        start: usize,
+        top_strand: bool,
+    ) {
+        let mut reference_offset = 0usize;
+        let mut query_offset = 0usize;
+        for &(kind, len) in ops {
+            match kind {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    for _ in 0..len {
+                        let reference_base = flanked[reference_offset + 1].to_ascii_uppercase();
+                        let cpg_site = if top_strand && reference_base == b'C' {
+                            let next = flanked[reference_offset + 2].to_ascii_uppercase();
+                            Some((next == b'G').then_some(start + reference_offset))
+                        } else if !top_strand && reference_base == b'G' {
+                            let previous = flanked[reference_offset].to_ascii_uppercase();
+                            Some((previous == b'C').then(|| start + reference_offset - 1))
+                        } else {
+                            None
+                        };
+                        if let Some(cpg_site) = cpg_site
+                            && self.methylation.is_methylated(cpg_site) == self.methylated_converts
+                            && let Some(base) = bases.get_mut(query_offset)
+                        {
+                            *base = match *base {
+                                b'C' => b'T',
+                                b'G' => b'A',
+                                other => other,
+                            };
+                        }
+                        reference_offset += 1;
+                        query_offset += 1;
+                    }
+                }
+                Kind::Insertion | Kind::SoftClip => query_offset += len,
+                Kind::Deletion | Kind::Skip => reference_offset += len,
+                Kind::HardClip | Kind::Pad => {}
+            }
+        }
+    }
+}
+
+/// The reference over `[start, start + len)` (1-based) on `contig` with one base of flank on
+/// each side, `N` where the flank falls outside the contig.
+fn flanked_reference(reference: &FastaBuilder, contig: &str, start: usize, len: usize) -> Vec<u8> {
+    let contig_len = reference
+        .dict()
+        .into_iter()
+        .find(|(name, _)| name == contig)
+        .map_or(0, |(_, contig_len)| contig_len);
+    let mut flanked = Vec::with_capacity(len + 2);
+    flanked.push(if start > 1 { reference.bases(contig, start - 1, 1)[0] } else { b'N' });
+    flanked.extend(reference.bases(contig, start, len));
+    let after = start + len;
+    flanked.push(if after <= contig_len { reference.bases(contig, after, 1)[0] } else { b'N' });
+    flanked
 }
 
 /// Resolve a contig `name` to its `reference_sequence_id` in `header` — its position among
@@ -1499,6 +1648,69 @@ mod tests {
         want_r1[2] = b'A';
         assert_eq!(*r1.sequence(), Sequence::from(want_r1));
         assert_eq!(*r2.sequence(), Sequence::from(vec![b'G'; 100]));
+    }
+
+    /// `chr1` = `ACGACAGT` + `C` padding: CpG at 2, CpA at 4, and a bottom-strand CpG cytosine
+    /// at the G (position 3) and a bottom-strand CpT cytosine at the G (position 8; its left
+    /// neighbour is T).
+    fn conversion_reference() -> FastaBuilder {
+        let mut sequence = b"ACGACAGT".to_vec();
+        sequence.extend(vec![b'T'; 92]);
+        FastaBuilder::new().contig("chr1", sequence)
+    }
+
+    fn converted_bases(builder: ReadBuilder) -> Vec<u8> {
+        builder
+            .at("chr1", 1)
+            .cigar("8M")
+            .matching_ref(&conversion_reference())
+            .build()
+            .sequence()
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn converted_unmethylated_forward_read_turns_every_reference_c_to_t() {
+        assert_eq!(converted_bases(read().converted(Methylation::None)), b"ATGATAGT");
+    }
+
+    #[test]
+    fn converted_all_cpg_forward_read_keeps_only_cpg_cytosines() {
+        assert_eq!(converted_bases(read().converted(Methylation::AllCpg)), b"ACGATAGT");
+    }
+
+    #[test]
+    fn converted_reverse_fragment_read_converts_bottom_strand_cytosines() {
+        // A reverse fragment read reports the bottom strand: reference Gs become A, except the
+        // CpG's G under AllCpg.
+        assert_eq!(converted_bases(read().reverse().converted(Methylation::None)), b"ACAACAAT");
+        assert_eq!(converted_bases(read().reverse().converted(Methylation::AllCpg)), b"ACGACAAT");
+    }
+
+    #[test]
+    fn converted_cpg_sites_methylates_only_the_named_sites() {
+        assert_eq!(converted_bases(read().converted(Methylation::CpgSites(vec![2]))), b"ACGATAGT");
+        assert_eq!(converted_bases(read().converted(Methylation::CpgSites(vec![5]))), b"ATGATAGT");
+    }
+
+    #[test]
+    fn taps_converted_turns_only_methylated_cytosines_to_t() {
+        assert_eq!(converted_bases(read().taps_converted(Methylation::AllCpg)), b"ATGACAGT");
+        assert_eq!(converted_bases(read().taps_converted(Methylation::None)), b"ACGACAGT");
+    }
+
+    #[test]
+    fn converted_pair_mates_report_the_strand_of_read_one() {
+        // FR pair: read 1 forward and read 2 reverse both report the top strand.
+        let (r1, r2) = pair("p1")
+            .r1(|r| r.at("chr1", 1).cigar("8M"))
+            .r2(|r| r.at("chr1", 1).cigar("8M").reverse())
+            .matching_ref(&conversion_reference())
+            .converted(Methylation::None)
+            .build();
+        assert_eq!(r1.sequence().as_ref(), b"ATGATAGT");
+        assert_eq!(r2.sequence().as_ref(), b"ATGATAGT");
     }
 
     #[test]

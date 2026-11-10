@@ -7,6 +7,7 @@ pub mod error;
 pub mod gcbias;
 pub mod hybcap;
 pub mod isize;
+pub mod methyl;
 pub mod multi;
 pub mod rna;
 pub mod wgs;

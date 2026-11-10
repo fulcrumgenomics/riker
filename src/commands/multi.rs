@@ -109,6 +109,7 @@ use crate::commands::error::{ErrorCollector, MultiErrorOptions};
 use crate::commands::gcbias::{GcBiasCollector, MultiGcBiasOptions};
 use crate::commands::hybcap::{HybCapCollector, MultiHybCapOptions};
 use crate::commands::isize::{InsertSizeCollector, MultiIsizeOptions};
+use crate::commands::methyl::{MethylCollector, MultiMethylOptions};
 use crate::commands::rna::{MultiRnaOptions, RnaCollector};
 use crate::commands::wgs::{MultiWgsOptions, WgsCollector};
 use crate::fasta::Fasta;
@@ -145,7 +146,7 @@ const NUM_BATCHES_POOLED: usize = 16;
 /// Reads the BAM file once and dispatches records to all selected
 /// collectors in parallel, avoiding the overhead of multiple passes.
 /// Use this when you need several metric types from the same BAM.
-/// Collectors that require a reference (gcbias, wgs) need --reference.
+/// Collectors that require a reference (error, gcbias, methyl, wgs) need --reference.
 /// The hybcap collector requires --hybcap::targets and --hybcap::baits.
 ///
 /// Output files depend on the selected --tools and use the <prefix> from
@@ -172,7 +173,7 @@ pub struct Multi {
     pub reference: OptionalReferenceOptions,
 
     /// Tools to run. Defaults to alignment, basic, and isize (the tools needing no extra
-    /// inputs). The error, gcbias, and wgs tools require --reference; hybcap requires
+    /// inputs). The error, gcbias, methyl, and wgs tools require --reference; hybcap requires
     /// --hybcap::targets/baits; rna requires --rna::gene-model.
     #[arg(
         long,
@@ -193,6 +194,8 @@ pub struct Multi {
     pub hybcap_opts: MultiHybCapOptions,
     #[command(flatten)]
     pub isize_opts: MultiIsizeOptions,
+    #[command(flatten)]
+    pub methyl_opts: MultiMethylOptions,
     #[command(flatten)]
     pub rna_opts: MultiRnaOptions,
     #[command(flatten)]
@@ -271,6 +274,16 @@ impl Multi {
                     collectors.push(Box::new(InsertSizeCollector::new(
                         &self.input.input,
                         &self.output.output,
+                        &opts,
+                    )));
+                }
+                CollectorKind::Methyl => {
+                    let reference = Fasta::from_path(self.required_reference_path()?)?;
+                    let opts = self.methyl_opts.clone().validate()?;
+                    collectors.push(Box::new(MethylCollector::new(
+                        &self.input.input,
+                        &self.output.output,
+                        reference,
                         &opts,
                     )));
                 }
@@ -384,6 +397,8 @@ pub enum CollectorKind {
     HybCap,
     /// Insert size distribution metrics.
     Isize,
+    /// Methylation QC metrics (CpG yield and exclusions, conversion, M-bias).
+    Methyl,
     /// RNA-seq metrics (base composition, strand, coverage bias, transcript insert size).
     Rna,
     /// Whole-genome sequencing coverage metrics.
@@ -391,9 +406,9 @@ pub enum CollectorKind {
 }
 
 impl CollectorKind {
-    /// Whether this collector needs `--reference` to run (error, gcbias, wgs).
+    /// Whether this collector needs `--reference` to run (error, gcbias, methyl, wgs).
     fn requires_reference(self) -> bool {
-        matches!(self, Self::Error | Self::GcBias | Self::Wgs)
+        matches!(self, Self::Error | Self::GcBias | Self::Methyl | Self::Wgs)
     }
 }
 
@@ -406,6 +421,7 @@ impl fmt::Display for CollectorKind {
             CollectorKind::GcBias => write!(f, "gcbias"),
             CollectorKind::HybCap => write!(f, "hybcap"),
             CollectorKind::Isize => write!(f, "isize"),
+            CollectorKind::Methyl => write!(f, "methyl"),
             CollectorKind::Rna => write!(f, "rna"),
             CollectorKind::Wgs => write!(f, "wgs"),
         }

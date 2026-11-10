@@ -6,29 +6,25 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail, ensure};
 use bigwig::{BigWigWriter, ChromIdOrder, ChromInfo, WriterOptions, ZoomPolicy};
-use bitvec::prelude::*;
 use clap::{Args, ValueEnum};
-use kuva::plot::LinePlot;
-use kuva::plot::legend::LegendPosition;
-use kuva::render::plots::Plot;
-use noodles::core::Position;
 use noodles::sam::Header;
-use noodles::sam::alignment::record::cigar::op::Kind;
 use riker_derive::MetricDocs;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::{Collector, drive_collector_single_threaded};
 use crate::commands::command::Command;
 use crate::commands::common::{InputOptions, OutputOptions, ReferenceOptions};
-use crate::counter::Counter;
+use crate::depth_histogram::DepthHistogram;
 use crate::fasta::Fasta;
 use crate::intervals::Intervals;
 use crate::math::safe_div_f;
 use crate::metrics::{serialize_f64_2dp, serialize_f64_5dp, write_tsv};
-use crate::plotting::{FG_BLUE, FG_TEAL, standard_layout, write_plot_pdf};
 use crate::progress::ProgressLogger;
 use crate::sam::alignment_reader::AlignmentReader;
+use crate::sam::cigar::{AlignedBlock, aligned_blocks, count_aligned_bases};
+use crate::sam::coordinate_order::CoordinateOrderGuard;
 use crate::sam::mate_buffer::{MateBuffer, Peek};
+use crate::sam::mate_overlap::{Alone, Buffering, OverlapAction, OverlapBitmap, Pairing};
 use crate::sam::riker_record::{RikerRecord, RikerRecordRequirements};
 use crate::sam::{derive_sample, is_coordinate_sorted};
 use crate::sequence_dict::SequenceDictionary;
@@ -222,7 +218,7 @@ pub struct WgsCollector {
     depth: ContigDepth,
 
     // Buffer of already-seen mate records whose overlapping mate hasn't arrived yet.
-    mate_buffer: MateBuffer<CachedMate>,
+    mate_buffer: MateBuffer<OverlapBitmap>,
 
     // Config
     reference: Fasta,
@@ -241,10 +237,8 @@ pub struct WgsCollector {
     // Per-contig working state
     current_ref_id: Option<usize>,
     processed_contigs: HashSet<usize>,
-    // Coordinates of the last mapped record, including ones the filters drop; what
-    // `check_coordinate_order` compares the next record against.
-    last_ref_id: Option<usize>,
-    last_start: Position,
+    // Checks every mapped record, including ones the filters drop, against the previous one.
+    order_guard: CoordinateOrderGuard,
 
     // Per-contig non-N runs (half-open `[start, end)`, 0-based), indexed by BAM
     // ref_id. Precomputed once up front in `initialize`; consulted only at
@@ -254,7 +248,7 @@ pub struct WgsCollector {
 
     // Global accumulators
     genome_territory: u64,
-    depth_histogram: Vec<u64>, // index = capped depth (0..=coverage_cap)
+    depth_histogram: DepthHistogram,
     bases_excl_mapq: u64,
     bases_excl_dupe: u64,
     bases_excl_unpaired: u64,
@@ -279,7 +273,6 @@ impl WgsCollector {
                 super::command::output_path(prefix, PER_BASE_BIGWIG_SUFFIX)
             }
         });
-        let hist_len = options.coverage_cap as usize + 1;
         Self {
             metrics_path,
             coverage_path,
@@ -301,11 +294,10 @@ impl WgsCollector {
             dict: None,
             current_ref_id: None,
             processed_contigs: HashSet::new(),
-            last_ref_id: None,
-            last_start: Position::MIN,
+            order_guard: CoordinateOrderGuard::new("wgs"),
             non_n_runs: Vec::new(),
             genome_territory: 0,
-            depth_histogram: vec![0u64; hist_len],
+            depth_histogram: DepthHistogram::capped(options.coverage_cap),
             bases_excl_mapq: 0,
             bases_excl_dupe: 0,
             bases_excl_unpaired: 0,
@@ -352,7 +344,7 @@ impl WgsCollector {
 
             let non_n = self.count_eligible_positions(ref_id, &self.non_n_runs[ref_id]);
             self.genome_territory += non_n;
-            self.depth_histogram[0] += non_n;
+            self.depth_histogram.add_n(0, non_n);
         }
 
         let total = self.genome_territory;
@@ -363,53 +355,11 @@ impl WgsCollector {
             return Ok(());
         }
 
-        // ── Build Counter from depth histogram for statistics helpers ────────
-        let hist_counter: Counter<u64> = self
-            .depth_histogram
-            .iter()
-            .enumerate()
-            .filter(|&(_, &c)| c > 0)
-            .map(|(d, &c)| (d as u64, c))
-            .collect();
-
-        // ── Compute mean and SD from the depth histogram ────────────────────
-        let (mean, sd, sum_depth) = {
-            let n = total as f64;
-            let mut sum = 0.0_f64;
-            let mut sum_sq = 0.0_f64;
-            for (depth, &count) in self.depth_histogram.iter().enumerate() {
-                if count > 0 {
-                    let d = depth as f64;
-                    let c = count as f64;
-                    sum += d * c;
-                    sum_sq += d * d * c;
-                }
-            }
-            let mean = sum / n;
-            let variance = if total > 1 { (sum_sq - n * mean * mean) / (n - 1.0) } else { 0.0 };
-            (mean, variance.max(0.0).sqrt(), sum)
-        };
-
-        let (median, mad) = hist_counter.median_and_mad();
-
-        // ── Reverse cumulative sums (used for frac_at, coverage histogram) ──
-        let n = self.depth_histogram.len();
-        let mut at_or_above = vec![0u64; n];
-        let mut running: u64 = 0;
-        for d in (0..n).rev() {
-            running += self.depth_histogram[d];
-            at_or_above[d] = running;
-        }
-
-        let frac_at = |nx: usize| -> f64 {
-            if nx >= n { 0.0 } else { at_or_above[nx] as f64 / total as f64 }
-        };
-
-        // ── Fold penalties ────────────────────────────────────────────────────
-        let fold_penalty = |lower_frac: f64| -> f64 {
-            let pct_depth = percentile_from_hist(&self.depth_histogram, lower_frac, total);
-            if pct_depth == 0.0 { 0.0 } else { mean / pct_depth }
-        };
+        let (mean, sd) = self.depth_histogram.mean_and_sd();
+        let sum_depth = self.depth_histogram.sum();
+        let (median, mad) = self.depth_histogram.median_and_mad();
+        let frac_at = |depth: usize| self.depth_histogram.frac_at_or_above(depth);
+        let fold_penalty = |lower_frac: f64| self.depth_histogram.fold_penalty(mean, lower_frac);
 
         // ── Exclusion fractions ───────────────────────────────────────────────
         // Saturating chain rather than `+`: at WGS scale the sum is well
@@ -462,35 +412,32 @@ impl WgsCollector {
         write_tsv(&self.metrics_path, &[metrics])?;
 
         // ── Coverage histogram ────────────────────────────────────────────────
+        let at_or_above = self.depth_histogram.at_or_above();
         let coverage_rows: Vec<WgsCoverageEntry> = self
             .depth_histogram
+            .counts()
             .iter()
             .enumerate()
-            .map(|(d, &bases)| {
-                let frac_bases = bases as f64 / total as f64;
-                let frac_bases_at_or_above = at_or_above[d] as f64 / total as f64;
-                WgsCoverageEntry {
-                    sample: self.sample.clone(),
-                    depth: d as u64,
-                    bases,
-                    frac_bases,
-                    bases_at_or_above: at_or_above[d],
-                    frac_bases_at_or_above,
-                }
+            .map(|(d, &bases)| WgsCoverageEntry {
+                sample: self.sample.clone(),
+                depth: d as u64,
+                bases,
+                frac_bases: bases as f64 / total as f64,
+                bases_at_or_above: at_or_above[d],
+                frac_bases_at_or_above: at_or_above[d] as f64 / total as f64,
             })
             .collect();
 
         write_tsv(&self.coverage_path, &coverage_rows)?;
 
-        // ── Coverage depth plot ───────────────────────────────────────────────
-        // Clip X axis at the 99.5th-percentile depth so the long tail is trimmed.
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "percentile depth ≤ coverage_cap and non-negative"
-        )]
-        let x_max = percentile_from_hist(&self.depth_histogram, 0.999, total) as u64;
-        self.plot_histogram(x_max, mean)?;
+        self.depth_histogram.plot_pdf(
+            mean,
+            &self.plot_title,
+            None,
+            "Coverage Depth (X)",
+            "Fraction of Genome",
+            &self.plot_path,
+        )?;
 
         log::info!(
             "wgs: genome_territory={total}, mean_coverage={mean:.2}, \
@@ -544,7 +491,7 @@ impl WgsCollector {
                 None => {
                     // Every position in the run is eligible.
                     for &position_depth in run {
-                        self.depth_histogram[position_depth.min(cap) as usize] += 1;
+                        self.depth_histogram.add(u64::from(position_depth));
                         excl_capped += u64::from(position_depth.saturating_sub(cap));
                     }
                     eligible += run.len() as u64;
@@ -554,7 +501,7 @@ impl WgsCollector {
                     for (offset, &position_depth) in run.iter().enumerate() {
                         let pos = start + offset;
                         if pos < bv.len() && bv[pos] {
-                            self.depth_histogram[position_depth.min(cap) as usize] += 1;
+                            self.depth_histogram.add(u64::from(position_depth));
                             eligible += 1;
                         }
                         excl_capped += u64::from(position_depth.saturating_sub(cap));
@@ -575,62 +522,6 @@ impl WgsCollector {
             per_base_thread.write_contig(ref_id, depth)?;
         }
         Ok(())
-    }
-
-    /// Write a PDF area-chart of the coverage depth distribution to [`Self::plot_path`].
-    ///
-    /// The X axis runs from 0 to `x_max` (the 99.9th-percentile depth), so the long
-    /// high-depth tail is trimmed.  The Y axis is the fraction of genome positions at
-    /// each depth.  A theoretical Poisson distribution is overlaid as a dashed line
-    /// using the observed `mean_coverage` as lambda.  Returns immediately when `x_max`
-    /// is 0 or no territory exists.
-    fn plot_histogram(&self, x_max: u64, mean_coverage: f64) -> Result<()> {
-        if self.genome_territory == 0 || x_max == 0 {
-            return Ok(());
-        }
-
-        let territory = self.genome_territory as f64;
-
-        let x_max_idx = usize::try_from(x_max).expect("x_max ≤ coverage_cap (u16)");
-        let xy: Vec<(f64, f64)> = self
-            .depth_histogram
-            .iter()
-            .enumerate()
-            .take(x_max_idx + 1)
-            .map(|(d, &c)| (d as f64, c as f64 / territory))
-            .collect();
-
-        // Theoretical Poisson distribution scaled by the fraction of covered bases.
-        let covered_bases = territory - self.depth_histogram[0] as f64;
-        let covered_frac = covered_bases / territory;
-        let poisson_xy: Vec<(f64, f64)> =
-            (0..=x_max).map(|k| (k as f64, poisson_pmf(k, mean_coverage) * covered_frac)).collect();
-
-        let observed = LinePlot::new()
-            .with_data(xy)
-            .with_color(FG_BLUE)
-            .with_fill()
-            .with_fill_opacity(0.3)
-            .with_legend("Empirical");
-
-        let theoretical = LinePlot::new()
-            .with_data(poisson_xy)
-            .with_color(FG_TEAL)
-            .with_dashed()
-            .with_stroke_width(1.5)
-            .with_legend("Theoretical");
-
-        let plots: Vec<Plot> = vec![observed.into(), theoretical.into()];
-
-        let layout = standard_layout(&plots)
-            .with_title(&self.plot_title)
-            .with_x_label("Coverage Depth (X)")
-            .with_y_label("Fraction of Genome")
-            .with_minor_ticks(5)
-            .with_show_minor_grid(true)
-            .with_legend_position(LegendPosition::InsideTopRight);
-
-        write_plot_pdf(plots, layout, &self.plot_path)
     }
 
     /// Count non-N positions in `runs` that fall within the configured intervals
@@ -659,33 +550,6 @@ impl WgsCollector {
         }
     }
 
-    /// Enforce coordinate-sorted input. A contig's depth is tallied once, when the
-    /// records leave it, and the mate buffer expects a read's overlapping mate to arrive
-    /// after it, so any regression in `(ref_id, start)` would silently drop coverage or
-    /// miss overlaps. This also catches a BAM whose header claims coordinate sort but
-    /// isn't.
-    fn check_coordinate_order(&mut self, ref_id: usize, start: Position) -> Result<()> {
-        if let Some(last_ref_id) = self.last_ref_id
-            && (ref_id < last_ref_id || (ref_id == last_ref_id && start < self.last_start))
-        {
-            bail!(
-                "wgs requires coordinate-sorted input (ordered by reference, then position); \
-                 encountered {}:{start} after {}:{}. Sort with `samtools sort`.",
-                self.contig_name(ref_id),
-                self.contig_name(last_ref_id),
-                self.last_start,
-            );
-        }
-        self.last_ref_id = Some(ref_id);
-        self.last_start = start;
-        Ok(())
-    }
-
-    /// Return the contig name for a `ref_id`, or `?` if unknown. Used only in errors.
-    fn contig_name(&self, ref_id: usize) -> &str {
-        self.dict.as_ref().and_then(|d| d.get_by_index(ref_id)).map_or("?", |m| m.name())
-    }
-
     /// Begin processing a new contig: resize the per-position depth array and
     /// reset the mate buffer (mates cannot straddle contigs). The non-N runs
     /// for every contig were precomputed in `initialize`, so no reference read
@@ -706,19 +570,12 @@ impl WgsCollector {
     }
 
     /// Walk the CIGAR of `record` and apply its per-base depth contribution,
-    /// parameterised on a [`DepthAction`] that encodes the mate-routing case:
-    ///
-    /// - [`AloneAction`] — no mate overlap; always push depth.
-    /// - [`BufferAction`] — buffer for a later mate; push depth and record
-    ///   each position in the overlap bitmap.
-    /// - [`PairAction`] — second read of a pair; skip positions the cached
-    ///   mate already counted (`excl_overlap`), push depth elsewhere.
-    ///
-    /// The `DepthAction` methods for unused hooks are zero-cost default
-    /// implementations; monomorphisation compiles each call site into
-    /// straight-line per-action code with no branches on the action kind.
+    /// parameterised on an [`OverlapAction`] that encodes the mate-routing case
+    /// (see [`crate::sam::mate_overlap`]): [`Alone`] always pushes depth,
+    /// [`Buffering`] also records each counted position for the later mate, and
+    /// [`Pairing`] skips positions the cached mate already counted (`excl_overlap`).
     #[inline]
-    fn walk_depth<A: DepthAction>(&mut self, record: &RikerRecord, mut action: A) {
+    fn walk_depth<A: OverlapAction>(&mut self, record: &RikerRecord, mut action: A) {
         let Some(pos_1based) = record.alignment_start() else {
             return;
         };
@@ -735,7 +592,9 @@ impl WgsCollector {
         let mut excl_overlap: u64 = 0;
         let mut excl_saturated: u64 = 0;
 
-        for (ref_off, read_off, len) in iter_aligned_blocks(record) {
+        for AlignedBlock { ref_offset: ref_off, read_offset: read_off, len } in
+            aligned_blocks(record)
+        {
             let block_ref_start = ref_start_u64 + u64::from(ref_off);
             // CIGAR blocks that fall entirely past the contig end — a
             // malformed-BAM case the spec disallows — are silently dropped.
@@ -773,7 +632,7 @@ impl WgsCollector {
                 excl_saturated += saturated;
             } else {
                 // Overlapping-mate cases keep the per-base scalar walk so the
-                // mate-overlap hooks (`is_mate_covered` / `on_depth_counted`) run.
+                // mate-overlap hooks (`is_mate_covered` / `on_counted`) run.
                 // The BQ-filter + saturating increment below MUST stay in lock-
                 // step with `simd::pileup_depth_alone` (the SIMD path above), whose
                 // per-position rule `pileup_depth_alone_matches_scalar_across_boundaries`
@@ -793,7 +652,7 @@ impl WgsCollector {
                         } else {
                             excl_saturated += 1;
                         }
-                        action.on_depth_counted(ref_pos);
+                        action.on_counted(ref_pos);
                     }
                 }
             }
@@ -893,7 +752,11 @@ impl Collector for WgsCollector {
         if let (Some(ref_id), Some(start)) =
             (record.reference_sequence_id(), record.alignment_start())
         {
-            self.check_coordinate_order(ref_id, start)?;
+            // `dict` is set in `initialize`, which always runs before `accept`. Positions fit
+            // in u32 for every supported reference.
+            #[allow(clippy::cast_possible_truncation)]
+            let start = (start.get() - 1) as u32;
+            self.order_guard.check(ref_id, start, self.dict.as_ref().unwrap())?;
         }
 
         // Mapping quality filter (checked first among the counted exclusions,
@@ -940,14 +803,14 @@ impl Collector for WgsCollector {
         // routing, the WouldBuffer arm walks once with the bitmap as a
         // side-effect, and insert deposits the cached state.
         match self.mate_buffer.probe(record) {
-            Peek::Alone => self.walk_depth(record, AloneAction),
+            Peek::Alone => self.walk_depth(record, Alone),
             Peek::WouldBuffer { overlap_start, overlap_len } => {
-                let mut bitmap = bitvec![u64, Lsb0; 0; overlap_len as usize];
-                self.walk_depth(record, BufferAction { overlap_start, bitmap: &mut bitmap });
-                self.mate_buffer.insert(record, CachedMate { overlap_start, bitmap });
+                let mut bitmap = OverlapBitmap::new(overlap_start, overlap_len);
+                self.walk_depth(record, Buffering { bitmap: &mut bitmap });
+                self.mate_buffer.insert(record, bitmap);
             }
             Peek::PairWith(cached) => {
-                self.walk_depth(record, PairAction { cached: &cached });
+                self.walk_depth(record, Pairing { cached: &cached });
             }
         }
 
@@ -1457,183 +1320,6 @@ impl ContigDepth {
     }
 }
 
-// ─── Mate buffering for read-pair overlap detection ──────────────────────────
-
-/// Per-mate state retained while the overlapping mate of a buffered read has
-/// not yet arrived. The only question we need to answer at pair time is:
-/// "did the first read contribute BQ-passing depth at this reference
-/// position?" — a single bit per position in the overlap region. We record
-/// exactly that bitmap, sized to the overlap span between the two mates'
-/// alignments, rather than keeping quals + CIGAR blocks to reconstruct the
-/// answer at query time.
-struct CachedMate {
-    /// 0-based reference position of the first bit; equals the mate's
-    /// expected `alignment_start`.
-    overlap_start: u32,
-    /// Bit `i` (LSB-first) is set when the first read contributed
-    /// BQ-passing depth at reference position `overlap_start + i`. The
-    /// length of the bitmap (in bits) is the overlap region's span.
-    bitmap: BitVec<u64, Lsb0>,
-}
-
-impl CachedMate {
-    /// Returns `true` if the cached read contributed BQ-passing depth at
-    /// `ref_pos`. Positions outside the overlap region return `false`.
-    fn covered_at(&self, ref_pos: u32) -> bool {
-        if ref_pos < self.overlap_start {
-            return false;
-        }
-        let idx = (ref_pos - self.overlap_start) as usize;
-        if idx >= self.bitmap.len() {
-            return false;
-        }
-        self.bitmap[idx]
-    }
-}
-
-/// Per-record strategy for the inner depth-push loop, capturing the two
-/// orthogonal decisions the three mate-routing cases disagree on:
-///
-/// 1. [`is_mate_covered`] — whether the paired-mate already contributed
-///    depth at this reference position; if so, the current record counts
-///    the base as an `excl_overlap` exclusion instead of pushing depth.
-/// 2. [`on_depth_counted`] — whether to record the position so that a
-///    later-arriving mate can dedupe against it (populates the bitmap in
-///    [`CachedMate`]).
-///
-/// [`AloneAction`] uses the defaults (never-covered, never-record).
-/// [`BufferAction`] overrides `on_depth_counted` to populate the overlap
-/// bitmap. [`PairAction`] overrides `is_mate_covered` to consult the
-/// cached mate. Monomorphization keeps the unused hook in each case at
-/// zero cost (a `false` return or empty body).
-///
-/// [`is_mate_covered`]: DepthAction::is_mate_covered
-/// [`on_depth_counted`]: DepthAction::on_depth_counted
-trait DepthAction {
-    /// `true` only for [`AloneAction`]. It gates the SIMD fast path in
-    /// `walk_depth`: with no per-base mate bookkeeping to do, an alone read's
-    /// block is a pure BQ-filter + saturating increment over a contiguous
-    /// depth slice, which vectorizes. The const is monomorphised away, so the
-    /// dispatch `if A::IS_ALONE` is resolved at compile time per action.
-    const IS_ALONE: bool = false;
-
-    /// Return `true` if the other read of this pair already counted
-    /// `ref_pos`. The caller should not push depth again.
-    #[inline]
-    fn is_mate_covered(&self, _ref_pos: u32) -> bool {
-        false
-    }
-
-    /// Record that depth was pushed at `ref_pos`, so a later-arriving mate
-    /// can dedupe against the current record's contribution.
-    #[inline]
-    fn on_depth_counted(&mut self, _ref_pos: u32) {}
-}
-
-/// No-overlap-awareness action for reads with no overlapping mate.
-struct AloneAction;
-impl DepthAction for AloneAction {
-    const IS_ALONE: bool = true;
-}
-
-/// Action for reads that will be buffered: records each depth-push
-/// position into `bitmap` so the arriving mate can skip the double-count.
-struct BufferAction<'a> {
-    overlap_start: u32,
-    bitmap: &'a mut BitVec<u64, Lsb0>,
-}
-
-impl DepthAction for BufferAction<'_> {
-    #[inline]
-    fn on_depth_counted(&mut self, ref_pos: u32) {
-        if ref_pos >= self.overlap_start {
-            let idx = (ref_pos - self.overlap_start) as usize;
-            if idx < self.bitmap.len() {
-                self.bitmap.set(idx, true);
-            }
-        }
-    }
-}
-
-/// Action for the second read of a pair: consults the cached mate's
-/// bitmap so overlap positions tally as `excl_overlap` instead of
-/// double-pushing depth.
-struct PairAction<'a> {
-    cached: &'a CachedMate,
-}
-
-impl DepthAction for PairAction<'_> {
-    #[inline]
-    fn is_mate_covered(&self, ref_pos: u32) -> bool {
-        self.cached.covered_at(ref_pos)
-    }
-}
-
-/// Iterate `(ref_offset, read_offset, len)` tuples for each M/=/X CIGAR
-/// operation in `record`. `ref_offset` is relative to the record's
-/// `alignment_start` and `read_offset` indexes into the record's quality /
-/// sequence arrays. Non-M CIGAR ops advance the ref/read cursors but do not
-/// yield.
-fn iter_aligned_blocks(record: &RikerRecord) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
-    let mut ref_off: u32 = 0;
-    let mut read_off: u32 = 0;
-    record.cigar_ops().filter_map(move |op| {
-        // CIGAR op lengths are stored as u32 in BAM/SAM, so the cast is lossless.
-        #[allow(clippy::cast_possible_truncation)]
-        let len = op.len() as u32;
-        match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                let out = (ref_off, read_off, len);
-                ref_off += len;
-                read_off += len;
-                Some(out)
-            }
-            Kind::Insertion | Kind::SoftClip => {
-                read_off += len;
-                None
-            }
-            Kind::Deletion | Kind::Skip => {
-                ref_off += len;
-                None
-            }
-            Kind::HardClip | Kind::Pad => None,
-        }
-    })
-}
-
-// ─── Poisson helpers ─────────────────────────────────────────────────────────
-
-/// Compute the Poisson PMF P(X = k) for a given lambda, using log-space
-/// arithmetic to avoid overflow for large k.
-fn poisson_pmf(k: u64, lambda: f64) -> f64 {
-    if lambda <= 0.0 {
-        return if k == 0 { 1.0 } else { 0.0 };
-    }
-    let log_pmf = k as f64 * lambda.ln() - lambda - ln_factorial(k);
-    log_pmf.exp()
-}
-
-/// Compute ln(k!) by iterative summation of ln(i) for i in 2..=k.
-fn ln_factorial(k: u64) -> f64 {
-    (2..=k).map(|i| (i as f64).ln()).sum()
-}
-
-// ─── CIGAR helper ─────────────────────────────────────────────────────────────
-
-/// Count the number of reference-aligned bases (M/=/X) in a record's CIGAR.
-fn count_aligned_bases(record: &RikerRecord) -> u64 {
-    let mut count: u64 = 0;
-    for op in record.cigar_ops() {
-        match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                count += op.len() as u64;
-            }
-            _ => {}
-        }
-    }
-    count
-}
-
 // ─── Coverage cap helper ──────────────────────────────────────────────────────
 
 /// The number of bases in `depths` above `cap`: the capped exclusions at those
@@ -1681,33 +1367,6 @@ fn non_n_intervals(seq: &[u8]) -> Vec<(u32, u32)> {
     runs
 }
 
-// ─── Percentile helper ────────────────────────────────────────────────────────
-
-/// Return the depth at which `lower_frac` of positions have depth ≤ that value
-/// (i.e., `1 - lower_frac` of positions are at or above).
-///
-/// For `lower_frac = 0.20`, this is the 20th percentile depth (80% of positions
-/// are at or above), used for `fold_80_base_penalty`.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "depth indices and totals fit safely in u64 conversions"
-)]
-fn percentile_from_hist(hist: &[u64], lower_frac: f64, total: u64) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    let threshold = (total as f64 * lower_frac).ceil() as u64;
-    let mut running: u64 = 0;
-    for (d, &count) in hist.iter().enumerate() {
-        running += count;
-        if running >= threshold {
-            return d as f64;
-        }
-    }
-    (hist.len() - 1) as f64
-}
-
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1715,64 +1374,6 @@ mod tests {
     use super::*;
 
     // ── Percentile tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_percentile_from_hist_basic() {
-        // hist[0]=1, hist[1]=1, hist[2]=1 → total=3
-        // 20th pct: threshold=ceil(0.2*3)=1, running after d=0 is 1 ≥ 1 → depth=0
-        let hist = [1u64, 1, 1];
-        crate::assert_close!(percentile_from_hist(&hist, 0.20, 3), 0.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_percentile_from_hist_80pct() {
-        // 10 positions at depth=10; fold_80 threshold = ceil(0.2*10) = 2
-        // All at depth=10, so after depth=10 running=10 ≥ 2 → depth=10
-        let mut hist = vec![0u64; 11];
-        hist[10] = 10;
-        crate::assert_close!(percentile_from_hist(&hist, 0.20, 10), 10.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_percentile_empty_histogram() {
-        crate::assert_close!(percentile_from_hist(&[], 0.5, 0), 0.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_percentile_single_bin() {
-        // All 10 positions at depth 0
-        let hist = [10u64];
-        crate::assert_close!(percentile_from_hist(&hist, 0.5, 10), 0.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_percentile_frac_zero() {
-        // lower_frac=0.0 → threshold=ceil(0)=0, running at d=0 is 5 ≥ 0 → depth=0
-        let mut hist = vec![0u64; 11];
-        hist[0] = 5;
-        hist[10] = 5;
-        crate::assert_close!(percentile_from_hist(&hist, 0.0, 10), 0.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_percentile_frac_one() {
-        // lower_frac=1.0 → threshold=ceil(10)=10
-        // hist[5]=5, hist[10]=5 → running at d=10 is 10 ≥ 10 → depth=10
-        let mut hist = vec![0u64; 11];
-        hist[5] = 5;
-        hist[10] = 5;
-        crate::assert_close!(percentile_from_hist(&hist, 1.0, 10), 10.0, f64::EPSILON);
-    }
-
-    #[test]
-    fn test_percentile_two_bins() {
-        // hist[5]=5, hist[10]=5, total=10, lower_frac=0.5
-        // threshold=ceil(5)=5, running at d=5 is 5 ≥ 5 → depth=5
-        let mut hist = vec![0u64; 11];
-        hist[5] = 5;
-        hist[10] = 5;
-        crate::assert_close!(percentile_from_hist(&hist, 0.5, 10), 5.0, f64::EPSILON);
-    }
 
     // ── Non-N interval tests ─────────────────────────────────────────────────
 
@@ -1895,68 +1496,5 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("cannot write per-base coverage"), "unexpected error: {message}");
         assert!(!path.exists());
-    }
-
-    // ── CachedMate tests ─────────────────────────────────────────────────────
-
-    /// Build a CachedMate by explicitly naming the ref positions where the
-    /// first read contributed BQ-passing depth.
-    fn cached_mate(overlap_start: u32, overlap_len: u32, covered: &[u32]) -> CachedMate {
-        let mut bitmap = bitvec![u64, Lsb0; 0; overlap_len as usize];
-        for &ref_pos in covered {
-            assert!(ref_pos >= overlap_start);
-            let idx = (ref_pos - overlap_start) as usize;
-            assert!(idx < overlap_len as usize);
-            bitmap.set(idx, true);
-        }
-        CachedMate { overlap_start, bitmap }
-    }
-
-    #[test]
-    fn test_cached_mate_covered_at_contiguous_region() {
-        // First read contributed depth at every position in [100, 109].
-        let cached = cached_mate(100, 10, &[100, 101, 102, 103, 104, 105, 106, 107, 108, 109]);
-        assert!(cached.covered_at(100));
-        assert!(cached.covered_at(105));
-        assert!(cached.covered_at(109));
-        // Outside overlap region:
-        assert!(!cached.covered_at(99));
-        assert!(!cached.covered_at(110));
-    }
-
-    #[test]
-    fn test_cached_mate_covered_at_with_gap() {
-        // Simulates CIGAR "5M2D5M" — BQ-passing depth at [100,104] and
-        // [107,111] (a 2bp gap in between from the deletion). The bitmap
-        // spans [100, 111] so gap positions are represented as 0 bits.
-        let cached = cached_mate(100, 12, &[100, 101, 102, 103, 104, 107, 108, 109, 110, 111]);
-        assert!(cached.covered_at(100));
-        assert!(cached.covered_at(104));
-        // Inside the 2bp deletion — not covered:
-        assert!(!cached.covered_at(105));
-        assert!(!cached.covered_at(106));
-        // After the deletion:
-        assert!(cached.covered_at(107));
-        assert!(cached.covered_at(111));
-    }
-
-    #[test]
-    fn test_cached_mate_covered_at_with_bq_fail_gaps() {
-        // First read aligned across [100, 109] but had a BQ-failing base at
-        // 103, so the bitmap has a 0 bit there even though the position is
-        // within the overlap region.
-        let cached = cached_mate(100, 10, &[100, 101, 102, 104, 105, 106, 107, 108, 109]);
-        assert!(cached.covered_at(102));
-        assert!(!cached.covered_at(103)); // BQ-fail gap
-        assert!(cached.covered_at(104));
-    }
-
-    #[test]
-    fn test_cached_mate_covered_at_out_of_range() {
-        let cached = cached_mate(100, 10, &[100, 109]);
-        assert!(!cached.covered_at(50));
-        assert!(!cached.covered_at(99));
-        assert!(!cached.covered_at(110));
-        assert!(!cached.covered_at(u32::MAX));
     }
 }
